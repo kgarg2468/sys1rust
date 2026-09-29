@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+
+# Rust build output
+runtime/target/
+
+# Benchmark caches, tools, environments and outputs (bench/env.sh points them all here)
+bench/.cache/
+bench/.cargo/
+bench/bin/
+bench/tmp/
+bench/results/
+bench/.snapshot/
+bench/.caffeinate.pid
+bench/**/.venv/
+bench/contenders/*/src/
+
+# Raw measurement data stays local; results/*.md summarize it
+results/raw/

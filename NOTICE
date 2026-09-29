@@ -1,0 +1,27 @@
+sys1rust
+
+runtime/crates/laya-core and runtime/crates/laya-mlx start from laya-r-mlx
+(https://github.com/tjameswilliams/laya-r-mlx at 914c9a76fd6bd211fc0be043869a5cf1dde1994b),
+Copyright 2026 Tim Williams, licensed under the Apache License, Version 2.0 (see LICENSE).
+Files changed since then say so in their header.
+
+laya-r-mlx's NOTICE, kept as required:
+
+  This product reimplements, in Rust, the inference pipeline of Laya
+  (https://github.com/NandhaKishorM/laya), Copyright Convai Innovations,
+  licensed under the Apache License, Version 2.0. Question rendering, sequence
+  layout, calibration and result formatting follow that package so answers are
+  identical; no code from it is vendored here. The Python package is used only by
+  the scripts in scripts/ to produce reference fixtures for tests.
+
+  The model checkpoints this engine runs (convaiinnovations/laya,
+  laya-multilingual, laya-typed-decisions on Hugging Face) are distributed by
+  Convai Innovations under the Apache License, Version 2.0, and are not part of
+  this repository. Their encoders derive from ModernBERT (Answer.AI / LightOn,
+  Apache-2.0) and mmBERT (JHU CLSP, MIT).
+
+runtime/vendor/mlx-sys is mlx-sys 0.6.0 (https://github.com/oxiglade/mlx-rs, MIT OR Apache-2.0)
+with a patched build.rs that can link a prebuilt MLX.
+
+bench/workloads are built from the typed-decisions benchmark states; bench/reference holds
+answers from upstream Laya (PyTorch, fp32, CPU) on those workloads.

@@ -1,0 +1,28 @@
+{
+  "files": [
+    {
+      "path": "results/SYNTHESIS.md",
+      "description": "Project plan and conclusions: why the runtime exists, what was measured, what comes next"
+    },
+    {
+      "path": "results/SPEED.md",
+      "description": "Measured effect and cost of the laya-mlx speed settings (dense_upto, headprune, unpad) and the review that made them default",
+      "scope": ["runtime/crates/laya-mlx/**", "runtime/crates/sys1-bench/**"]
+    },
+    {
+      "path": "results/SPIKE.md",
+      "description": "fp16 slowdown fix, MLX buffer cache cap and length buckets in the MLX backend",
+      "scope": ["runtime/crates/laya-mlx/**", "runtime/crates/sys1-bench/**"]
+    },
+    {
+      "path": "results/SERVER.md",
+      "description": "sys1d server design choices, protocol parity with upstream laya serve, measured overhead",
+      "scope": ["runtime/crates/sys1d/**"]
+    },
+    {
+      "path": "bench/PLAN.md",
+      "description": "Benchmark ground rules, request and result formats, correctness gate",
+      "scope": ["bench/**"]
+    }
+  ]
+}
