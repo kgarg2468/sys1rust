@@ -77,7 +77,8 @@ impl Agent {
 
     /// Assemble an agent from already loaded parts. The action head must read the encoder
     /// hidden size plus its 4 scalar features, or the rows of the backend's pooled output
-    /// would be sliced at the wrong width.
+    /// would be sliced at the wrong width, and it must have `len(act_costs) + 1` output
+    /// classes, the shape upstream builds it with and loads strictly.
     pub fn from_parts(
         cfg: ModelConfig,
         tokenizer: LayaTokenizer,
@@ -85,6 +86,7 @@ impl Agent {
         backend: Box<dyn Backend>,
     ) -> Result<Self> {
         act_head.check_pooled_width(cfg.hidden_size())?;
+        act_head.check_n_act(cfg.n_act())?;
         let temperatures = Temperatures::from_config(&cfg.agent);
         Ok(Self {
             model_dir: PathBuf::new(),
@@ -240,7 +242,11 @@ mod tests {
 
     /// An action head with small, varied weights so `act_probability` depends on the row.
     fn test_act_head(d_in: usize) -> ActHead {
-        let (h, n_act) = (6, 2);
+        test_act_head_with_classes(d_in, 2)
+    }
+
+    fn test_act_head_with_classes(d_in: usize, n_act: usize) -> ActHead {
+        let h = 6;
         let w0 = (0..h * d_in)
             .map(|i| ((i * 7 % 11) as f32 - 5.0) / 10.0)
             .collect();
@@ -248,7 +254,8 @@ mod tests {
         let w2 = (0..n_act * h)
             .map(|i| ((i * 5 % 7) as f32 - 3.0) / 10.0)
             .collect();
-        ActHead::from_tensors(vec![h, d_in], w0, b0, vec![n_act, h], w2, vec![0.1, -0.1]).unwrap()
+        let b2 = (0..n_act).map(|i| 0.1 - 0.2 * i as f32).collect();
+        ActHead::from_tensors(vec![h, d_in], w0, b0, vec![n_act, h], w2, b2).unwrap()
     }
 
     fn test_config() -> ModelConfig {
@@ -371,6 +378,29 @@ mod tests {
             e.contains("input width 13") && e.contains("hidden size 8"),
             "{e}"
         );
+    }
+
+    /// `test_config` lists one act cost, so the head must have two classes: a three-class
+    /// head is refused at assembly, before any `act_probability` is read from it.
+    #[test]
+    fn from_parts_rejects_an_action_head_of_another_class_count() {
+        let e = Agent::from_parts(
+            test_config(),
+            test_tokenizer(),
+            test_act_head_with_classes(HIDDEN + 4, 3),
+            Box::new(SyntheticBackend {
+                hidden: HIDDEN,
+                pad_to: 1,
+            }),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap();
+        assert!(
+            e.contains("3 output classes") && e.contains("lists 1 act_costs"),
+            "{e}"
+        );
+        assert_eq!(test_config().n_act(), 2);
     }
 
     #[test]
