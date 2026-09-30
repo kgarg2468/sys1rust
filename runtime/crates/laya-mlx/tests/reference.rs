@@ -10,10 +10,10 @@
 
 mod common;
 
-use common::{bench_root, categorical, prob_diff, read_jsonl, CHECKPOINTS};
+use common::{agree, bench_root, categorical, prob_diff, read_jsonl, CHECKPOINTS};
 use laya_core::resolve::resolve_model_dir;
 use laya_core::{Agent, BackendOptions};
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// The settings answers are served with: GELU kept in f16 (upstream promotes it to f32), a
 /// 512 MiB MLX buffer cache and 2 GiB wired. The bench's `mlx-fp16-fast` variant.
@@ -40,7 +40,7 @@ fn smoke_matches_upstream_reference() {
         let reference = read_jsonl(&bench.join(format!("reference/{name}/smoke.jsonl")));
         let opts = BackendOptions { tuning: Some(PRODUCTION.into()), ..Default::default() };
         let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend)).unwrap();
-        let (mut worst, mut worst_at, mut agree, mut total) = (0.0f64, String::new(), 0usize, 0usize);
+        let (mut worst, mut worst_at, mut agreed, mut total) = (0.0f64, String::new(), 0usize, 0usize);
         for row in &smoke {
             let id = row["id"].as_str().unwrap();
             let want = &reference
@@ -61,12 +61,12 @@ fn smoke_matches_upstream_reference() {
                     (worst, worst_at) = (d, format!("{id}/{qid}"));
                 }
                 total += 1;
-                agree += usize::from(categorical(ans) == categorical(&want[qid]));
+                agreed += usize::from(agree(ans, &want[qid]));
             }
         }
-        let agreement = agree as f64 / total as f64;
+        let agreement = agreed as f64 / total as f64;
         eprintln!(
-            "{name:<16} {total} answers over {} requests: agreement {agree}/{total} ({:.1}%), max probability diff {worst:.4} at {worst_at}",
+            "{name:<16} {total} answers over {} requests: agreement {agreed}/{total} ({:.1}%), max probability diff {worst:.4} at {worst_at}",
             smoke.len(),
             100.0 * agreement
         );
@@ -101,11 +101,45 @@ fn prob_diff_rejects_missing_or_non_numeric_values() {
     assert!(prob_diff(&json!({"noul": f64::NAN}), &json!({"noul": 0.5})).is_err());
 }
 
+/// The decision of each answer type is the one `bench/harness/compare.py` counts: the choice
+/// label, the noul side, and for a score the most probable level, not the rounded expected score.
 #[test]
 fn categorical_is_the_decision_of_each_answer_type() {
     assert_eq!(categorical(&json!({"type": "choice", "choice": "refund"})), json!("refund"));
+    // Without `choice`, the most probable option; the first one on a tie.
+    assert_eq!(categorical(&json!({"type": "choice", "probabilities": {"a": 0.3, "b": 0.4, "c": 0.3}})), json!("b"));
+    assert_eq!(categorical(&json!({"type": "choice", "probabilities": {"a": 0.5, "b": 0.5}})), json!("a"));
     assert_eq!(categorical(&json!({"type": "noul", "noul": 0.51})), json!(true));
     assert_eq!(categorical(&json!({"type": "noul", "noul": 0.49})), json!(false));
-    assert_eq!(categorical(&json!({"type": "score", "score": 2.4})), json!(2.0));
-    assert_eq!(categorical(&json!({"type": "score", "score": 2.6})), json!(3.0));
+    assert_eq!(categorical(&json!({"type": "noul"})), Value::Null);
+    // A score decides its most probable level: expected 2.4 rounds to 2, but level 3 is the
+    // most probable here, and a shift of probability can flip the level without moving the
+    // rounded score.
+    let score = json!({"type": "score", "score": 2.4, "probabilities": {"0": 0.1, "1": 0.1, "2": 0.35, "3": 0.45}});
+    assert_eq!(categorical(&score), json!(3));
+    assert_eq!(categorical(&json!({"type": "score", "score": 2.6, "probabilities": {"0": 0.0, "1": 0.0, "2": 0.6, "3": 0.4}})), json!(2));
+    // Without probabilities an integer score is the level and a fractional one decides nothing.
+    assert_eq!(categorical(&json!({"type": "score", "score": 2.0})), json!(2));
+    assert_eq!(categorical(&json!({"type": "score", "score": 2.4})), Value::Null);
+    assert_eq!(categorical(&json!({"type": "other"})), Value::Null);
+}
+
+/// `agree` is compare.py's rule: same type, same decision, and nothing agrees with a null
+/// decision.
+#[test]
+fn agree_needs_the_same_type_and_a_decision() {
+    let choice = json!({"type": "choice", "choice": "refund", "probabilities": {"refund": 0.6, "deny": 0.4}});
+    assert!(agree(&choice, &json!({"type": "choice", "probabilities": {"refund": 0.51, "deny": 0.49}})));
+    assert!(!agree(&choice, &json!({"type": "choice", "choice": "deny"})));
+    let level1 = json!({"type": "score", "score": 1.0, "probabilities": {"0": 0.2, "1": 0.8}});
+    let yes = json!({"type": "noul", "noul": 1.0});
+    assert!(!agree(&level1, &yes), "score level 1 is not noul true");
+    assert!(agree(&level1, &json!({"type": "score", "score": 1.2, "probabilities": {"0": 0.45, "1": 0.55}})));
+    assert!(!agree(&level1, &json!({"type": "score", "score": 1.0, "probabilities": {"0": 0.55, "1": 0.45}})));
+    assert!(!agree(&json!({"type": "noul"}), &json!({"type": "noul"})), "two null decisions do not agree");
+    assert!(!agree(&json!({}), &json!({})));
+    // A fractional score without probabilities is compared as a value within 0.05.
+    assert!(agree(&json!({"type": "score", "score": 2.4}), &json!({"type": "score", "score": 2.44})));
+    assert!(!agree(&json!({"type": "score", "score": 2.4}), &json!({"type": "score", "score": 2.5})));
+    assert!(!agree(&json!({"type": "score", "score": 2.4}), &json!({"type": "score"})));
 }
