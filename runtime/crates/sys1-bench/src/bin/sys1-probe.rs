@@ -7,14 +7,17 @@
 //! each shape `iters` times in a row after `warmup` runs; `mixed` cycles through the shapes
 //! `iters` times, so every request follows a different shape. Prints min, p50 and max ms.
 //! Backend settings are a laya-mlx `Knobs` spec: `--tuning` (default: none, the upstream
-//! reproduction), or `SYS1_MLX` when `--tuning` is absent. The probe takes specs, not
-//! sys1-bench variant names; `sys1-bench --list-variants` shows each variant's spec.
+//! reproduction), or `SYS1_MLX` when `--tuning` is absent. Every spec is checked at startup, so
+//! a bad one is an error and not a run reported under settings that were never applied. The
+//! probe takes specs, not sys1-bench variant names; `sys1-bench --list-variants` shows each
+//! variant's spec.
 //!
 //! `--ab` loads two agents from the same checkpoint, one per settings spec, warms both and runs
 //! them alternately (A, B, A, B, ...) on every shape so clock and thermal drift hit both the
 //! same. Prints p50 of each and B/A per shape, then the geo-mean of B/A. `--check` also
 //! compares A's and B's answers on every picked row: the largest absolute difference over the
-//! reported probabilities and whether every choice, score and noul answer is the same.
+//! reported probabilities, over `score` and over `action.act_probability`, and whether every
+//! choice, score and noul answer is the same.
 //! Separate process runs on this machine differ by about 5%, which hides 3% effects; the
 //! in-process alternation is what makes the comparison usable. The two specs must agree on
 //! the process-wide MLX limits (`cache`, `wired`): both agents share one allocator, so the
@@ -52,7 +55,7 @@ fn main() -> Result<()> {
             ),
             "--warmup" => warmup = val()?.parse()?,
             "--iters" => iters = val()?.parse()?,
-            "--order" => mixed = val()? == "mixed",
+            "--order" => mixed = parse_order(&val()?)?,
             "--ab" => ab = Some((val()?, val()?)),
             "--check" => check = true,
             other => anyhow::bail!("unknown argument {other}"),
@@ -64,9 +67,20 @@ fn main() -> Result<()> {
     if iters == 0 {
         anyhow::bail!("--iters must be at least 1 (there is no p50 of no runs)");
     }
-    if let Some((a, b)) = &ab {
-        if let Err(e) = same_process_wide_limits(a, b) {
-            anyhow::bail!("--ab: {e}");
+    // The settings the run is reported under; a bad one is an error, not a silent default.
+    match (&ab, &tuning) {
+        (Some((a, b)), _) => {
+            laya_mlx::check_settings(a).with_context(|| format!("--ab A `{a}`"))?;
+            laya_mlx::check_settings(b).with_context(|| format!("--ab B `{b}`"))?;
+            if let Err(e) = same_process_wide_limits(a, b) {
+                anyhow::bail!("--ab: {e}");
+            }
+        }
+        (None, Some(spec)) => laya_mlx::check_settings(spec).with_context(|| format!("--tuning `{spec}`"))?,
+        (None, None) => {
+            if let Ok(spec) = std::env::var("SYS1_MLX") {
+                laya_mlx::check_settings(&spec).context("SYS1_MLX")?;
+            }
         }
     }
     let bench = std::env::var("BENCH_ROOT").context("source bench/env.sh")?;
@@ -229,12 +243,13 @@ fn ab_run(
             total.merge(&compare_answers(a, b));
         }
         println!(
-            "check\trows {}\tanswers {}\tmax_prob_diff {:.6}\tmax_score_diff {:.6}\tmismatch {}\t\
-             (choice {} score {} noul {})\tmissing_values {}",
+            "check\trows {}\tanswers {}\tmax_prob_diff {:.6}\tmax_score_diff {:.6}\tmax_act_diff {:.6}\t\
+             mismatch {}\t(choice {} score {} noul {})\tmissing_values {}",
             picked.len(),
             total.answers,
             total.max_prob_diff,
             total.max_score_diff,
+            total.max_act_diff,
             total.mismatches(),
             total.choice_mismatch,
             total.score_mismatch,
@@ -271,6 +286,15 @@ fn same_process_wide_limits(a: &str, b: &str) -> std::result::Result<(), String>
     Ok(())
 }
 
+/// `--order`: `mixed` cycles through the shapes, `grouped` runs each shape's iterations in a row.
+fn parse_order(order: &str) -> Result<bool> {
+    match order {
+        "mixed" => Ok(true),
+        "grouped" => Ok(false),
+        other => anyhow::bail!("unknown order {other}: use mixed or grouped"),
+    }
+}
+
 fn print_mlx_mb() {
     let mb = |r: mlx_rs::error::Result<usize>| r.map(|b| b >> 20).unwrap_or(0);
     println!(
@@ -301,12 +325,16 @@ struct AnswerCheck {
     max_prob_diff: f64,
     /// Largest absolute difference of the expected `score` (score questions only).
     max_score_diff: f64,
+    /// Largest absolute difference of `action.act_probability`, which comes from the pooled
+    /// output rather than the marker logits, so it can move when nothing else does.
+    max_act_diff: f64,
     /// Answers whose reported `choice`, `score` or `noul` (4 decimals) is not the same.
     choice_mismatch: usize,
     score_mismatch: usize,
     noul_mismatch: usize,
-    /// Values (`probabilities.*`, `noul`, `score`) that one side reports as a number and the
-    /// other side not at all or not as a number. These never count as a difference of zero.
+    /// Values (`probabilities.*`, `noul`, `score`, `action.act_probability`) that one side
+    /// reports as a number and the other side not at all or not as a number. These never count
+    /// as a difference of zero.
     missing: usize,
 }
 
@@ -318,6 +346,7 @@ impl AnswerCheck {
         self.answers += other.answers;
         self.max_prob_diff = self.max_prob_diff.max(other.max_prob_diff);
         self.max_score_diff = self.max_score_diff.max(other.max_score_diff);
+        self.max_act_diff = self.max_act_diff.max(other.max_act_diff);
         self.choice_mismatch += other.choice_mismatch;
         self.score_mismatch += other.score_mismatch;
         self.noul_mismatch += other.noul_mismatch;
@@ -366,6 +395,7 @@ fn compare_answers(a: &Value, b: &Value) -> AnswerCheck {
         }
         note(diff(&ans_a["noul"], &ans_b["noul"]), &mut c.max_prob_diff);
         note(diff(&ans_a["score"], &ans_b["score"]), &mut c.max_score_diff);
+        note(diff(&ans_a["action"]["act_probability"], &ans_b["action"]["act_probability"]), &mut c.max_act_diff);
         // Keys B reports that A does not.
         let extra = pb.map_or(0, |pb| pb.keys().filter(|k| !pa.is_some_and(|pa| pa.contains_key(*k))).count());
         c.missing += missing + extra;
@@ -395,9 +425,9 @@ mod tests {
     #[test]
     fn compare_answers_reports_prob_diff_and_mismatches() {
         let a = json!({
-            "pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7, "y": 0.3}},
-            "rate": {"type": "score", "score": 1.25, "probabilities": {"0": 0.25, "1": 0.25, "2": 0.5}},
-            "yes": {"type": "noul", "noul": 0.61},
+            "pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7, "y": 0.3}, "action": {"act_probability": 0.8}},
+            "rate": {"type": "score", "score": 1.25, "probabilities": {"0": 0.25, "1": 0.25, "2": 0.5}, "action": {"act_probability": 0.5}},
+            "yes": {"type": "noul", "noul": 0.61, "action": {"act_probability": 0.3}},
         });
         let same = compare_answers(&a, &a);
         assert_eq!(
@@ -406,23 +436,32 @@ mod tests {
         );
 
         let b = json!({
-            "pick": {"type": "choice", "choice": "y", "probabilities": {"x": 0.45, "y": 0.55}},
-            "rate": {"type": "score", "score": 1.2501, "probabilities": {"0": 0.25, "1": 0.25, "2": 0.5}},
-            "yes": {"type": "noul", "noul": 0.6},
+            "pick": {"type": "choice", "choice": "y", "probabilities": {"x": 0.45, "y": 0.55}, "action": {"act_probability": 0.8}},
+            "rate": {"type": "score", "score": 1.2501, "probabilities": {"0": 0.25, "1": 0.25, "2": 0.5}, "action": {"act_probability": 0.52}},
+            "yes": {"type": "noul", "noul": 0.6, "action": {"act_probability": 0.3}},
         });
         let c = compare_answers(&a, &b);
         assert_eq!(c.answers, 3);
         assert!((c.max_prob_diff - 0.25).abs() < 1e-12);
         assert!((c.max_score_diff - 0.0001).abs() < 1e-12);
+        // The action probability is compared on its own: it comes from the pooled output.
+        assert!((c.max_act_diff - 0.02).abs() < 1e-12);
         assert_eq!((c.choice_mismatch, c.score_mismatch, c.noul_mismatch), (1, 1, 1));
         assert_eq!(c.mismatches(), 3);
 
+        // Only the action probability differs: no mismatch, but a nonzero act diff.
+        let mut act_only = a.clone();
+        act_only["yes"]["action"]["act_probability"] = json!(0.31);
+        let c = compare_answers(&a, &act_only);
+        assert_eq!((c.mismatches(), c.missing, c.max_prob_diff), (0, 0, 0.0));
+        assert!((c.max_act_diff - 0.01).abs() < 1e-12);
+
         // A question B does not have counts as a mismatch of its type, and every number A
-        // reported for it as missing (5 probabilities, 1 noul, 1 score).
+        // reported for it as missing (5 probabilities, 1 noul, 1 score, 3 action probabilities).
         let c = compare_answers(&a, &json!({}));
         assert_eq!((c.choice_mismatch, c.score_mismatch, c.noul_mismatch), (1, 1, 1));
-        assert_eq!((c.max_prob_diff, c.max_score_diff), (0.0, 0.0));
-        assert_eq!(c.missing, 7);
+        assert_eq!((c.max_prob_diff, c.max_score_diff, c.max_act_diff), (0.0, 0.0, 0.0));
+        assert_eq!(c.missing, 10);
     }
 
     /// A probability B leaves out, reports as something other than a number, or adds is not a
@@ -437,11 +476,26 @@ mod tests {
         assert_eq!(compare_answers(&a, &text).missing, 1);
         let extra = json!({"pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7, "y": 0.3, "z": 0.0}}});
         assert_eq!(compare_answers(&a, &extra).missing, 1);
-        // Keys the answer type does not report (no `score` on a choice) are not missing.
+        // Keys the answer type does not report (no `score` on a choice) are not missing, and
+        // neither is an `action` block absent on both sides.
         assert_eq!(compare_answers(&a, &a).missing, 0);
+        // An action probability on one side only is missing.
+        let mut with_act = a.clone();
+        with_act["pick"]["action"] = json!({"act_probability": 0.9});
+        assert_eq!(compare_answers(&with_act, &a).missing, 1);
+        assert_eq!(compare_answers(&a, &with_act).missing, 1);
         let mut t = AnswerCheck::default();
         t.merge(&c);
         assert_eq!(t.missing, 1);
+    }
+
+    #[test]
+    fn order_is_mixed_or_grouped() {
+        assert!(parse_order("mixed").unwrap());
+        assert!(!parse_order("grouped").unwrap());
+        for bad in ["Mixed", "mixd", "random", ""] {
+            assert!(parse_order(bad).is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]
@@ -463,11 +517,12 @@ mod tests {
             answers: 2,
             max_prob_diff: 0.3,
             max_score_diff: 0.2,
+            max_act_diff: 0.05,
             score_mismatch: 1,
             ..Default::default()
         });
         assert_eq!(t.answers, 3);
-        assert_eq!((t.max_prob_diff, t.max_score_diff), (0.3, 0.2));
+        assert_eq!((t.max_prob_diff, t.max_score_diff, t.max_act_diff), (0.3, 0.2, 0.05));
         assert_eq!(t.mismatches(), 1);
     }
 }
