@@ -18,6 +18,17 @@ pub fn dumps(v: &Value) -> String {
     out
 }
 
+/// The key `json.dumps` writes for a dict key holding `v`: a string as it is, anything else
+/// as its JSON text (`1`, `1.5`, `1e+16`, `true`, `null`, an integer's digits). This is how a
+/// non-string choice label comes back as a `probabilities` key: upstream's `_to_internal`
+/// keeps the raw label as the dict key and FastAPI's `json.dumps` stringifies it.
+pub fn dumps_key(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => dumps(other),
+    }
+}
+
 fn write_value(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
@@ -572,6 +583,20 @@ mod tests {
         assert_eq!(dumps(&json!([])), "[]");
         assert_eq!(dumps(&json!(1e16)), "1e+16");
         assert_eq!(dumps(&json!(-0.0)), "-0.0");
+    }
+
+    /// Expected strings are the keys `json.dumps` writes for a dict keyed by the same values
+    /// under Python 3.14: `{1: 0, "b": 0, 1.5: 0, 1e16: 0, False: 0, None: 0}`.
+    #[test]
+    fn dumps_key_matches_json_dumps_dict_keys() {
+        assert_eq!(dumps_key(&json!(1)), "1");
+        assert_eq!(dumps_key(&json!("b")), "b");
+        assert_eq!(dumps_key(&json!("it's \"q\"\n")), "it's \"q\"\n");
+        assert_eq!(dumps_key(&json!(true)), "true");
+        assert_eq!(dumps_key(&json!(false)), "false");
+        assert_eq!(dumps_key(&json!(1.5)), "1.5");
+        assert_eq!(dumps_key(&json!(1e16)), "1e+16");
+        assert_eq!(dumps_key(&Value::Null), "null");
     }
 
     #[test]

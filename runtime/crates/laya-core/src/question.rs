@@ -46,8 +46,11 @@ pub struct Question {
     pub instructions: String,
     /// Option texts in label-index order; for noul always `[false, true]`.
     pub options: Vec<String>,
-    /// Choice label keys in option order (empty for other types).
-    pub choice_keys: Vec<String>,
+    /// Choice labels in option order as the caller wrote them: dict-form keys are strings,
+    /// list-form items keep their JSON type (`1`, `true`, `1.5`). Upstream's `_to_internal`
+    /// makes these the dict keys, so the answer's `choice` is the raw label and its
+    /// `probabilities` key is the label's [`pyjson::dumps_key`]. Empty for other types.
+    pub choice_labels: Vec<Value>,
     /// Score level descriptions as given (raw JSON values), for the `legend` output.
     pub score_legend: Vec<Value>,
 }
@@ -214,29 +217,32 @@ fn to_internal(qid: &str, qdef: &Map<String, Value>) -> Result<Question> {
     };
     let crit = qdef.get("criteria");
     let mut options = Vec::new();
-    let mut choice_keys = Vec::new();
+    let mut choice_labels = Vec::new();
     let mut score_legend = Vec::new();
     match qtype {
         QType::Choice => {
-            // dict: label -> description; list: labels only, each rendered with `str(label)`
-            // (`check` has rejected labels that are one Python dict key).
-            let mut entries: Vec<(String, Value)> = Vec::new();
+            // dict: label -> description; list: labels only, kept as the raw JSON value
+            // (`check` has rejected labels that are one Python dict key). `render_options`
+            // writes every label with `str(label)`, with or without a description.
+            let mut entries: Vec<(Value, Value)> = Vec::new();
             match crit {
-                Some(Value::Object(m)) => {
-                    entries.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())))
-                }
+                Some(Value::Object(m)) => entries.extend(
+                    m.iter()
+                        .map(|(k, v)| (Value::String(k.clone()), v.clone())),
+                ),
                 Some(Value::Array(a)) => {
-                    entries.extend(a.iter().map(|item| (pyjson::py_str(item), Value::Null)))
+                    entries.extend(a.iter().map(|item| (item.clone(), Value::Null)))
                 }
                 _ => unreachable!("validated"),
             }
-            for (k, v) in entries {
+            for (label, v) in entries {
+                let text = pyjson::py_str(&label);
                 options.push(if is_blank(Some(&v)) {
-                    k.clone()
+                    text
                 } else {
-                    format!("{}: {}", k, render_criterion(&v))
+                    format!("{}: {}", text, render_criterion(&v))
                 });
-                choice_keys.push(k);
+                choice_labels.push(label);
             }
         }
         QType::Score => {
@@ -285,7 +291,7 @@ fn to_internal(qid: &str, qdef: &Map<String, Value>) -> Result<Question> {
         qtype,
         instructions,
         options,
-        choice_keys,
+        choice_labels,
         score_legend,
     })
 }
@@ -343,8 +349,41 @@ mod tests {
             ["B: no, the statement does not hold", "A: yes money"]
         );
         // List labels render with `str(label)`: a number or bool as Python prints it.
-        assert_eq!(qs[4].choice_keys, ["a", "7", "2.5", "True", "it's"]);
-        assert_eq!(qs[4].options, qs[4].choice_keys);
+        assert_eq!(qs[4].options, ["a", "7", "2.5", "True", "it's"]);
+        assert_eq!(
+            qs[4].choice_labels,
+            [json!("a"), json!(7), json!(2.5), json!(true), json!("it's")]
+        );
+        // Dict-form labels are strings either way.
+        assert_eq!(
+            qs[0].choice_labels,
+            [json!("billing"), json!("other"), json!("zero"), json!("e")]
+        );
+        assert!(qs[1].choice_labels.is_empty() && qs[2].choice_labels.is_empty());
+    }
+
+    /// A list-form label keeps its JSON type: the option text is `str(label)`, the answer's
+    /// `choice` is the raw label and the `probabilities` key is what `json.dumps` writes for
+    /// it as a dict key.
+    #[test]
+    fn list_labels_keep_their_json_type() {
+        let qs = parse_questions(&json!({
+            "q": {"type": "choice", "instructions": "x", "criteria": [2, "b", true, 1.5]},
+        }))
+        .unwrap();
+        assert_eq!(qs[0].options, ["2", "b", "True", "1.5"]);
+        assert_eq!(qs[0].choice_labels, [json!(2), json!("b"), json!(true), json!(1.5)]);
+        assert!(qs[0].choice_labels[0].is_i64());
+        assert!(qs[0].choice_labels[1].is_string());
+        assert!(qs[0].choice_labels[2].is_boolean());
+        assert!(qs[0].choice_labels[3].is_f64());
+        let keys: Vec<String> = qs[0].choice_labels.iter().map(pyjson::dumps_key).collect();
+        assert_eq!(keys, ["2", "b", "true", "1.5"]);
+        // `1` and `True` are one Python dict key, so upstream refuses that list.
+        assert_eq!(
+            err("q", json!({"type": "choice", "instructions": "x", "criteria": [1, "b", true, 1.5]})),
+            "question 'q': choice label 2 (True) repeats label 0; the labels are the answer keys, so every option needs its own (1, 1.0 and True are one key)"
+        );
     }
 
     fn err(qid: &str, qdef: Value) -> String {
