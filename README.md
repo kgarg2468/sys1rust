@@ -15,7 +15,7 @@ Limits today:
 
 - Building needs a prebuilt MLX 0.32.2, which currently comes from the `mlx` Python wheel. The built binary links it by path. A self-contained release is the next step.
 - The runtime finds models in the local Hugging Face cache. It does not download them.
-- The GPU runs one forward pass at a time, so more clients wait longer instead of getting more throughput.
+- The GPU runs one forward pass at a time, so more clients do not get more throughput. `sys1d` holds up to `LAYA_MAX_CONCURRENT` requests at once (16 by default), one running and the rest waiting their turn. A request that arrives while all those slots are held is not queued. It gets `503` with `Retry-After: 1` at once, so clients must retry it.
 
 ## Supported models
 
