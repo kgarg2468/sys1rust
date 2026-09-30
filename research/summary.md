@@ -43,5 +43,5 @@ Jev: 0.727 to 0.754 depending on harness and date. "Decider" and "Lev" are decod
 - Batching's 3.6-10x speedup applies only on GPU. On CPU it is 0.8-2.4x.
 - laya-mlx has M3 Max data only, not M4 Pro. laya-apple numbers are M4 Max, not M5 Pro. All FluidInference numbers are on macOS 27.0.
 - The ~270 s ANE compile applies to laya-apple only. FluidInference's precompiled buckets load in 4.9 to 8.5 s.
-- kime's "10x": 13.7x at p50 for one question on a 4090, 6.9x at p95, 1.42x for ten questions, 0.80x on M4 Metal.
+- kime's "10x": 13.7x at p50 for one question on a 4090, 6.9x at p95, 1.42x for ten questions, 0.80x on M4 Metal. Report D calls the 13.7x an upper bound, because the kime and Laya timings came from different sessions. In that one-question setting kime matched Laya fp32 on CUDA on only 96 of 100 answers, below the 99% agreement this project requires. Against Laya fp32 on MPS it matched all 100, and Laya on CUDA matched 96 (Report D, section 2).
 - Upstream Laya server does serialize requests behind a lock (confirmed).
