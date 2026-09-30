@@ -77,13 +77,14 @@ runtime/target/release/sys1d --model typed-decisions --host 0.0.0.0 --port 8000
 
 ## Build and run inside the benchmark setup
 
-Use this instead of the steps above when working on the benchmark. `bench/env.sh` takes MLX from the laya-mlx contender's venv, so set that venv up first (`bench/contenders/laya-mlx/NOTES.md`). The script also keeps the Cargo output and the Hugging Face cache under `bench/`, so the binary is at `$CARGO_TARGET_DIR/release/sys1d`.
+Use this instead of the steps above when working on the benchmark. `bench/env.sh` takes MLX from the laya-mlx contender's venv, so set that venv up first (`bench/contenders/laya-mlx/NOTES.md`). The script also keeps the Cargo output and the Hugging Face cache under `bench/`, so the binary is at `$CARGO_TARGET_DIR/release/sys1d`. The commands download and serve the typed-decisions revision pinned in `bench/models.lock.json`, the one the results used.
 
 ```sh
 source bench/env.sh
 cargo build --release --manifest-path runtime/Cargo.toml
-bench/contenders/laya-mlx/.venv/bin/hf download convaiinnovations/laya-typed-decisions
-$CARGO_TARGET_DIR/release/sys1d --model typed-decisions --port 8000
+REV=1a793eb568e6718f15941d08f85432581df534e3   # typed-decisions sha in bench/models.lock.json
+bench/contenders/laya-mlx/.venv/bin/hf download convaiinnovations/laya-typed-decisions --revision $REV
+$CARGO_TARGET_DIR/release/sys1d --model typed-decisions --revision $REV --port 8000
 ```
 
 ## Layout
