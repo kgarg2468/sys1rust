@@ -1,11 +1,27 @@
 # Workloads
 
-Built by `build_workloads.py` and `build_short.py` (deterministic, seed 20260928). Rebuild with:
+`build_workloads.py` builds `smoke`, `correctness` and `timing`, and `build_short.py` builds `short`
+(deterministic, seed 20260928). No script builds `cold.jsonl` or `long.jsonl`; see "Cold and long
+workloads" below.
+
+The builders need Python with `transformers`, `pandas` and `huggingface_hub`. `build_short.py` also
+imports upstream `laya` 0.3.21. The spike ran them in the venv of a `laya-upstream` contender that is
+not in this repository. They download the pinned datasets themselves, but they load the tokenizers
+and `rl_agent_config.json` of the pinned checkpoints from `$HF_HOME/hub` and fail if those
+snapshots are missing. Rebuild with:
 
 ```
 source bench/env.sh
-bench/contenders/laya-upstream/.venv/bin/python bench/workloads/build_workloads.py
-cd bench/workloads && ../contenders/laya-upstream/.venv/bin/python build_short.py
+PY=python3   # any Python with the packages above
+$PY - <<'EOF'
+import json, huggingface_hub as hub
+lock = json.load(open("bench/models.lock.json"))
+for key in ("typed-decisions", "multilingual", "english"):
+    hub.snapshot_download(lock[key]["repo"], revision=lock[key]["sha"],
+                          allow_patterns=["tokenizer/*", "rl_agent_config.json"])
+EOF
+$PY bench/workloads/build_workloads.py
+cd bench/workloads && $PY build_short.py
 ```
 
 | file | requests | per shape | questions | questions with gold | distinct states |
@@ -14,6 +30,8 @@ cd bench/workloads && ../contenders/laya-upstream/.venv/bin/python build_short.p
 | `correctness.jsonl` | 300 | 25 | 1,500 | 825 | 300 |
 | `timing.jsonl` | 240 | 20 | 1,200 | 668 | 240 |
 | `short.jsonl` | 40 | 40 (one shape) | 40 | 40 | 40 |
+| `cold.jsonl` | 1 | 1 (one shape) | 1 | 1 | 1 |
+| `long.jsonl` | 60 | 20 | 300 | 200 | 60 |
 
 Shapes: state length 64 / 128 / 256 / 512 tokens times 1 / 4 / 10 questions. Question types across
 the correctness file: 526 choice, 571 score, 403 noul. `short.jsonl` has a single extra shape,
@@ -69,7 +87,10 @@ Sources:
 Token lengths come from the natural length of the state plus one of three JSON layouts of the same
 content, chosen in this order: `default` (upstream's serialization), `compact` (no spaces after
 separators) or `pretty` (`indent=2`). The content and therefore the gold label are unchanged; only
-whitespace differs. Nothing is truncated or padded.
+whitespace differs. No typed-decisions state is truncated or padded. Both builders cut each support
+ticket body to its first 3,000 characters when they load the CSV. No committed ticket reaches that
+limit. Only tickets of 24 to 70 state tokens are selected, and the longest ticket body in any
+workload file is 374 characters.
 
 Composition by bucket (correctness file):
 
@@ -120,6 +141,20 @@ is stored per checkpoint in `meta.seq_tokens`. The shape is recorded as
 - The dataset labels are synthetic, and the questions are new to every checkpoint. The references
   score 0.800 (`typed-decisions`), 0.825 (`multilingual`) and 0.750 (`english`) on the 40 gold
   answers, but 40 decisions is a small sample. The file is meant for agreement with the reference.
+
+## Cold and long workloads
+
+No script in this repository builds these two files, and none was kept from the spike. They were
+derived from the built files as described below, which matches the committed data exactly.
+
+- `cold.jsonl` is the first line of `short.jsonl`, unchanged. Cold-start runs use it with `--warmup 0`.
+- `long.jsonl` takes the 60 `s512` requests of `timing.jsonl` in file order. Each state is repeated
+  twice, joined by a blank line (`state + "\n\n" + state`), so it is no longer a JSON object. The id
+  prefix `s512` becomes `s1024` and `shape.state_tokens` becomes 1024. `gold` and `meta` are copied
+  unchanged, so the `meta` token counts describe one copy of the state. The doubled states are 924 to
+  1,126 English tokens and 965 to 1,495 multilingual tokens. The 1,024-token `max_len` cuts the end
+  of 223 of the 300 question sequences with `typed-decisions` and all 300 with `multilingual`. There
+  is no reference for this file; it was used for memory and speed checks, not for agreement.
 
 ## Order
 
