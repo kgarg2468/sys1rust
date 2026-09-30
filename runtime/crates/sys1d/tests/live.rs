@@ -2,8 +2,9 @@
 //! revision pinned in `bench/models.lock.json` in the HF cache, `source bench/env.sh` first).
 //! Starts the real `sys1d` binary on port 0 at that revision with every server setting
 //! pinned (the caller's environment cannot change them), posts every request in
-//! `bench/workloads/smoke.jsonl`, requires each answer to equal an in-process
-//! `Agent::predict` of the same revision and engine settings byte for byte, checks it against
+//! `bench/workloads/smoke.jsonl`, requires each response body to equal, byte for byte, an
+//! in-process `Agent::predict` of the same revision and engine settings serialized the way
+//! the server serializes (so formatting and key order count, not just values), checks it against
 //! the fp32 CPU reference (key sets and order, every numeric field within a tolerance,
 //! categorical agreement), then stops it with SIGINT. The child is killed if the test fails
 //! or hangs at any point.
@@ -298,7 +299,8 @@ async fn smoke_workload_through_the_real_server() {
     eprintln!("health: {hv}");
 
     // Post every smoke request over one kept-alive connection.
-    let mut served: Vec<(String, Value)> = Vec::new();
+    // Each served request: its id, the raw response body and the parsed body.
+    let mut served: Vec<(String, Vec<u8>, Value)> = Vec::new();
     let mut latencies = Vec::new();
     for row in &workload {
         let body = row["body"].to_string();
@@ -323,7 +325,7 @@ async fn smoke_workload_through_the_real_server() {
         let v = r.json();
         assert_eq!(v["routing"]["model"], MODEL);
         assert_eq!(v["model"], "laya-rl-agent");
-        served.push((row["id"].as_str().unwrap().to_string(), v));
+        served.push((row["id"].as_str().unwrap().to_string(), r.body, v));
     }
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     eprintln!(
@@ -340,9 +342,17 @@ async fn smoke_workload_through_the_real_server() {
 
     // In-process answers from the same revision with the same engine settings (the ones
     // pinned on the child's command line: the default tuning, f16) must equal the served
-    // ones byte for byte. Resolve it the way the binary did, so both sides read one snapshot.
+    // ones byte for byte: the result with the server's `routing` block appended, serialized
+    // by the same serde_json call the inference thread uses, is the whole response body. A
+    // parsed comparison would let whitespace or key order differ. Resolve the checkpoint the
+    // way the binary did, so both sides read one snapshot.
     let local_model = sys1d::config::resolve_served(MODEL, Some(&sha)).unwrap();
     assert_eq!(local_model.revision.as_deref(), Some(sha.as_str()));
+    let routing = serde_json::json!({
+        "model": local_model.name,
+        "repo": local_model.repo,
+        "reason": "only checkpoint served",
+    });
     let dir = local_model.dir;
     let opts = BackendOptions {
         f32: false,
@@ -350,13 +360,13 @@ async fn smoke_workload_through_the_real_server() {
         ..Default::default()
     };
     let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend)).unwrap();
-    for (row, (id, over_http)) in workload.iter().zip(&served) {
-        let local = agent
+    for (row, (id, raw, over_http)) in workload.iter().zip(&served) {
+        let mut local = agent
             .predict(&row["body"]["state"], &row["body"]["questions"])
             .unwrap();
+        // Diagnostics first: name the question and the size of the gap when values differ.
         assert_eq!(local["usage"], over_http["usage"], "{id}");
         if local["answers"] != over_http["answers"] {
-            // Name the question and the size of the gap before failing.
             let (la, ha) = (
                 local["answers"].as_object().unwrap(),
                 over_http["answers"].as_object().unwrap(),
@@ -375,9 +385,26 @@ async fn smoke_workload_through_the_real_server() {
                 over_http["answers"], local["answers"]
             );
         }
+        // Then the bytes: the same values can still be laid out differently.
+        local["routing"] = routing.clone();
+        let expected = serde_json::to_vec(&local).unwrap();
+        if expected != *raw {
+            let first = expected
+                .iter()
+                .zip(raw.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(expected.len().min(raw.len()));
+            panic!(
+                "{id}: response bytes differ from Agent::predict serialized at byte {first}: served {:?} in-process {:?}",
+                String::from_utf8_lossy(&raw[first.saturating_sub(40)..(first + 40).min(raw.len())]),
+                String::from_utf8_lossy(
+                    &expected[first.saturating_sub(40)..(first + 40).min(expected.len())]
+                )
+            );
+        }
     }
     eprintln!(
-        "in-process agreement: {}/{} requests byte-identical answers",
+        "in-process agreement: {}/{} response bodies byte-identical",
         served.len(),
         served.len()
     );
@@ -386,7 +413,7 @@ async fn smoke_workload_through_the_real_server() {
     // the reference's key set in the reference's order, every numeric field is within its
     // tolerance, and the categorical answer (argmax choice, rounded score, noul side) agrees
     // on at least 99% of answers.
-    let served_ids: BTreeSet<&str> = served.iter().map(|(id, _)| id.as_str()).collect();
+    let served_ids: BTreeSet<&str> = served.iter().map(|(id, _, _)| id.as_str()).collect();
     let reference_ids: BTreeSet<&str> = reference
         .iter()
         .map(|r| r["id"].as_str().unwrap())
@@ -407,7 +434,7 @@ async fn smoke_workload_through_the_real_server() {
         ("action.act_probability", REFERENCE_TOL, 0.0),
         ("score", SCORE_TOL, 0.0),
     ];
-    for (id, over_http) in &served {
+    for (id, _, over_http) in &served {
         let reference = reference
             .iter()
             .find(|r| r["id"] == *id)
