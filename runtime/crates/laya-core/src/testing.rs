@@ -183,7 +183,9 @@ fn flat_f32(v: &Value) -> Vec<f32> {
 }
 
 /// Largest element-wise difference. A backend output of the wrong length is an error rather
-/// than a comparison over the shorter prefix, which would report zero for a truncated output.
+/// than a comparison over the shorter prefix, which would report zero for a truncated output,
+/// and a value that is not finite on either side is an error rather than a NaN difference
+/// that `f32::max` would drop.
 fn max_abs_diff(case: &str, what: &str, got: &[f32], want: &[f32]) -> Result<f32> {
     if got.len() != want.len() {
         return Err(crate::Error::Backend(format!(
@@ -192,11 +194,17 @@ fn max_abs_diff(case: &str, what: &str, got: &[f32], want: &[f32]) -> Result<f32
             want.len()
         )));
     }
-    Ok(got
-        .iter()
-        .zip(want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max))
+    let mut worst = 0f32;
+    for (i, (a, b)) in got.iter().zip(want).enumerate() {
+        let d = (a - b).abs();
+        if !d.is_finite() {
+            return Err(crate::Error::Backend(format!(
+                "{case}: {what}[{i}] is {a}, the fixture has {b}; not a finite difference"
+            )));
+        }
+        worst = worst.max(d);
+    }
+    Ok(worst)
 }
 
 /// The key with the largest value, first in object order on a tie (`max(probs, key=...)`).
@@ -245,32 +253,41 @@ pub fn same_decision(got: &Value, want: &Value) -> bool {
     }
 }
 
-/// Largest absolute difference over the numeric leaves shared by two values.
-fn numeric_max_diff(got: &Value, want: &Value, prob_max: &mut f64) {
-    match (got, want) {
-        (Value::Object(a), Value::Object(b)) => {
+/// Largest absolute difference over the numeric leaves of the fixture answer (`want`),
+/// `act_probability` included. Every number the fixture has must be a finite number in `got`
+/// too: a NaN from the backend turns into JSON `null` through `round_dp`, and skipping it would
+/// let a broken forward pass through with its decision unchanged. `path` names the leaf.
+fn numeric_max_diff(path: &str, got: &Value, want: &Value, prob_max: &mut f64) -> Result<()> {
+    match want {
+        Value::Object(b) => {
+            // `get` on a non-object is `None`: a missing object fails at its first number.
             for (k, wv) in b {
-                if let Some(gv) = a.get(k) {
-                    numeric_max_diff(gv, wv, prob_max);
-                }
+                let gv = got.get(k).unwrap_or(&Value::Null);
+                numeric_max_diff(&format!("{path}.{k}"), gv, wv, prob_max)?;
             }
+            Ok(())
         }
-        (Value::Number(a), Value::Number(b)) => {
-            let d = (a.as_f64().unwrap_or(0.0) - b.as_f64().unwrap_or(0.0)).abs();
-            if d > *prob_max {
-                *prob_max = d;
-            }
+        Value::Number(b) => {
+            let finite = |v: &Value| v.as_f64().filter(|x| x.is_finite());
+            let (Some(x), Some(y)) = (finite(got), finite(want)) else {
+                return Err(Error::Backend(format!(
+                    "{path} is {got}, the fixture has {b}; not a finite number"
+                )));
+            };
+            *prob_max = prob_max.max((x - y).abs());
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
 /// Compare two `answers` objects: the max abs difference over numeric leaves and the number
-/// of questions whose decision differs or whose answer is missing.
-fn compare_answers(got: &Value, want: &Value) -> (f64, usize) {
+/// of questions whose decision differs or whose answer is missing. An answer whose numbers
+/// cannot be compared is an error, see [`numeric_max_diff`].
+fn compare_answers(got: &Value, want: &Value) -> Result<(f64, usize)> {
     let (mut prob_max, mut mismatches) = (0f64, 0usize);
     let Some(want) = want.as_object() else {
-        return (prob_max, mismatches);
+        return Ok((prob_max, mismatches));
     };
     for (qid, w) in want {
         match got.get(qid) {
@@ -278,12 +295,12 @@ fn compare_answers(got: &Value, want: &Value) -> (f64, usize) {
                 if !same_decision(g, w) {
                     mismatches += 1;
                 }
-                numeric_max_diff(g, w, &mut prob_max);
+                numeric_max_diff(qid, g, w, &mut prob_max)?;
             }
             None => mismatches += 1,
         }
     }
-    (prob_max, mismatches)
+    Ok((prob_max, mismatches))
 }
 
 /// Fixtures from a laya older than 0.3.21 have no `answer_confidence`; drop it from `got`
@@ -341,13 +358,21 @@ pub fn run_parity(
         let forward_ms = t0.elapsed().as_secs_f64() * 1e3;
         let want_logits = flat_f32(&case["masked_logits"]);
         let want_pooled = flat_f32(&case["pooled"]);
-        let mut logits_max = 0f32;
+        // Only the real option slots of each row; the padded ones hold the mask fill.
+        let (mut got_l, mut want_l) = (Vec::new(), Vec::new());
         for r in 0..batch.n {
             for k in 0..batch.marker_count[r] {
                 let i = r * batch.kmax + k;
-                logits_max = logits_max.max((out.logits[i] - want_logits[i]).abs());
+                got_l.push(out.logits[i]);
+                want_l.push(*want_logits.get(i).ok_or_else(|| {
+                    Error::Backend(format!(
+                        "{name}: masked_logits has {} values, row {r} slot {k} needs index {i}",
+                        want_logits.len()
+                    ))
+                })?);
             }
         }
+        let logits_max = max_abs_diff(&name, "masked logits", &got_l, &want_l)?;
         let pooled_max = max_abs_diff(&name, "pooled", &out.pooled, &want_pooled)?;
         let encoder_hidden_max_abs = match case.get("encoder_hidden_item0") {
             Some(h) if !h.is_null() => {
@@ -363,7 +388,7 @@ pub fn run_parity(
         let mut answers = decode_answers(&out, &batch, &act_head, &temps, &qs, 0)?;
         let want = &case["result"]["answers"];
         drop_answer_confidence_if_absent(&mut answers, want);
-        let (prob_max, decision_mismatches) = compare_answers(&answers, want);
+        let (prob_max, decision_mismatches) = compare_answers(&answers, want)?;
         report.cases.push(CaseReport {
             name,
             rows: batch.n,
@@ -507,13 +532,90 @@ mod tests {
             "n": {"type": "noul", "noul": 0.505},
             "s": {"type": "score", "score": 1.5, "probabilities": {"0": 0.0, "1": 0.49, "2": 0.51}},
         });
-        let (prob_max, mismatches) = compare_answers(&got, &want);
+        let (prob_max, mismatches) = compare_answers(&got, &want).unwrap();
         assert_eq!(mismatches, 4);
         assert!((prob_max - 0.02).abs() < 1e-9, "{prob_max}");
-        let (prob_max, mismatches) = compare_answers(&want, &want);
+        let (prob_max, mismatches) = compare_answers(&want, &want).unwrap();
         assert_eq!((prob_max, mismatches), (0.0, 0));
+        // A changed type is a mismatch; the fixture's numbers the answer lacks are an error.
         let other_type = json!({"c": {"type": "noul", "noul": 1.0}});
-        assert_eq!(compare_answers(&other_type, &json!({"c": want["c"]})).1, 1);
+        let want_c = json!({"c": {"type": "choice", "choice": "a"}});
+        assert_eq!(compare_answers(&other_type, &want_c).unwrap().1, 1);
+        let e = compare_answers(&other_type, &json!({"c": want["c"]}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("c.probabilities.a is null"), "{e}");
+    }
+
+    /// A NaN from the backend must fail the case, not vanish in a `max`: the drift helper
+    /// errors on it, and so does the answer comparison on the `act_probability` it becomes
+    /// (`round_dp(NaN)` serializes as `null`), while the decision itself is unchanged.
+    #[test]
+    fn a_non_finite_backend_output_fails_the_case() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let e = max_abs_diff("c", "pooled", &[0.0, bad], &[0.0, 0.0])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("pooled[1]") && e.contains("not a finite difference"),
+                "{e}"
+            );
+        }
+        assert_eq!(
+            max_abs_diff("c", "pooled", &[0.5, 1.0], &[0.0, 0.0]).unwrap(),
+            1.0
+        );
+
+        // Decode one noul row whose pooled state holds a NaN: the logits are fine, so the
+        // decision is the fixture's, but `act_probability` is null.
+        let qs = parse_questions(&json!({"q": {"type": "noul", "instructions": "x"}})).unwrap();
+        let batch = crate::sequence::collate(
+            &[crate::sequence::EncodedItem {
+                ids: vec![0, 1, 2],
+                markers: vec![1, 2],
+                qtype: crate::QType::Noul,
+            }],
+            0,
+        );
+        let out = BackendOutput {
+            logits: vec![0.0, 1.0],
+            pooled: vec![0.25, f32::NAN],
+        };
+        let head = ActHead::from_tensors(
+            vec![1, 6],
+            vec![0.1; 6],
+            vec![0.0],
+            vec![2, 1],
+            vec![0.5, -0.5],
+            vec![0.0; 2],
+        )
+        .unwrap();
+        let temps = Temperatures {
+            by_type: [1.0; 3],
+            by_options: serde_json::Map::new(),
+            rejected: vec![],
+        };
+        let got = decode_answers(&out, &batch, &head, &temps, &qs, 0).unwrap();
+        assert!(got["q"]["action"]["act_probability"].is_null(), "{got}");
+        assert_eq!(got["q"]["noul"], 0.7311);
+        let want = json!({"q": {"type": "noul", "noul": 0.7311, "confidence": 0.7311,
+                                 "answer_confidence": 0.7311, "action": {"act_probability": 0.4}}});
+        assert!(same_decision(&got["q"], &want["q"]));
+        let e = compare_answers(&got, &want).unwrap_err().to_string();
+        assert!(
+            e.contains("q.action.act_probability is null") && e.contains("fixture has 0.4"),
+            "{e}"
+        );
+        // With a finite pooled state the same row compares, act_probability included.
+        let out = BackendOutput {
+            logits: vec![0.0, 1.0],
+            pooled: vec![0.25, 0.25],
+        };
+        let got = decode_answers(&out, &batch, &head, &temps, &qs, 0).unwrap();
+        let (prob_max, mismatches) = compare_answers(&got, &want).unwrap();
+        let act = got["q"]["action"]["act_probability"].as_f64().unwrap();
+        assert!(((act - 0.4).abs() - prob_max).abs() < 1e-12, "{got}");
+        assert_eq!(mismatches, 0);
     }
 
     #[test]
