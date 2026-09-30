@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/laya-core",
     "crates/laya-mlx",
+    "crates/sys1-bench",
 ]
 
 [workspace.package]
