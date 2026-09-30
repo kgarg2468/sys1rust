@@ -1,23 +1,28 @@
-//! Live end-to-end test (ignored by default; needs the typed-decisions checkpoint in the HF
-//! cache, `source bench/env.sh` first). Starts the real `sys1d` binary on port 0, posts every
-//! request in `bench/workloads/smoke.jsonl`, checks the answers against an in-process
-//! `Agent::predict` and against the fp32 CPU reference (key sets and order, every numeric
+//! Live end-to-end test (ignored by default; needs the typed-decisions checkpoint at the
+//! revision pinned in `bench/models.lock.json` in the HF cache, `source bench/env.sh` first).
+//! Starts the real `sys1d` binary on port 0 at that revision, posts every request in
+//! `bench/workloads/smoke.jsonl`, checks the answers against an in-process `Agent::predict`
+//! of the same revision and against the fp32 CPU reference (key sets and order, every numeric
 //! field within a tolerance, categorical agreement), then stops it with SIGINT. The child is
 //! killed if the test fails or hangs at any point.
 //!
-//! Run with: `cargo test -p sys1d --release --test live -- --ignored --nocapture`
+//! Run from the repository root with:
+//! `cargo test --manifest-path runtime/Cargo.toml -p sys1d --release --test live -- --ignored --nocapture`
 
 mod common;
 
-use common::{build_request, read_response, send};
+use common::{build_request, read_response, send, Resp};
 use laya_core::{Agent, BackendOptions};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+
+/// Upstream's name for the served checkpoint, and its key in `bench/models.lock.json`.
+const MODEL: &str = "typed-decisions";
 
 /// Served (f16 on the GPU) against in-process with the same engine: the same numbers.
 const SAME_ENGINE_TOL: f64 = 1e-3;
@@ -32,12 +37,40 @@ const SCORE_TOL: f64 = 0.005;
 /// Model load is about 3 s, warm-up under 1 s; a ready line later than this means a hang.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+/// One request round trip (send plus the full response) over the kept-alive connection. A
+/// smoke request takes milliseconds; a stall past this fails the test instead of hanging it,
+/// so the server guard still runs.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn bench_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../bench")
         .canonicalize()
         .unwrap()
+}
+
+/// The pinned snapshot sha of `name` in `bench/models.lock.json`, the revision the fp32
+/// reference was produced from.
+fn pinned_sha(bench: &Path, name: &str) -> String {
+    let path = bench.join("models.lock.json");
+    let lock: Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    lock[name]["sha"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: no sha for {name:?}", path.display()))
+        .to_string()
+}
+
+/// Send `req` and read its response, within `REQUEST_TIMEOUT`.
+async fn round_trip(conn: &mut TcpStream, req: &[u8], what: &str) -> Resp {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        send(conn, req).await;
+        read_response(conn).await
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: no complete response within {REQUEST_TIMEOUT:?}"))
 }
 
 fn read_jsonl(path: &PathBuf) -> Vec<Value> {
@@ -97,10 +130,11 @@ fn field_diff(a: &Value, b: &Value, key: &str) -> Option<f64> {
 struct Server(Child);
 
 impl Server {
-    fn spawn() -> Server {
+    /// Start the binary on a free port, serving `MODEL` at snapshot `revision`.
+    fn spawn(revision: &str) -> Server {
         Server(
             Command::new(env!("CARGO_BIN_EXE_sys1d"))
-                .args(["--port", "0", "--model", "typed-decisions"])
+                .args(["--port", "0", "--model", MODEL, "--revision", revision])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -172,10 +206,12 @@ async fn smoke_workload_through_the_real_server() {
     let workload = read_jsonl(&bench.join("workloads/smoke.jsonl"));
     let reference = read_jsonl(&bench.join("reference/typed-decisions/smoke.jsonl"));
     assert!(!workload.is_empty());
+    // The reference was produced from the pinned revision; serve and load that same one.
+    let sha = pinned_sha(&bench, MODEL);
 
     // Start the binary on a free port and parse its ready line.
     let t0 = Instant::now();
-    let mut server = Server::spawn();
+    let mut server = Server::spawn(&sha);
     let line = server.ready_line();
     let ready: Value =
         serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("ready line {line:?}: {e}"));
@@ -185,20 +221,23 @@ async fn smoke_workload_through_the_real_server() {
         line.trim()
     );
     assert_eq!(ready["event"], "listening");
-    assert_eq!(ready["model"], "typed-decisions");
+    assert_eq!(ready["model"], MODEL);
+    assert_eq!(ready["revision"], sha, "served revision is the pinned one");
     assert!(ready["engine"].as_str().unwrap().starts_with("mlx("));
     assert!(ready["load_ms"].as_f64().unwrap() > 0.0);
     let addr = ready["addr"].as_str().unwrap().to_string();
 
     let mut conn = TcpStream::connect(&addr).await.unwrap();
-    let h = {
-        send(&mut conn, &build_request("GET", "/health", &[], None)).await;
-        read_response(&mut conn).await
-    };
+    let h = round_trip(
+        &mut conn,
+        &build_request("GET", "/health", &[], None),
+        "GET /health",
+    )
+    .await;
     assert_eq!(h.status, 200);
     let hv = h.json();
     assert_eq!(hv["status"], "ok");
-    assert_eq!(hv["loaded"], serde_json::json!(["typed-decisions"]));
+    assert_eq!(hv["loaded"], serde_json::json!([MODEL]));
     eprintln!("health: {hv}");
 
     // Post every smoke request over one kept-alive connection.
@@ -213,8 +252,7 @@ async fn smoke_workload_through_the_real_server() {
             Some(body.as_bytes()),
         );
         let t = Instant::now();
-        send(&mut conn, &req).await;
-        let r = read_response(&mut conn).await;
+        let r = round_trip(&mut conn, &req, &format!("POST {}", row["id"])).await;
         latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(
             r.status,
@@ -226,7 +264,7 @@ async fn smoke_workload_through_the_real_server() {
         let infer: f64 = r.header("x-inference-time-ms").unwrap().parse().unwrap();
         assert!(infer > 0.0);
         let v = r.json();
-        assert_eq!(v["routing"]["model"], "typed-decisions");
+        assert_eq!(v["routing"]["model"], MODEL);
         assert_eq!(v["model"], "laya-rl-agent");
         served.push((row["id"].as_str().unwrap().to_string(), v));
     }
@@ -243,9 +281,11 @@ async fn smoke_workload_through_the_real_server() {
     let exit = server.stop();
     assert_eq!(exit.code(), Some(0), "clean shutdown exit code");
 
-    // In-process answers with the same engine settings must match the served ones.
-    let dir = laya_core::resolve::resolve_model_dir("convaiinnovations/laya-typed-decisions", None)
-        .unwrap();
+    // In-process answers from the same revision with the same engine settings must match the
+    // served ones. Resolve it the way the binary did, so both sides read one snapshot.
+    let local_model = sys1d::config::resolve_served(MODEL, Some(&sha)).unwrap();
+    assert_eq!(local_model.revision.as_deref(), Some(sha.as_str()));
+    let dir = local_model.dir;
     let opts = BackendOptions {
         tuning: Some(sys1d::config::DEFAULT_TUNING.into()),
         ..Default::default()
