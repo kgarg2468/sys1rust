@@ -185,6 +185,21 @@ impl ActHead {
         Ok(())
     }
 
+    /// The head's output classes must be `len(act_costs) + 1`: upstream builds
+    /// `nn.Linear(256, n_act)` from the config and `load_state_dict(strict=True)` refuses a
+    /// checkpoint of another width, so `act_probability` never comes from a head trained for
+    /// a different action set.
+    pub fn check_n_act(&self, n_act: usize) -> Result<()> {
+        if self.n_act != n_act {
+            return Err(Error::Weights(format!(
+                "act_head.2.weight has {} output classes, but rl_agent_config.json lists {} act_costs, so the action head must have {n_act}",
+                self.n_act,
+                n_act.saturating_sub(1)
+            )));
+        }
+        Ok(())
+    }
+
     /// Action-class probabilities for one row.
     pub fn probs(&self, pooled: &[f32], feats: [f32; 4]) -> Vec<f32> {
         debug_assert_eq!(pooled.len() + 4, self.d_in);
@@ -416,6 +431,28 @@ mod tests {
         );
         // Zero weights: every action class is equally likely.
         assert_eq!(head.probs(&[1.0, 2.0], [0.5, 0.1, 0.2, 0.01]), [0.5, 0.5]);
+    }
+
+    /// A one-class head with a config listing one act cost (two classes) would report
+    /// `act_probability` 1.0 for every answer; the mismatch is a weights error instead.
+    #[test]
+    fn act_head_output_classes_must_match_act_costs() {
+        let dir = act_head_checkpoint(6, 8, 1, 8);
+        let head = ActHead::load(&Weights::open(&dir).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(head.n_act, 1);
+        head.check_n_act(1).unwrap();
+        let e = head.check_n_act(2).unwrap_err().to_string();
+        assert!(
+            e.contains("1 output classes") && e.contains("lists 1 act_costs") && e.contains("must have 2"),
+            "{e}"
+        );
+        let dir = act_head_checkpoint(6, 8, 3, 8);
+        let head = ActHead::load(&Weights::open(&dir).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        head.check_n_act(3).unwrap();
+        let e = head.check_n_act(2).unwrap_err().to_string();
+        assert!(e.contains("3 output classes"), "{e}");
     }
 
     #[test]
