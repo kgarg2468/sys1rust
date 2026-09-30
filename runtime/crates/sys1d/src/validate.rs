@@ -5,7 +5,7 @@
 
 use crate::config::checkpoint_name;
 use axum::http::StatusCode;
-use laya_core::pyjson::repr_str;
+use laya_core::pyjson::{py_str, repr_str};
 use serde_json::Value;
 
 pub const MAX_QUESTIONS: usize = 64;
@@ -146,17 +146,17 @@ pub fn check_limits(state: &Value, questions: &Value) -> Result<(), Rejection> {
     Ok(())
 }
 
-/// Characters in the state as upstream counts them for a string (`len(str)`, i.e. Unicode
-/// scalar values). Upstream measures a non-string state as `len(str(state))`, the Python
-/// repr of the decoded object (`{'a': 1}`, `True`, `None`); sys1d measures its compact JSON
-/// text (`{"a":1}`, `true`, `null`) instead, which differs by the spaces after `,` and `:`
-/// and the literal spellings. Both are guards on the same order of magnitude, not a contract.
+/// Characters in the state as upstream counts them (`laya_serve.py`, `_check_request_limits`):
+/// `len(state) if isinstance(state, str) else len(str(state))`, so a string by its Unicode
+/// scalar values and anything else by the Python repr of the decoded object (`{'a': 1}` is 8,
+/// `True` and `None` are 4). Upstream wraps that in `try/except Exception` with a fallback of
+/// `MAX_STATE_CHARS + 1`; the only way `str()` fails on a decoded JSON value is a
+/// RecursionError on nesting past Python's limit, and serde_json refuses a body nested past
+/// 128 levels before this check runs, so there is no such branch here.
 pub fn state_chars(state: &Value) -> usize {
     match state {
         Value::String(s) => s.chars().count(),
-        other => serde_json::to_string(other)
-            .map(|s| s.chars().count())
-            .unwrap_or(MAX_STATE_CHARS + 1),
+        other => py_str(other).chars().count(),
     }
 }
 
@@ -194,11 +194,26 @@ mod tests {
         );
     }
 
+    /// A string is measured as is; anything else as Python's `str()` of it (`{'a': 1}`,
+    /// `True`, `None`, `[1, 2.0, 'x']`), spaces and literal spellings included.
     #[test]
-    fn state_chars_counts_scalars_or_compact_json() {
+    fn state_chars_is_len_of_python_str() {
         assert_eq!(state_chars(&json!("héllo")), 5);
-        assert_eq!(state_chars(&json!({"a": 1})), 7);
+        assert_eq!(state_chars(&json!("it's")), 4);
+        assert_eq!(state_chars(&json!({"a": 1})), 8);
         assert_eq!(state_chars(&json!(true)), 4);
+        assert_eq!(state_chars(&Value::Null), 4);
+        assert_eq!(state_chars(&json!([1, 2.0, "x"])), 13);
+        assert_eq!(state_chars(&json!({"k": "héllo"})), 14);
+        // The limit is on the Python text: `['aa', 'aa', ...]` is 6 chars per item, so 8334
+        // items are 50004 (a 413 with that count in the detail) and 8333 are 49998.
+        let items: Vec<Value> = (0..8334).map(|_| json!("aa")).collect();
+        assert_eq!(state_chars(&Value::Array(items.clone())), 50_004);
+        let e = check_limits(&Value::Array(items), &json!({})).unwrap_err();
+        assert_eq!(e.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(e.detail, "state too large (50004 > 50000 chars)");
+        let items: Vec<Value> = (0..8333).map(|_| json!("aa")).collect();
+        assert!(check_limits(&Value::Array(items), &json!({})).is_ok());
     }
 
     #[test]
