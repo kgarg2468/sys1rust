@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 
 /// Upstream's default admission bound, also the fallback for an invalid `LAYA_MAX_CONCURRENT`.
 pub const DEFAULT_MAX_CONCURRENT: usize = 16;
-/// Engine settings measured in `results/SPIKE.md`: fp16 GELU, a 512 MiB MLX buffer cache
-/// (unbounded, it grows to about RAM size and pushes the machine into swap), 2 GiB wired.
-pub const DEFAULT_TUNING: &str = "f16gelu,cache=512,wired=2048";
+/// Engine settings. From `results/SPIKE.md`: fp16 GELU, a 512 MiB MLX buffer cache (unbounded,
+/// it grows to about RAM size and pushes the machine into swap), 2 GiB wired. From
+/// `results/SPEED.md`: dense local attention up to 1,024 tokens, the last head layer only at
+/// the rows the scorer reads, and no computing on padding; together 0.90 of the time of the
+/// SPIKE settings, with the same answers (probabilities within 0.0005 on all three models).
+pub const DEFAULT_TUNING: &str = "f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad";
 
 /// Checkpoint names and their Hugging Face repos, in upstream's naming.
 pub const CHECKPOINTS: [(&str, &str); 3] = [

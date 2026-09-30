@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const CONTENDER: &str = "sys1rust";
-const MODELS: [&str; 2] = ["typed-decisions", "multilingual"];
+const MODELS: [&str; 3] = ["typed-decisions", "multilingual", "english"];
 
 struct Variant {
     name: &'static str,
@@ -27,7 +27,7 @@ fn tuned(tuning: &str) -> BackendOptions {
     BackendOptions { tuning: Some(tuning.into()), ..Default::default() }
 }
 
-const VARIANTS: [Variant; 5] = [
+const VARIANTS: [Variant; 6] = [
     Variant {
         name: "mlx-fp16",
         notes: "laya-r-mlx 914c9a7 as forked, unchanged: fp16 weights, questions in one batch padded to the \
@@ -45,6 +45,13 @@ const VARIANTS: [Variant; 5] = [
                 grow to about the size of RAM when request lengths vary) and a 2 GiB wired limit so \
                 the weights stay resident.",
         opts: || tuned("f16gelu,cache=512,wired=2048"),
+    },
+    Variant {
+        name: "mlx-fp16-lean",
+        notes: "mlx-fp16-fast plus the results/SPEED.md work reductions, the sys1d default: dense local \
+                attention up to 1,024 tokens, the last head layer only at the scorer's rows, no computing \
+                on padding.",
+        opts: || tuned("f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad"),
     },
     Variant {
         name: "mlx-env",
