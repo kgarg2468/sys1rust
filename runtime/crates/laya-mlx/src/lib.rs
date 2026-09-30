@@ -8,7 +8,11 @@
 //! Changed in sys1rust from laya-r-mlx 914c9a7: `Knobs` (settings from
 //! `BackendOptions::tuning` or `SYS1_MLX`), the `f16gelu` fix for the f16 -> f32 promotion in
 //! GELU, length buckets with warm-up at load, MLX cache and wired limits, optional boolean
-//! masks, and diagnostic timing.
+//! masks, and diagnostic timing. Work-reduction knobs, off unless asked for (measured in
+//! `results/SPEED.md`): `dense_upto` (the dense/chunked local-attention switch), `headprune`
+//! (last head layer only on the rows the scorer reads) and `unpad` (hidden states packed to
+//! the real tokens outside attention). Experiments that gained nothing (`split`, `rope1`,
+//! `splitk`) were removed after commit 0495800; that commit has their code.
 
 use laya_core::weights::{to_f16, to_f32};
 use laya_core::{
@@ -19,37 +23,24 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{fast, nn, ops, transforms, Array, Dtype, Stream};
 use safetensors::SafeTensors;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Finite "minus infinity" for additive attention masks (safe in f16, no NaN rows).
 const MASK_NEG: f32 = -1e4;
 /// Logit value reported for masked marker slots.
 const LOGIT_MASKED: f32 = -1e4;
-/// Distinct input shapes the per-shape GeGLU (`geglu=compiled`) compiles before new shapes take
-/// the shapeless trace instead. MLX keeps every per-shape trace for the life of the process, so
-/// this count bounds that memory; 64 covers a few length buckets times the row counts a server
-/// sees, and the shapeless trace serves everything past it.
-const GEGLU_MAX_SHAPES: usize = 64;
 
 /// Backend settings, read once at load from `BackendOptions::tuning` or else `SYS1_MLX` (comma
 /// list, e.g. `f16gelu,mask=bool`). Defaults reproduce laya-r-mlx 914c9a7.
-///
-/// Parsing is strict: an unknown setting or a value the setting cannot take is an
-/// [`Error::Config`] naming it, so a run cannot be labeled with a setting that was never
-/// applied. Flags take no value (`f16gelu`) or `=0`/`=1`; everything else needs `key=value`.
 #[derive(Debug, Clone)]
 struct Knobs {
-    /// `shapeless` (default): split outside, GELU * gate compiled once for all shapes.
-    /// `compiled`: split + GELU + gate compiled per input shape, one trace per distinct
-    /// `(rows, len)` that MLX never frees, so at most [`GEGLU_MAX_SHAPES`] shapes are compiled
-    /// this way and every new shape after that runs the shapeless trace; for experiments only.
-    /// `plain`: no compile.
+    /// `compiled`: split + GELU + gate compiled per shape (default). `plain`: no compile.
+    /// `shapeless`: split outside, GELU * gate compiled once for all shapes.
     geglu: String,
     /// Fuse residual adds into the gemm with `addmm` (default) or use matmul + add.
     addmm: bool,
-    /// Boolean attention masks (as Python laya-mlx) instead of additive f16 masks, on every
-    /// path of the forward: key padding, dense and chunked local attention, and the head.
+    /// Boolean attention masks (as Python laya-mlx) instead of additive f16 masks.
     bool_mask: bool,
     /// Chunked sliding-window attention for long inputs (default) or dense masks always.
     windowed: bool,
@@ -64,10 +55,7 @@ struct Knobs {
     /// Linear weights: `view` keeps the host-loaded `[out, in]` array behind a transposed view
     /// (default); `gpu` copies it on the GPU first; `t` stores a GPU-written contiguous `[in, out]`.
     wcopy: String,
-    /// Keep GELU in the compute dtype (fixes the upstream f16 -> f32 promotion). Off by
-    /// default like every knob here, so that `BackendOptions::default()` reproduces upstream's
-    /// numerics and the bench's `mlx-fp16` control variant measures the promotion. Everything
-    /// that serves answers (`sys1d`, the other bench variants) sets `f16gelu`.
+    /// Keep GELU in the compute dtype (fixes the upstream f16 -> f32 promotion).
     f16gelu: bool,
     /// Pad the sequence length up to the first of these that fits (`buckets=128:256:512`).
     buckets: Vec<usize>,
@@ -80,22 +68,25 @@ struct Knobs {
     cache_mb: Option<usize>,
     /// MLX wired-memory limit in MiB (keeps the weights resident).
     wired_mb: Option<usize>,
+    /// Local attention runs dense (full `len x len` masks) while the padded length is at most
+    /// this, chunked above it (`dense_upto=512`). `None` is the upstream `4 * window`.
+    /// `windowed=0` still means never chunk.
+    dense_upto: Option<usize>,
+    /// Last head layer: queries, out_proj, norm2 and the FFN only for the rows the scorer
+    /// reads (position 0 and every marker slot); keys and values still from every token.
+    /// The other positions of that layer are never computed, so its output is a
+    /// [`ScorerRows`] and nothing else: a consumer that needs per-token head output has to
+    /// run with `headprune=0`.
+    headprune: bool,
+    /// Keep hidden states packed as `[T, d]` (real tokens only) through embeddings, norms,
+    /// linears and GeGLU; expand to `[n, len, ...]` only around attention.
+    unpad: bool,
 }
 
 impl Knobs {
-    /// The settings of `tuning`, or of `SYS1_MLX` when `tuning` is `None`.
-    fn from_spec(tuning: Option<&str>) -> Result<Self> {
-        let spec = match tuning {
-            Some(t) => t.to_string(),
-            None => std::env::var("SYS1_MLX").unwrap_or_default(),
-        };
-        Self::parse(&spec)
-    }
-
-    /// Parse a comma-separated spec. The last mention of a setting wins.
-    fn parse(spec: &str) -> Result<Self> {
+    fn from_spec(tuning: Option<&str>) -> Self {
         let mut k = Knobs {
-            geglu: "shapeless".into(),
+            geglu: "compiled".into(),
             addmm: true,
             bool_mask: false,
             windowed: true,
@@ -110,68 +101,45 @@ impl Knobs {
             warm: Vec::new(),
             cache_mb: None,
             wired_mb: None,
+            dense_upto: None,
+            headprune: false,
+            unpad: false,
+        };
+        let list = |v: &str| -> Vec<usize> { v.split(':').filter_map(|x| x.parse().ok()).collect() };
+        let spec = match tuning {
+            Some(t) => t.to_string(),
+            None => std::env::var("SYS1_MLX").unwrap_or_default(),
         };
         for kv in spec.split(',').filter(|s| !s.is_empty()) {
-            let (key, val) = match kv.split_once('=') {
-                Some((key, val)) => (key, Some(val)),
-                None => (kv, None),
-            };
-            let bad = |what: String| Error::Config(format!("mlx settings: `{kv}`: {what}"));
-            // A flag is on when bare or `=1`, off when `=0`; nothing else.
-            let flag = || match val {
-                None | Some("1") => Ok(true),
-                Some("0") => Ok(false),
-                Some(v) => Err(bad(format!("`{v}` is not 0 or 1"))),
-            };
-            let value = || val.ok_or_else(|| bad("needs a value (`key=value`)".into()));
-            let one_of = |allowed: &[&str]| -> Result<String> {
-                let v = value()?;
-                if allowed.contains(&v) {
-                    Ok(v.to_string())
-                } else {
-                    Err(bad(format!("`{v}` is not one of {}", allowed.join(", "))))
-                }
-            };
-            let number = |v: &str| -> Result<usize> {
-                v.parse().map_err(|_| bad(format!("`{v}` is not a whole number")))
-            };
-            let list = || -> Result<Vec<usize>> { value()?.split(':').map(number).collect() };
+            let (key, val) = kv.split_once('=').unwrap_or((kv, "1"));
+            let on = val != "0";
             match key {
-                "geglu" => k.geglu = one_of(&["shapeless", "compiled", "plain"])?,
-                "addmm" => k.addmm = flag()?,
-                "mask" => k.bool_mask = one_of(&["bool", "additive"])? == "bool",
-                "windowed" => k.windowed = flag()?,
-                "clear" => k.clear = flag()?,
-                "trace" => k.trace = flag()?,
-                "layers" => k.layers = flag()?,
-                "ops" => k.ops = flag()?,
-                "wcopy" => k.wcopy = one_of(&["view", "gpu", "t"])?,
-                "f16gelu" => k.f16gelu = flag()?,
+                "geglu" => k.geglu = val.to_string(),
+                "addmm" => k.addmm = on,
+                "mask" => k.bool_mask = val == "bool",
+                "windowed" => k.windowed = on,
+                "clear" => k.clear = on,
+                "trace" => k.trace = on,
+                "layers" => k.layers = on,
+                "ops" => k.ops = on,
+                "wcopy" => k.wcopy = val.to_string(),
+                "f16gelu" => k.f16gelu = on,
                 "buckets" => {
-                    k.buckets = list()?;
+                    k.buckets = list(val);
                     k.buckets.sort_unstable();
                 }
-                "pad" => {
-                    k.pad = number(value()?)?;
-                    if k.pad == 0 {
-                        return Err(bad("pad must be at least 1".into()));
-                    }
-                }
-                "warm" => k.warm = list()?,
-                "cache" => k.cache_mb = Some(number(value()?)?),
-                "wired" => k.wired_mb = Some(number(value()?)?),
-                _ => return Err(Error::Config(format!("mlx settings: unknown setting `{key}` in `{spec}`"))),
+                "pad" => k.pad = val.parse().unwrap_or(1).max(1),
+                "warm" => k.warm = list(val),
+                "cache" => k.cache_mb = val.parse().ok(),
+                "wired" => k.wired_mb = val.parse().ok(),
+                "dense_upto" => k.dense_upto = val.parse().ok(),
+                "headprune" => k.headprune = on,
+                "unpad" => k.unpad = on,
+                _ => eprintln!("SYS1_MLX: unknown knob {key}"),
             }
         }
-        Ok(k)
+        k
     }
-}
-
-/// Check a settings spec (`BackendOptions::tuning`, `SYS1_MLX`) without loading a model: `Err`
-/// names the first unknown setting or bad value, as loading with it would. Callers that label
-/// a run with its settings (sys1-bench, sys1-probe) call this at startup.
-pub fn check_settings(spec: &str) -> Result<()> {
-    Knobs::parse(spec).map(|_| ())
 }
 
 /// Convert an MLX exception into a `laya_core::Error::Backend`.
@@ -192,98 +160,40 @@ type CompiledFn = Box<dyn for<'a> FnMut(&'a [Array]) -> std::result::Result<Vec<
 ///
 /// Unfused, the split + five elementwise passes cost ~0.8 ms per layer at 4x512 tokens;
 /// compiled they cost ~0.08 ms. The compiled state is not thread-safe, hence the mutex.
-///
-/// The default is the shapeless trace: GELU * gate is elementwise, so one trace serves every
-/// input shape and the split (which needs concrete shapes) happens outside as two views. Paired
-/// A/B on the timing workload against the per-shape trace, `f16gelu,cache=512,wired=2048`:
-/// 1.002 on typed-decisions, identical answers. The per-shape mode (`geglu=compiled`) stays
-/// for experiments; MLX keeps one trace per distinct input shape for the life of the process,
-/// so the mode compiles at most [`GEGLU_MAX_SHAPES`] shapes and hands every new shape after
-/// that to the shapeless trace ([`ShapeBudget`]).
 struct GeGlu {
     mode: String,
     keep: bool,
-    traces: Mutex<GeGluTraces>,
+    f: Mutex<CompiledFn>,
 }
 
-/// The compiled traces behind [`GeGlu`]'s mutex.
-struct GeGluTraces {
-    /// GELU * gate over the two halves; one trace for every shape.
-    shapeless: CompiledFn,
-    /// Split + GELU * gate, one trace per input shape (`geglu=compiled` only).
-    per_shape: Option<CompiledFn>,
-    /// The shapes `per_shape` has compiled.
-    shapes: ShapeBudget,
-}
-
-/// The distinct shapes a per-shape cache may hold, at most `cap` of them.
-struct ShapeBudget {
-    cap: usize,
-    seen: HashSet<Vec<i32>>,
-}
-
-impl ShapeBudget {
-    fn new(cap: usize) -> Self {
-        Self { cap, seen: HashSet::new() }
-    }
-
-    /// Whether `shape` may take the per-shape path: yes when it is already cached, or when the
-    /// cache has room (the shape is then counted); no once `cap` shapes are cached.
-    fn admit(&mut self, shape: &[i32]) -> bool {
-        if self.seen.contains(shape) {
-            return true;
-        }
-        if self.seen.len() >= self.cap {
-            return false;
-        }
-        self.seen.insert(shape.to_vec());
-        true
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.seen.len()
-    }
-}
-
-// SAFETY: the compiled closures own no thread-affine resources; calls are serialised by the
+// SAFETY: the compiled closure owns no thread-affine resources; calls are serialised by the
 // mutex and MLX's scheduler is thread-safe.
 unsafe impl Send for GeGlu {}
 unsafe impl Sync for GeGlu {}
 
 impl GeGlu {
     fn new(mode: &str, keep: bool) -> Self {
-        Self::with_cap(mode, keep, GEGLU_MAX_SHAPES)
-    }
-
-    /// `cap` is the number of shapes `geglu=compiled` compiles per shape (tests pass a small one).
-    fn with_cap(mode: &str, keep: bool, cap: usize) -> Self {
-        let shapeless: CompiledFn = Box::new(compile(
-            move |a: &[Array]| -> Vec<Array> {
-                vec![ops::multiply(gelu_erf_as(&a[0], keep).expect("gelu"), &a[1]).expect("geglu gate")]
-            },
-            true,
-        ));
-        let per_shape: Option<CompiledFn> = (mode == "compiled").then(|| -> CompiledFn {
+        let f: CompiledFn = if mode == "shapeless" {
+            Box::new(compile(
+                move |a: &[Array]| -> Vec<Array> {
+                    vec![ops::multiply(gelu_erf_as(&a[0], keep).expect("gelu"), &a[1]).expect("geglu gate")]
+                },
+                true,
+            ))
+        } else {
             Box::new(compile(
                 move |a: &[Array]| -> Vec<Array> {
                     let ig = a[0].split_equal(2, -1).expect("geglu split");
                     vec![ops::multiply(gelu_erf_as(&ig[0], keep).expect("gelu"), &ig[1]).expect("geglu gate")]
                 },
-                // Not shapeless: `split` needs concrete shapes; MLX caches one trace per input
-                // shape and never drops one, which is why this is not the default and why
-                // `apply` stops sending new shapes here after `cap` of them.
+                // Not shapeless: `split` needs concrete shapes; MLX caches one trace per input shape.
                 false,
             ))
-        });
+        };
         Self {
             mode: mode.to_string(),
             keep,
-            traces: Mutex::new(GeGluTraces {
-                shapeless,
-                per_shape,
-                shapes: ShapeBudget::new(cap),
-            }),
+            f: Mutex::new(f),
         }
     }
 
@@ -294,22 +204,14 @@ impl GeGlu {
         }
         // A panic inside the compiled closure (mlx-rs re-raises it after MLX returns) would
         // poison the lock; recover the guard so one failed request cannot fail every later one.
-        let mut guard = self.traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let t = &mut *guard;
-        let mut out = match &mut t.per_shape {
-            Some(f) if t.shapes.admit(x.shape()) => f(std::slice::from_ref(x)).lx()?,
-            _ => {
-                let ig = x.split_equal(2, -1).lx()?;
-                (t.shapeless)(ig.as_slice()).lx()?
-            }
+        let mut f = self.f.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = if self.mode == "shapeless" {
+            let ig = x.split_equal(2, -1).lx()?;
+            f(ig.as_slice()).lx()?
+        } else {
+            f(std::slice::from_ref(x)).lx()?
         };
         Ok(out.remove(0))
-    }
-
-    /// How many shapes the per-shape trace has compiled (0 unless `geglu=compiled`).
-    #[cfg(test)]
-    fn per_shape_traces(&self) -> usize {
-        self.traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner).shapes.len()
     }
 }
 
@@ -331,72 +233,21 @@ fn gelu_erf_as(x: &Array, keep_dtype: bool) -> std::result::Result<Array, Except
     ops::multiply(ops::multiply(x, c(0.5)?)?, ops::add(&e, c(1.0)?)?)
 }
 
-/// The chunk-local band, `[S, 3S]` row-major: query `i` of a chunk may see gathered key slot
+/// Chunk-local band mask `[1, 1, 1, S, 3S]`: query `i` of a chunk may see gathered key slot
 /// `j` (global offset `j - S` relative to the chunk start) iff `|S + i - j| <= S`.
-fn band_allows(s: usize) -> Vec<bool> {
+fn band_mask(s: usize, dtype: Dtype) -> Result<Array> {
     let ks = 3 * s;
-    let mut vals = vec![false; s * ks];
+    let mut vals = vec![MASK_NEG; s * ks];
     for i in 0..s {
         for j in i..=i + 2 * s {
-            vals[i * ks + j] = true;
+            vals[i * ks + j] = 0.0;
         }
     }
-    vals
-}
-
-/// Additive chunk-local band mask `[1, 1, 1, S, 3S]` (0 where [`band_allows`], else `MASK_NEG`).
-fn band_mask(s: usize, dtype: Dtype) -> Result<Array> {
-    let vals: Vec<f32> = band_allows(s).iter().map(|&ok| if ok { 0.0 } else { MASK_NEG }).collect();
-    let m = Array::from_slice(&vals, &[1, 1, 1, s as i32, 3 * s as i32])
+    let m = Array::from_slice(&vals, &[1, 1, 1, s as i32, ks as i32])
         .as_dtype(dtype)
         .lx()?;
     m.eval().lx()?;
     Ok(m)
-}
-
-/// Boolean chunk-local band mask `[1, 1, 1, S, 3S]` (true where [`band_allows`]), for `mask=bool`.
-fn band_mask_bool(s: usize) -> Result<Array> {
-    let m = Array::from_slice(&band_allows(s), &[1, 1, 1, s as i32, 3 * s as i32]);
-    m.eval().lx()?;
-    Ok(m)
-}
-
-/// Key validity of the chunked path, `[n, nc, 3S]` row-major: gathered slot `j` of chunk `c`
-/// holds position `(c - 1) * S + j`, valid when that lies in `0..len` and is not padding.
-fn window_key_valid(attention_mask: &[u32], n: usize, len: usize, s: usize, nc: usize) -> Vec<bool> {
-    let ks = 3 * s;
-    let mut ok = vec![false; n * nc * ks];
-    for b in 0..n {
-        for c in 0..nc {
-            for j in 0..ks {
-                let pos = (c as i64 - 1) * s as i64 + j as i64;
-                ok[(b * nc + c) * ks + j] =
-                    pos >= 0 && (pos as usize) < len && attention_mask[b * len + pos as usize] == 1;
-            }
-        }
-    }
-    ok
-}
-
-/// Padded queries of the chunked path, `[n, nc, S]` row-major: query `i` of chunk `c` is
-/// position `c * S + i`, padded when it is past `len` (the tail of the last chunk when `len` is
-/// not a multiple of `S`) or padding in its row.
-fn window_query_padded(attention_mask: &[u32], n: usize, len: usize, s: usize, nc: usize) -> Vec<bool> {
-    let mut padded = vec![true; n * nc * s];
-    for b in 0..n {
-        for pos in 0..len {
-            padded[b * nc * s + pos] = attention_mask[b * len + pos] != 1;
-        }
-    }
-    padded
-}
-
-/// Attention scale of the decision-head layers, `1 / sqrt(hidden / heads)`: upstream builds
-/// them as `nn.TransformerEncoderLayer(d, nhead=max(1, d // 64))`, whose `MultiheadAttention`
-/// scales by the square root of its head dim `d // nhead`. That is 64 (a scale of 1/8) for the
-/// published 768- and 1,024-wide checkpoints, but not for a `d` that 64 does not divide.
-fn head_scale(hidden: usize, heads: usize) -> f32 {
-    1.0 / ((hidden / heads) as f32).sqrt()
 }
 
 /// Cast to f32 and force a row-contiguous layout so the result can be read from the host.
@@ -477,6 +328,8 @@ struct EncoderLayer {
 struct HeadLayer {
     norm1: Norm,
     in_proj: Linear,
+    /// `in_proj` cut into its q rows and its k|v rows, for the pruned last layer (`headprune`).
+    split_proj: Option<(Linear, Linear)>,
     out_proj: Linear,
     norm2: Norm,
     linear1: Linear,
@@ -505,7 +358,18 @@ impl Loader<'_> {
     }
 
     fn linear(&self, w: &str, b: Option<&str>) -> Result<Linear> {
-        let w = self.get(w)?;
+        let b = b.map(|n| self.get(n)).transpose()?;
+        self.linear_from(self.get(w)?, b)
+    }
+
+    /// Output rows `rows` of a linear layer as a layer of their own.
+    fn linear_rows(&self, w: &str, b: Option<&str>, rows: std::ops::Range<i32>) -> Result<Linear> {
+        let w = self.get(w)?.index((rows.clone(), ..));
+        let b = b.map(|n| self.get(n)).transpose()?.map(|b| b.index(rows));
+        self.linear_from(w, b)
+    }
+
+    fn linear_from(&self, w: Array, b: Option<Array>) -> Result<Linear> {
         let wt = match self.wcopy.as_str() {
             "t" => ops::transpose(&w).lx()?.contiguous().lx()?,
             "gpu" => {
@@ -514,7 +378,6 @@ impl Loader<'_> {
             }
             _ => ops::transpose(&w).lx()?,
         };
-        let b = b.map(|n| self.get(n)).transpose()?;
         Ok(Linear { wt, b })
     }
 
@@ -545,50 +408,33 @@ pub struct MlxBackend {
     scorer_norm: Norm,
     scorer1: Linear,
     scorer3: Linear,
-    /// Chunk-local band mask `[1, 1, 1, S, 3S]` for the windowed attention path: additive, or
-    /// boolean with `mask=bool`.
+    /// Chunk-local band mask `[1, 1, 1, S, 3S]` for the windowed attention path.
     band: Array,
     caches: Mutex<Caches>,
     geglu: GeGlu,
     knobs: Knobs,
 }
 
-/// Constants reused across forwards. Nothing here is keyed by request shape.
+/// Per-shape constants reused across forwards.
 ///
 /// The dense window masks are one array each, for the longest length seen so far; shorter
 /// lengths take a view of it (see [`MlxBackend::window_mask`]). One mask per distinct length
-/// would pile up: without length buckets, a server seeing every length up to 1,024 would hold
-/// about 700 MB of masks that nothing frees. The gather indices of the windowed path are built
-/// inside the forward graph instead ([`window_key_idx`]), so they need no cache at all.
+/// would pile up: with `dense_upto=1024` and no length buckets, a server seeing every length
+/// up to 1,024 would hold about 700 MB of masks that nothing frees.
 #[derive(Default)]
 struct Caches {
     /// Dense sliding-window additive mask `[1, 1, L, L]` for the longest `L` so far.
     window_mask: Option<Array>,
+    /// Flat key gather indices `[n * H * n_chunks * 3S]` into `[n * H * len, hd]` rows for
+    /// the windowed path, keyed by `(n, len)`.
+    key_idx: HashMap<(usize, usize), Array>,
     /// Boolean sliding-window mask `[1, 1, L, L]` for the longest `L` so far (`mask=bool`).
     window_bool: Option<Array>,
 }
 
-/// Flat key gather indices `[rows * nc * 3S]` into the `[rows * len, hd]` view of the keys for
-/// the windowed path: chunk `c` of row `r` gathers positions `(c - 1) * S + j` for `j < 3S`,
-/// clamped into `0..len` (the mask hides the clamped slots), as `r * len + pos`. Two small host
-/// tables and one broadcast add on the device, part of the forward graph: no per-shape cache
-/// and no early evaluation.
-fn window_key_idx(s: usize, rows: usize, len: usize, nc: usize) -> Result<Array> {
-    let ks = 3 * s;
-    let pos: Vec<u32> = (0..nc)
-        .flat_map(|c| (0..ks).map(move |j| (c as i64 - 1) * s as i64 + j as i64))
-        .map(|p| p.clamp(0, len as i64 - 1) as u32)
-        .collect();
-    let pos = Array::from_slice(&pos, &[1, nc as i32, ks as i32]);
-    let base: Vec<u32> = (0..rows as u32).map(|r| r * len as u32).collect();
-    let base = Array::from_slice(&base, &[rows as i32, 1, 1]);
-    ops::add(&base, &pos).lx()?.reshape(&[(rows * nc * ks) as i32]).lx()
-}
-
-/// How local (sliding-window) layers attend for the current batch shape. Every mask here is
-/// additive, or boolean (true = may attend) with `mask=bool`.
+/// How local (sliding-window) layers attend for the current batch shape.
 enum LocalAttn {
-    /// Full `len x len` attention with a pad + window mask `[n, 1, len, len]`.
+    /// Full `len x len` attention with an additive pad + window mask `[n, 1, len, len]`.
     Dense(Array),
     /// Chunked attention: every 64-query chunk attends to the 192 keys that can fall inside
     /// its window (previous, own and next chunk); see [`MlxBackend::windowed_attention`].
@@ -599,16 +445,112 @@ enum LocalAttn {
 struct Windowed {
     /// Flat key gather indices `[n * H * n_chunks * 3S]` into `[n * H * len, hd]` rows.
     key_idx: Array,
-    /// Pad + band mask `[n * H, n_chunks, S, 3S]`.
+    /// Additive pad + band mask `[n * H, n_chunks, S, 3S]`.
     mask: Array,
     n_chunks: i32,
 }
 
 /// Masks shared by every encoder layer of one forward pass.
 struct AttnCtx {
-    /// Key-padding mask `[n, 1, 1, len]`.
+    /// Additive key-padding mask `[n, 1, 1, len]`.
     pad: Array,
     local: LocalAttn,
+}
+
+/// Decision-head output as the scorer reads it.
+///
+/// Every consumer has to match all three variants: with `headprune` the last head layer is
+/// computed at the scorer's rows only, so `Rows` holds no per-token output and cannot be
+/// turned into one. Anything that needs every token's head output (per-token embeddings,
+/// say) must run with `headprune=0` and take `Full` or `Packed`.
+enum HeadOut {
+    /// Every token, `[n, len, d]`.
+    Full(Array),
+    /// Every real token, `[T, d]` in [`Packing`] order (`unpad`).
+    Packed(Array),
+    /// The scorer's rows only (`headprune`).
+    Rows(ScorerRows),
+}
+
+/// The last head layer at the rows the scorer reads and nowhere else: position 0 followed by
+/// the `kmax` marker slots of each row, `[n, 1 + kmax, d]`. Padded marker slots hold position
+/// 0's output (their logits are masked afterwards, as in the full layer). The array is private
+/// so that it cannot be mistaken for a `[n, len, d]` per-token output.
+struct ScorerRows(Array);
+
+impl ScorerRows {
+    /// Position 0 of every row, `[n, d]`.
+    fn pooled(&self) -> Array {
+        self.0.index((.., 0, ..))
+    }
+
+    /// The marker slots of every row, `[n * kmax, d]`.
+    fn markers(&self, n: i32, kmax: i32, d: i32) -> Result<Array> {
+        self.0.index((.., 1.., ..)).reshape(&[n * kmax, d]).lx()
+    }
+}
+
+/// Token packing for `unpad`: hidden states live as `[T, d]` over the real tokens only and
+/// are expanded to the padded `[n, len, ...]` layout just for attention. Every row has at
+/// least one real token (its `[CLS]`), which the padding positions borrow.
+struct Packing {
+    /// `[T]` padded positions `r * len + pos` of the packed tokens, row-major.
+    pack: Array,
+    /// `[n * len]` packed index of every padded position. Padding points at its row's token 0,
+    /// so expanded values stay finite; they are masked as keys and dropped as queries.
+    unpack: Array,
+    /// `[T]` row of every packed token.
+    row: Array,
+    /// Packed index of position 0 of every row.
+    offsets: Vec<u32>,
+}
+
+impl Packing {
+    fn new(batch: &Batch) -> Self {
+        let mut pack: Vec<u32> = Vec::with_capacity(batch.total_tokens());
+        let mut unpack: Vec<u32> = Vec::with_capacity(batch.n * batch.len);
+        let mut row: Vec<u32> = Vec::with_capacity(batch.total_tokens());
+        let mut offsets = Vec::with_capacity(batch.n);
+        for r in 0..batch.n {
+            let first = pack.len() as u32;
+            offsets.push(first);
+            for pos in 0..batch.len {
+                let flat = r * batch.len + pos;
+                if batch.attention_mask[flat] == 1 {
+                    unpack.push(pack.len() as u32);
+                    pack.push(flat as u32);
+                    row.push(r as u32);
+                } else {
+                    unpack.push(first);
+                }
+            }
+        }
+        Self {
+            pack: Array::from_slice(&pack, &[pack.len() as i32]),
+            unpack: Array::from_slice(&unpack, &[unpack.len() as i32]),
+            row: Array::from_slice(&row, &[row.len() as i32]),
+            offsets,
+        }
+    }
+
+    /// `[T, c] -> [n, len, c]`.
+    fn expand(&self, x: &Array, n: i32, len: i32) -> Result<Array> {
+        x.take_axis(&self.unpack, 0).lx()?.reshape(&[n, len, x.dim(-1)]).lx()
+    }
+
+    /// `[n, len, c] -> [T, c]`.
+    fn compact(&self, x: &Array, n: i32, len: i32) -> Result<Array> {
+        x.reshape(&[n * len, x.dim(-1)]).lx()?.take_axis(&self.pack, 0).lx()
+    }
+}
+
+/// Encoder output for one batch.
+struct Encoded {
+    /// `last_hidden_state`: `[n, len, d]`, or `[T, d]` when `packing` is set.
+    h: Array,
+    /// Additive key-padding mask `[n, 1, 1, len]`.
+    pad: Array,
+    packing: Option<Packing>,
 }
 
 // SAFETY: `mlx_rs::Array` is a reference-counted handle to immutable, already-evaluated
@@ -626,7 +568,7 @@ impl MlxBackend {
         };
         let enc = &cfg.encoder;
         let eps = enc.norm_eps as f32;
-        let knobs = Knobs::from_spec(opts.tuning.as_deref())?;
+        let knobs = Knobs::from_spec(opts.tuning.as_deref());
         let loader = Loader {
             st: w.view()?,
             dtype,
@@ -668,18 +610,28 @@ impl MlxBackend {
                 });
             }
             let mut head = Vec::with_capacity(cfg.agent.head_layers);
+            let d = enc.hidden_size as i32;
             for j in 0..cfg.agent.head_layers {
                 let p = format!("head.layers.{j}");
+                let (in_w, in_b) = (
+                    format!("{p}.self_attn.in_proj_weight"),
+                    format!("{p}.self_attn.in_proj_bias"),
+                );
                 head.push(HeadLayer {
                     norm1: loader.norm(
                         &format!("{p}.norm1.weight"),
                         Some(&format!("{p}.norm1.bias")),
                         1e-5,
                     )?,
-                    in_proj: loader.linear(
-                        &format!("{p}.self_attn.in_proj_weight"),
-                        Some(&format!("{p}.self_attn.in_proj_bias")),
-                    )?,
+                    in_proj: loader.linear(&in_w, Some(&in_b))?,
+                    split_proj: if knobs.headprune && j + 1 == cfg.agent.head_layers {
+                        Some((
+                            loader.linear_rows(&in_w, Some(&in_b), 0..d)?,
+                            loader.linear_rows(&in_w, Some(&in_b), d..3 * d)?,
+                        ))
+                    } else {
+                        None
+                    },
                     out_proj: loader.linear(
                         &format!("{p}.self_attn.out_proj.weight"),
                         Some(&format!("{p}.self_attn.out_proj.bias")),
@@ -716,11 +668,7 @@ impl MlxBackend {
                 scorer_norm: loader.norm("scorer.0.weight", Some("scorer.0.bias"), 1e-5)?,
                 scorer1: loader.linear("scorer.1.weight", Some("scorer.1.bias"))?,
                 scorer3: loader.linear("scorer.3.weight", Some("scorer.3.bias"))?,
-                band: if knobs.bool_mask {
-                    band_mask_bool(enc.local_attention / 2)?
-                } else {
-                    band_mask(enc.local_attention / 2, dtype)?
-                },
+                band: band_mask(enc.local_attention / 2, dtype)?,
                 caches: Mutex::new(Caches::default()),
                 geglu: GeGlu::new(&knobs.geglu, knobs.f16gelu),
                 knobs: knobs.clone(),
@@ -784,6 +732,10 @@ impl MlxBackend {
         for h in &self.head {
             push_norm(&mut v, &h.norm1);
             push_lin(&mut v, &h.in_proj);
+            if let Some((q, kv)) = &h.split_proj {
+                push_lin(&mut v, q);
+                push_lin(&mut v, kv);
+            }
             push_lin(&mut v, &h.out_proj);
             push_norm(&mut v, &h.norm2);
             push_lin(&mut v, &h.linear1);
@@ -815,69 +767,92 @@ impl MlxBackend {
     }
 
     /// Masks for this batch: dense window masks for short inputs, chunked gather indices and
-    /// masks once the sequence is long enough for windowing to pay off. With `mask=bool` every
-    /// mask is boolean, whichever path the length takes.
+    /// masks once the sequence is long enough for windowing to pay off.
     fn attn_ctx(&self, batch: &Batch) -> Result<AttnCtx> {
         let has_local = self.layers.iter().any(|l| l.local);
-        let windowed = self.knobs.windowed && batch.len > 4 * self.window;
-        let (n, len) = (batch.n as i32, batch.len as i32);
-        let pad = if self.knobs.bool_mask {
-            Array::from_slice(&batch.attention_mask, &[n, 1, 1, len])
+        let s = self.window;
+        let dense_upto = self.knobs.dense_upto.unwrap_or(4 * s);
+        let windowed = self.knobs.windowed && batch.len > dense_upto;
+        if self.knobs.bool_mask && !windowed {
+            let (n, len) = (batch.n as i32, batch.len as i32);
+            let valid = Array::from_slice(&batch.attention_mask, &[n, len])
                 .as_dtype(Dtype::Bool)
-                .lx()?
-        } else {
-            self.pad_mask(batch)?
-        };
+                .lx()?;
+            let pad = valid.reshape(&[n, 1, 1, len]).lx()?;
+            let local = if has_local {
+                // Padded queries may see every valid key so no softmax row is fully masked
+                // (as Python laya-mlx); they are never used as keys or outputs.
+                let pad_q = ops::logical_not(&valid.reshape(&[n, 1, len, 1]).lx()?).lx()?;
+                let band = self.window_mask_bool(batch.len)?;
+                ops::logical_and(&ops::logical_or(&band, &pad_q).lx()?, &pad).lx()?
+            } else {
+                pad.clone()
+            };
+            return Ok(AttnCtx {
+                pad,
+                local: LocalAttn::Dense(local),
+            });
+        }
+        let pad = self.pad_mask(batch)?;
         let local = if !has_local {
             LocalAttn::Dense(pad.clone())
         } else if windowed {
-            LocalAttn::Windowed(self.windowed_ctx(batch)?)
-        } else if self.knobs.bool_mask {
-            // Padded queries may see every valid key so no softmax row is fully masked
-            // (as Python laya-mlx); they are never used as keys or outputs.
-            let pad_q = ops::logical_not(&pad.reshape(&[n, 1, len, 1]).lx()?).lx()?;
-            let band = self.window_mask_bool(batch.len)?;
-            LocalAttn::Dense(ops::logical_and(&ops::logical_or(&band, &pad_q).lx()?, &pad).lx()?)
+            let (n, len) = (batch.n, batch.len);
+            let nc = len.div_ceil(s);
+            let ks = 3 * s;
+            let rows = n * self.n_heads;
+            let mut caches = self.lock_caches()?;
+            let key_idx = match caches.key_idx.get(&(n, len)) {
+                Some(a) => a.clone(),
+                None => {
+                    let idx: Vec<u32> = (0..rows)
+                        .flat_map(|r| (0..nc).map(move |c| (r, c)))
+                        .flat_map(|(r, c)| {
+                            (0..ks).map(move |j| (r, (c as i64 - 1) * s as i64 + j as i64))
+                        })
+                        .map(|(r, pos)| (r * len) as u32 + pos.clamp(0, len as i64 - 1) as u32)
+                        .collect();
+                    let a = Array::from_slice(&idx, &[(rows * nc * ks) as i32]);
+                    a.eval().lx()?;
+                    caches.key_idx.insert((n, len), a.clone());
+                    a
+                }
+            };
+            drop(caches);
+            // Key validity per (row, chunk, key slot): in range and not padding.
+            let mut vals = vec![MASK_NEG; n * nc * ks];
+            for b in 0..n {
+                for c in 0..nc {
+                    for j in 0..ks {
+                        let pos = (c as i64 - 1) * s as i64 + j as i64;
+                        if pos >= 0
+                            && (pos as usize) < len
+                            && batch.attention_mask[b * len + pos as usize] == 1
+                        {
+                            vals[(b * nc + c) * ks + j] = 0.0;
+                        }
+                    }
+                }
+            }
+            let (n, nc, ks, s) = (n as i32, nc as i32, ks as i32, s as i32);
+            let valid = Array::from_slice(&vals, &[n, 1, nc, 1, ks])
+                .as_dtype(self.dtype)
+                .lx()?;
+            let h = self.n_heads as i32;
+            let mask = ops::add(&valid, &self.band).lx()?;
+            let mask = ops::broadcast_to(&mask, &[n, h, nc, s, ks])
+                .lx()?
+                .reshape(&[n * h, nc, s, ks])
+                .lx()?;
+            LocalAttn::Windowed(Windowed {
+                key_idx,
+                mask,
+                n_chunks: nc,
+            })
         } else {
             LocalAttn::Dense(ops::add(&pad, &self.window_mask(batch.len)?).lx()?)
         };
         Ok(AttnCtx { pad, local })
-    }
-
-    /// The chunked path's constants for this batch: the key gather indices and the pad + band
-    /// mask `[n * H, n_chunks, S, 3S]`, additive or boolean as `mask=` says.
-    fn windowed_ctx(&self, batch: &Batch) -> Result<Windowed> {
-        let (n, len, s) = (batch.n, batch.len, self.window);
-        let nc = len.div_ceil(s);
-        let ks = 3 * s;
-        let key_idx = window_key_idx(s, n * self.n_heads, len, nc)?;
-        let key_ok = window_key_valid(&batch.attention_mask, n, len, s, nc);
-        let (n, nc, ks, s) = (n as i32, nc as i32, ks as i32, s as i32);
-        let mask = if self.knobs.bool_mask {
-            let valid = Array::from_slice(&key_ok, &[n, 1, nc, 1, ks]);
-            // A padded query (padding in its row, or past `len` in the last chunk) may see every
-            // gathered slot: an all-false row is NaN with boolean masks, and the outputs of these
-            // rows are never read. The dense boolean path does the same with `pad_q`.
-            let pad_q = window_query_padded(&batch.attention_mask, batch.n, len, self.window, nc as usize);
-            let pad_q = Array::from_slice(&pad_q, &[n, 1, nc, s, 1]);
-            ops::logical_or(&ops::logical_and(&valid, &self.band).lx()?, &pad_q).lx()?
-        } else {
-            let vals: Vec<f32> = key_ok.iter().map(|&ok| if ok { 0.0 } else { MASK_NEG }).collect();
-            let valid = Array::from_slice(&vals, &[n, 1, nc, 1, ks])
-                .as_dtype(self.dtype)
-                .lx()?;
-            ops::add(&valid, &self.band).lx()?
-        };
-        let h = self.n_heads as i32;
-        let mask = ops::broadcast_to(&mask, &[n, h, nc, s, ks])
-            .lx()?
-            .reshape(&[n * h, nc, s, ks])
-            .lx()?;
-        Ok(Windowed {
-            key_idx,
-            mask,
-            n_chunks: nc,
-        })
     }
 
     fn lock_caches(&self) -> Result<std::sync::MutexGuard<'_, Caches>> {
@@ -915,10 +890,6 @@ impl MlxBackend {
     /// Additive sliding-window mask `[1, 1, len, len]`. Whether `i` may see `j` depends on
     /// `|i - j|` alone, so the mask for `len` is the top-left corner of any longer one: one
     /// array for the longest length so far is kept and shorter lengths get a view of it.
-    ///
-    /// The new mask is evaluated here, on purpose: the cached array is shared by every later
-    /// forward and must hold data, not a graph node those forwards would all point into. This
-    /// happens once per new longest length, a few times in the life of a server.
     fn window_mask(&self, len: usize) -> Result<Array> {
         let mut caches = self.lock_caches()?;
         if caches.window_mask.as_ref().is_none_or(|m| (m.dim(2) as usize) < len) {
@@ -997,9 +968,9 @@ impl MlxBackend {
         })
     }
 
-    /// `[n, len, d] -> [n, heads, len, hd]`.
+    /// `[n, len, heads * hd] -> [n, heads, len, hd]`.
     fn split_heads(&self, x: &Array, n: i32, len: i32, heads: usize) -> Result<Array> {
-        let hd = (self.hidden / heads) as i32;
+        let hd = x.dim(-1) / heads as i32;
         x.reshape(&[n, len, heads as i32, hd])
             .lx()?
             .transpose_axes(&[0, 2, 1, 3])
@@ -1014,17 +985,68 @@ impl MlxBackend {
             .lx()
     }
 
+    /// Encoder `qkv [n, len, 3d]` -> roped `q`, roped `k` and `v`, each `[n, H, len, hd]`.
+    fn qkv_rope(&self, qkv: &Array, n: i32, len: i32, theta: f32) -> Result<(Array, Array, Array)> {
+        let rope = |x: &Array| -> Result<Array> {
+            fast::rope(x, self.head_dim as i32, false, theta, 1.0, 0, None::<&Array>).lx()
+        };
+        let parts = qkv.split_equal(3, -1).lx()?;
+        let q = self.split_heads(&parts[0], n, len, self.n_heads)?;
+        let k = self.split_heads(&parts[1], n, len, self.n_heads)?;
+        let v = self.split_heads(&parts[2], n, len, self.n_heads)?;
+        Ok((rope(&q)?, rope(&k)?, v))
+    }
+
+    /// Token index of position 0 of every row: `r * len` in the padded layout, the packing
+    /// offsets when the hidden states are packed.
+    fn row_starts(batch: &Batch, packing: Option<&Packing>) -> Vec<u32> {
+        match packing {
+            Some(p) => p.offsets.clone(),
+            None => (0..batch.n as u32).map(|r| r * batch.len as u32).collect(),
+        }
+    }
+
+    /// Flat token indices of the rows the scorer reads: position 0 of every row followed by
+    /// its `kmax` marker slots (padded slots point at position 0, as in `Batch`).
+    fn scorer_rows(batch: &Batch, starts: &[u32]) -> Array {
+        let kmax = batch.kmax;
+        let flat: Vec<u32> = (0..batch.n)
+            .flat_map(|r| {
+                let base = starts[r];
+                std::iter::once(base)
+                    .chain(batch.marker_pos[r * kmax..(r + 1) * kmax].iter().map(move |&p| base + p))
+            })
+            .collect();
+        Array::from_slice(&flat, &[flat.len() as i32])
+    }
+
     /// ModernBERT encoder; returns `last_hidden_state [n, len, d]` and the pad mask.
-    fn encode(&self, batch: &Batch) -> Result<(Array, Array)> {
+    fn encode(&self, batch: &Batch) -> Result<Encoded> {
         let (n, len) = (batch.n as i32, batch.len as i32);
         let d = self.hidden as i32;
-        let ids = Array::from_slice(&batch.input_ids, &[batch.n as i32 * len]);
-        let mut h = self
-            .tok_emb
-            .take_axis(&ids, 0)
-            .lx()?
-            .reshape(&[n, len, d])
-            .lx()?;
+        // `unpad` only pays off when there is padding; a batch without any runs the plain path.
+        let packing = if self.knobs.unpad && batch.total_tokens() < batch.n * batch.len {
+            Some(Packing::new(batch))
+        } else {
+            None
+        };
+        let mut h = match &packing {
+            Some(_) => {
+                let ids: Vec<u32> = batch
+                    .input_ids
+                    .iter()
+                    .zip(&batch.attention_mask)
+                    .filter(|(_, &m)| m == 1)
+                    .map(|(&id, _)| id)
+                    .collect();
+                let ids = Array::from_slice(&ids, &[ids.len() as i32]);
+                self.tok_emb.take_axis(&ids, 0).lx()?
+            }
+            None => {
+                let ids = Array::from_slice(&batch.input_ids, &[batch.n as i32 * len]);
+                self.tok_emb.take_axis(&ids, 0).lx()?.reshape(&[n, len, d]).lx()?
+            }
+        };
         h = self.emb_norm.apply(&h)?;
 
         let ctx = self.attn_ctx(batch)?;
@@ -1062,31 +1084,13 @@ impl MlxBackend {
             };
             mark("attn_norm", &[&a])?;
             let qkv = layer.wqkv.apply(&a)?;
+            // Packed: back to `[n, len, 3d]` for attention.
+            let qkv = match &packing {
+                Some(p) => p.expand(&qkv, n, len)?,
+                None => qkv,
+            };
             mark("wqkv", &[&qkv])?;
-            let parts = qkv.split_equal(3, -1).lx()?;
-            let q = self.split_heads(&parts[0], n, len, self.n_heads)?;
-            let k = self.split_heads(&parts[1], n, len, self.n_heads)?;
-            let v = self.split_heads(&parts[2], n, len, self.n_heads)?;
-            let q = fast::rope(
-                &q,
-                self.head_dim as i32,
-                false,
-                layer.rope_theta,
-                1.0,
-                0,
-                None::<&Array>,
-            )
-            .lx()?;
-            let k = fast::rope(
-                &k,
-                self.head_dim as i32,
-                false,
-                layer.rope_theta,
-                1.0,
-                0,
-                None::<&Array>,
-            )
-            .lx()?;
+            let (q, k, v) = self.qkv_rope(&qkv, n, len, layer.rope_theta)?;
             mark("split+rope", &[&q, &k, &v])?;
             let att = match (&ctx.local, layer.local) {
                 (LocalAttn::Windowed(w), true) => self.windowed_attention(&q, &k, &v, w, scale)?,
@@ -1101,6 +1105,10 @@ impl MlxBackend {
             };
             mark(if layer.local { "sdpa_local" } else { "sdpa_global" }, &[&att])?;
             let att = self.merge_heads(&att, n, len)?;
+            let att = match &packing {
+                Some(p) => p.compact(&att, n, len)?,
+                None => att,
+            };
             h = self.lin_add(&layer.wo, &att, &h)?;
             mark("merge+wo", &[&h])?;
 
@@ -1123,55 +1131,114 @@ impl MlxBackend {
         if self.knobs.layers {
             eprintln!("layers_us n={} len={} emb+masks={} layers={:?}", batch.n, batch.len, lt[0], &lt[1..]);
         }
-        Ok((self.final_norm.apply(&h)?, ctx.pad))
+        Ok(Encoded {
+            h: self.final_norm.apply(&h)?,
+            pad: ctx.pad,
+            packing,
+        })
     }
 
-    /// Decision-head transformer layers on top of the encoder output.
-    fn head_forward(&self, batch: &Batch, enc: &Array, pad: &Array) -> Result<Array> {
+    /// Decision-head transformer layers on top of the encoder output. With `headprune` the
+    /// last layer is only computed at the scorer's rows, and the result says so in its type
+    /// (see [`HeadOut`]).
+    fn head_forward(&self, batch: &Batch, enc: &Encoded) -> Result<HeadOut> {
         let (n, len) = (batch.n as i32, batch.len as i32);
+        let d = self.hidden as i32;
+        let packing = enc.packing.as_ref();
         let qtype = Array::from_slice(&batch.qtype, &[n]);
-        let te = self
-            .type_emb
-            .take_axis(&qtype, 0)
-            .lx()?
-            .reshape(&[n, 1, self.hidden as i32])
-            .lx()?;
-        let mut h = ops::add(enc, &te).lx()?;
-        let scale = head_scale(self.hidden, self.head_nheads);
+        let te = self.type_emb.take_axis(&qtype, 0).lx()?;
+        let mut h = match packing {
+            // Packed tokens take their row's type embedding row by row.
+            Some(p) => ops::add(&enc.h, &te.take_axis(&p.row, 0).lx()?).lx()?,
+            None => ops::add(&enc.h, &te.reshape(&[n, 1, d]).lx()?).lx()?,
+        };
+        let scale = 1.0 / 8.0; // head_dim 64
+        let sdpa = |q: &Array, k: &Array, v: &Array| -> Result<Array> {
+            fast::scaled_dot_product_attention(q, k, v, scale, &enc.pad, None::<&Array>).lx()
+        };
+        // Around attention only: `[T, c] -> [n, len, c]` and back (identity when not packed).
+        let expand = |x: Array| -> Result<Array> {
+            match packing {
+                Some(p) => p.expand(&x, n, len),
+                None => Ok(x),
+            }
+        };
+        let compact = |x: Array| -> Result<Array> {
+            match packing {
+                Some(p) => p.compact(&x, n, len),
+                None => Ok(x),
+            }
+        };
         for layer in &self.head {
             let x = layer.norm1.apply(&h)?;
-            let qkv = layer.in_proj.apply(&x)?;
+            if let Some((wq, wkv)) = &layer.split_proj {
+                // `headprune` (last layer only): every token still supplies a key and a value,
+                // but queries, out_proj, norm2 and the FFN run only for the rows the scorer
+                // reads. A token's output depends on the other tokens only through attention,
+                // so the picked rows come out the same as in the full layer.
+                let kv = expand(wkv.apply(&x)?)?;
+                let parts = kv.split_equal(2, -1).lx()?;
+                let k = self.split_heads(&parts[0], n, len, self.head_nheads)?;
+                let v = self.split_heads(&parts[1], n, len, self.head_nheads)?;
+                let r = 1 + batch.kmax as i32;
+                let idx = Self::scorer_rows(batch, &Self::row_starts(batch, packing));
+                let pick = |a: &Array| -> Result<Array> {
+                    a.reshape(&[-1, d]).lx()?.take_axis(&idx, 0).lx()?.reshape(&[n, r, d]).lx()
+                };
+                let q = self.split_heads(&wq.apply(&pick(&x)?)?, n, r, self.head_nheads)?;
+                let att = self.merge_heads(&sdpa(&q, &k, &v)?, n, r)?;
+                let hs = self.lin_add(&layer.out_proj, &att, &pick(&h)?)?;
+                let x = layer.norm2.apply(&hs)?;
+                let x = nn::relu(&layer.linear1.apply(&x)?).lx()?;
+                return Ok(HeadOut::Rows(ScorerRows(self.lin_add(&layer.linear2, &x, &hs)?)));
+            }
+            let qkv = expand(layer.in_proj.apply(&x)?)?;
             let parts = qkv.split_equal(3, -1).lx()?;
             let q = self.split_heads(&parts[0], n, len, self.head_nheads)?;
             let k = self.split_heads(&parts[1], n, len, self.head_nheads)?;
             let v = self.split_heads(&parts[2], n, len, self.head_nheads)?;
-            let att =
-                fast::scaled_dot_product_attention(&q, &k, &v, scale, pad, None::<&Array>).lx()?;
-            let att = self.merge_heads(&att, n, len)?;
+            let att = compact(self.merge_heads(&sdpa(&q, &k, &v)?, n, len)?)?;
             h = self.lin_add(&layer.out_proj, &att, &h)?;
 
             let x = layer.norm2.apply(&h)?;
             let x = nn::relu(&layer.linear1.apply(&x)?).lx()?;
             h = self.lin_add(&layer.linear2, &x, &h)?;
         }
-        Ok(h)
+        Ok(match packing {
+            Some(_) => HeadOut::Packed(h),
+            None => HeadOut::Full(h),
+        })
     }
 
     /// Scorer logits `[n * kmax]` (unmasked) and pooled `[n, d]` as f32 arrays.
-    fn score(&self, batch: &Batch, h: &Array) -> Result<(Array, Array)> {
+    fn score(&self, batch: &Batch, h: &HeadOut, packing: Option<&Packing>) -> Result<(Array, Array)> {
         let (n, len, kmax) = (batch.n as i32, batch.len as i32, batch.kmax as i32);
         let d = self.hidden as i32;
-        let pooled = h
-            .take_axis(Array::from_slice(&[0u32], &[1]), 1)
-            .lx()?
-            .reshape(&[n, d])
-            .lx()?;
-        let flat: Vec<u32> = (0..batch.n)
-            .flat_map(|r| (0..batch.kmax).map(move |k| (r, k)))
-            .map(|(r, k)| r as u32 * len as u32 + batch.marker_pos[r * batch.kmax + k])
-            .collect();
-        let idx = Array::from_slice(&flat, &[n * kmax]);
-        let m = h.reshape(&[n * len, d]).lx()?.take_axis(&idx, 0).lx()?;
+        let (pooled, m) = match h {
+            HeadOut::Full(h) => {
+                let pooled = h
+                    .take_axis(Array::from_slice(&[0u32], &[1]), 1)
+                    .lx()?
+                    .reshape(&[n, d])
+                    .lx()?;
+                let flat: Vec<u32> = (0..batch.n)
+                    .flat_map(|r| (0..batch.kmax).map(move |k| (r, k)))
+                    .map(|(r, k)| r as u32 * len as u32 + batch.marker_pos[r * batch.kmax + k])
+                    .collect();
+                let idx = Array::from_slice(&flat, &[n * kmax]);
+                (pooled, h.reshape(&[n * len, d]).lx()?.take_axis(&idx, 0).lx()?)
+            }
+            HeadOut::Packed(h) => {
+                let starts = Self::row_starts(batch, packing);
+                let pooled = h.take_axis(Array::from_slice(&starts, &[n]), 0).lx()?;
+                let flat: Vec<u32> = (0..batch.n)
+                    .flat_map(|r| (0..batch.kmax).map(move |k| (r, k)))
+                    .map(|(r, k)| starts[r] + batch.marker_pos[r * batch.kmax + k])
+                    .collect();
+                (pooled, h.take_axis(Array::from_slice(&flat, &[n * kmax]), 0).lx()?)
+            }
+            HeadOut::Rows(rows) => (rows.pooled(), rows.markers(n, kmax, d)?),
+        };
         let s = self.scorer_norm.apply(&m)?;
         let s = gelu_erf_as(&self.scorer1.apply(&s)?, self.knobs.f16gelu).lx()?;
         let logits = self.scorer3.apply(&s)?.reshape(&[n * kmax]).lx()?;
@@ -1201,9 +1268,9 @@ impl Backend for MlxBackend {
         let stream = self.stream();
         mlx_rs::with_stream(&stream, || {
             let t0 = std::time::Instant::now();
-            let (enc, pad) = self.encode(batch)?;
-            let h = self.head_forward(batch, &enc, &pad)?;
-            let (logits, pooled) = self.score(batch, &h)?;
+            let enc = self.encode(batch)?;
+            let h = self.head_forward(batch, &enc)?;
+            let (logits, pooled) = self.score(batch, &h, enc.packing.as_ref())?;
             let t1 = std::time::Instant::now();
             transforms::eval([&logits, &pooled]).lx()?;
             if self.knobs.trace {
@@ -1232,10 +1299,15 @@ impl Backend for MlxBackend {
     fn encoder_hidden(&self, batch: &Batch) -> Result<Option<Vec<f32>>> {
         let stream = self.stream();
         mlx_rs::with_stream(&stream, || {
-            let (enc, _) = self.encode(batch)?;
-            let enc = to_f32_contiguous(&enc)?;
-            enc.eval().lx()?;
-            Ok(Some(host_f32(&enc)?))
+            let enc = self.encode(batch)?;
+            let h = match &enc.packing {
+                // Back to `[n, len, d]`; padding positions repeat their row's token 0.
+                Some(p) => p.expand(&enc.h, batch.n as i32, batch.len as i32)?,
+                None => enc.h,
+            };
+            let h = to_f32_contiguous(&h)?;
+            h.eval().lx()?;
+            Ok(Some(host_f32(&h)?))
         })
     }
 }
@@ -1245,79 +1317,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_parse_every_kind_of_value() {
-        let k = Knobs::parse("f16gelu,addmm=0,mask=bool,geglu=compiled,wcopy=t,buckets=512:128:256,pad=8,warm=1:4,cache=512,wired=2048").unwrap();
-        assert!(k.f16gelu && !k.addmm && k.bool_mask);
-        assert_eq!((k.geglu.as_str(), k.wcopy.as_str()), ("compiled", "t"));
-        assert_eq!((k.buckets, k.pad, k.warm), (vec![128, 256, 512], 8, vec![1, 4]));
-        assert_eq!((k.cache_mb, k.wired_mb), (Some(512), Some(2048)));
-        // Empty spec and empty items are the defaults; the last mention wins.
-        let d = Knobs::parse("").unwrap();
-        assert!(!d.f16gelu && d.addmm && d.geglu == "shapeless" && d.cache_mb.is_none());
-        assert!(Knobs::parse(",f16gelu,,").unwrap().f16gelu);
-        assert!(!Knobs::parse("f16gelu,f16gelu=0").unwrap().f16gelu);
-        assert!(!Knobs::parse("mask=bool,mask=additive").unwrap().bool_mask);
+    fn knobs_default_off_and_parse() {
+        let k = Knobs::from_spec(Some(""));
+        assert_eq!(k.dense_upto, None);
+        assert!(!k.headprune && !k.unpad);
+        let k = Knobs::from_spec(Some("dense_upto=512,headprune,unpad"));
+        assert_eq!(k.dense_upto, Some(512));
+        assert!(k.headprune && k.unpad);
+        let k = Knobs::from_spec(Some("headprune=0,unpad=0"));
+        assert!(!k.headprune && !k.unpad);
     }
 
-    /// An unknown setting or a bad value is an error that names the item, never a silent default.
+    /// The padding rows of a batch go through the packing as their row's token 0, and every
+    /// scorer row (position 0 and the marker slots) lands on the right packed token.
     #[test]
-    fn settings_reject_unknown_keys_and_bad_values() {
-        let err = |spec: &str| Knobs::parse(spec).err().map(|e| e.to_string()).unwrap_or_else(|| panic!("{spec} was accepted"));
-        assert!(err("f16gelu,cache=512x").contains("`cache=512x`"), "{}", err("f16gelu,cache=512x"));
-        assert!(err("f16gelu,chache=512").contains("unknown setting `chache`"), "{}", err("f16gelu,chache=512"));
-        assert!(err("geglu=fast").contains("`fast` is not one of shapeless, compiled, plain"));
-        assert!(err("mask=1").contains("`mask=1`"));
-        assert!(err("wcopy=copy").contains("`wcopy=copy`"));
-        assert!(err("f16gelu=yes").contains("`yes` is not 0 or 1"));
-        assert!(err("buckets=128:abc").contains("`abc` is not a whole number"));
-        assert!(err("buckets=").contains("`buckets=`"));
-        assert!(err("pad=0").contains("pad must be at least 1"));
-        assert!(err("pad=-1").contains("`-1` is not a whole number"));
-        assert!(err("cache").contains("needs a value"));
-        assert!(err("wired=2048,f16gelu,cache=512 ").contains("`cache=512 `"));
-        assert_eq!(check_settings("f16gelu,cache=512,wired=2048").ok(), Some(()));
-        assert!(check_settings("f16gelu,cache=512x").is_err());
-    }
-
-    /// The per-shape cache admits `cap` distinct shapes, then only the shapes it already holds.
-    #[test]
-    fn shape_budget_caps_distinct_shapes() {
-        let mut b = ShapeBudget::new(3);
-        assert!(b.admit(&[1, 4]) && b.admit(&[2, 4]) && b.admit(&[3, 4]));
-        assert_eq!(b.len(), 3);
-        assert!(!b.admit(&[4, 4]), "a fourth shape is refused");
-        assert!(b.admit(&[2, 4]), "a cached shape stays admitted");
-        assert!(!b.admit(&[4, 4]), "the refused shape is not counted");
-        assert_eq!(b.len(), 3);
-        assert!(!ShapeBudget::new(0).admit(&[1]));
-    }
-
-    /// `geglu=compiled` compiles at most `cap` shapes; past the cap new shapes run the shapeless
-    /// trace, and every path computes the same values as the plain (uncompiled) GeGLU.
-    #[test]
-    fn per_shape_geglu_falls_back_past_the_cap() {
-        let g = GeGlu::with_cap("compiled", true, 2);
-        let plain = GeGlu::new("plain", true);
-        for rows in [1i32, 2, 3, 1, 4] {
-            let x = Array::from_iter((0..rows * 8).map(|i| i as f32 * 0.25 - 4.0), &[rows, 8]);
-            let (got, want) = (g.apply(&x).unwrap(), plain.apply(&x).unwrap());
-            assert_eq!(got.shape(), &[rows, 4]);
-            let d = ops::abs(&ops::subtract(&got, &want).unwrap()).unwrap().max(None).unwrap();
-            assert!(d.item_exact::<f32>() < 1e-6, "rows={rows}: max diff {d}");
-        }
-        assert_eq!(g.per_shape_traces(), 2, "shapes [1,8] and [2,8] compiled per shape, [3,8] and [4,8] fell back");
-        assert_eq!(GeGlu::new("shapeless", true).per_shape_traces(), 0);
-    }
-
-    /// The head attention scales by its own head dim, `hidden / max(1, hidden / 64)`: 1/8 for
-    /// the published widths, and `1 / sqrt(hidden)` when a single head takes the whole width.
-    #[test]
-    fn head_scale_follows_the_head_dim() {
-        assert_eq!(head_scale(768, 12), 0.125);
-        assert_eq!(head_scale(1024, 16), 0.125);
-        assert_eq!(head_scale(512, 8), 0.125);
-        assert_eq!(head_scale(96, 1), 1.0 / 96f32.sqrt());
-        assert_eq!(head_scale(160, 2), 1.0 / 80f32.sqrt());
+    fn packing_indexes_real_tokens_and_scorer_rows() {
+        let batch = Batch {
+            n: 3,
+            len: 4,
+            kmax: 2,
+            input_ids: vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 0, 0, 0],
+            attention_mask: vec![1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0],
+            seq_lens: vec![2, 4, 1],
+            marker_pos: vec![1, 0, 1, 3, 0, 0],
+            marker_count: vec![1, 2, 0],
+            qtype: vec![0, 1, 2],
+        };
+        let p = Packing::new(&batch);
+        assert_eq!(p.offsets, vec![0, 2, 6]);
+        assert_eq!(p.pack.as_slice::<u32>(), &[0, 1, 4, 5, 6, 7, 8]);
+        assert_eq!(p.unpack.as_slice::<u32>(), &[0, 1, 0, 0, 2, 3, 4, 5, 6, 6, 6, 6]);
+        assert_eq!(p.row.as_slice::<u32>(), &[0, 0, 1, 1, 1, 1, 2]);
+        // Padded layout: row start `r * len`; packed: the offsets. Padded marker slots point
+        // at position 0 in both.
+        let padded = MlxBackend::scorer_rows(&batch, &MlxBackend::row_starts(&batch, None));
+        assert_eq!(padded.as_slice::<u32>(), &[0, 1, 0, 4, 5, 7, 8, 8, 8]);
+        let packed = MlxBackend::scorer_rows(&batch, &MlxBackend::row_starts(&batch, Some(&p)));
+        assert_eq!(packed.as_slice::<u32>(), &[0, 1, 0, 2, 3, 5, 6, 6, 6]);
     }
 
     /// One window mask serves every shorter length as a view with the same values.
@@ -1342,97 +1378,5 @@ mod tests {
             }
         }
         vals
-    }
-
-    /// The device-built gather indices are the ones the host loop used to build and cache:
-    /// `r * len + clamp((c - 1) * S + j, 0, len - 1)`, row-major over `(r, c, j)`.
-    #[test]
-    fn window_key_idx_matches_the_host_formula() {
-        for (s, rows, len) in [(2usize, 3usize, 7usize), (4, 1, 4), (64, 2, 130)] {
-            let nc = len.div_ceil(s);
-            let want: Vec<u32> = (0..rows)
-                .flat_map(|r| (0..nc).map(move |c| (r, c)))
-                .flat_map(|(r, c)| (0..3 * s).map(move |j| (r, (c as i64 - 1) * s as i64 + j as i64)))
-                .map(|(r, pos)| (r * len) as u32 + pos.clamp(0, len as i64 - 1) as u32)
-                .collect();
-            let got = window_key_idx(s, rows, len, nc).unwrap();
-            assert_eq!(got.shape(), &[(rows * nc * 3 * s) as i32]);
-            assert_eq!(got.as_slice::<u32>(), &want[..], "s={s} rows={rows} len={len}");
-        }
-    }
-
-    /// Two rows, `S = 2`, `len = 7` (the last chunk has one real slot): row 0 is full, row 1
-    /// has 3 tokens and 4 of padding.
-    fn padded_batch() -> (Vec<u32>, usize, usize, usize, usize) {
-        let mask = vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0];
-        (mask, 2, 7, 2, 4)
-    }
-
-    /// The chunked masks, boolean and additive, are the same rule: key slot `j` of chunk `c` is
-    /// position `(c - 1) * S + j`, and a padded query is one past `len` or masked in its row.
-    #[test]
-    fn chunked_mask_tables_follow_the_position_formula() {
-        let (mask, n, len, s, nc) = padded_batch();
-        let key_ok = window_key_valid(&mask, n, len, s, nc);
-        let padded = window_query_padded(&mask, n, len, s, nc);
-        for b in 0..n {
-            for c in 0..nc {
-                for j in 0..3 * s {
-                    let pos = (c as i64 - 1) * s as i64 + j as i64;
-                    let want = (0..len as i64).contains(&pos) && mask[b * len + pos as usize] == 1;
-                    assert_eq!(key_ok[(b * nc + c) * 3 * s + j], want, "row {b} chunk {c} slot {j}");
-                }
-                for i in 0..s {
-                    let pos = c * s + i;
-                    let want = pos >= len || mask[b * len + pos] != 1;
-                    assert_eq!(padded[(b * nc + c) * s + i], want, "row {b} chunk {c} query {i}");
-                }
-            }
-        }
-        // The band is the same rule the additive mask has always used.
-        let band = band_allows(s);
-        let additive = band_mask(s, Dtype::Float32).unwrap();
-        let additive = additive.as_slice::<f32>();
-        for i in 0..s {
-            for j in 0..3 * s {
-                assert_eq!(band[i * 3 * s + j], i + 2 * s >= j && j >= i, "band {i},{j}");
-                assert_eq!(additive[i * 3 * s + j] == 0.0, band[i * 3 * s + j], "additive band {i},{j}");
-            }
-        }
-        assert_eq!(band_mask_bool(s).unwrap().as_slice::<bool>(), &band[..]);
-    }
-
-    /// `(key valid & band) | padded query` over the tables: a real query sees exactly the valid
-    /// keys within `S` of it, and no query row is all false (which would be a NaN softmax row
-    /// with boolean masks). Row 1's fourth chunk is all padding, so it relies on the `padded`
-    /// term alone.
-    #[test]
-    fn chunked_bool_mask_leaves_no_query_row_all_false() {
-        let (mask, n, len, s, nc) = padded_batch();
-        let key_ok = window_key_valid(&mask, n, len, s, nc);
-        let padded = window_query_padded(&mask, n, len, s, nc);
-        let band = band_allows(s);
-        for b in 0..n {
-            for c in 0..nc {
-                for i in 0..s {
-                    let q = c * s + i;
-                    let row: Vec<bool> = (0..3 * s)
-                        .map(|j| (key_ok[(b * nc + c) * 3 * s + j] && band[i * 3 * s + j]) || padded[(b * nc + c) * s + i])
-                        .collect();
-                    assert!(row.iter().any(|&v| v), "row {b} query {q} attends to nothing");
-                    if q < len && mask[b * len + q] == 1 {
-                        for (j, &v) in row.iter().enumerate() {
-                            let pos = (c as i64 - 1) * s as i64 + j as i64;
-                            let want = (0..len as i64).contains(&pos)
-                                && mask[b * len + pos as usize] == 1
-                                && (pos - q as i64).abs() <= s as i64;
-                            assert_eq!(v, want, "row {b} query {q} key slot {j} (position {pos})");
-                        }
-                    }
-                }
-            }
-        }
-        // The chunk that motivates the padded-query term.
-        assert!(!key_ok[((nc + 3) * 3 * s)..((nc + 4) * 3 * s)].iter().any(|&v| v));
     }
 }
