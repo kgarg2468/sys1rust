@@ -125,6 +125,24 @@ fn model_dir(bench: &str, model: &str) -> Result<(PathBuf, String)> {
     Ok((dir, sha.to_string()))
 }
 
+/// One request per non-blank JSONL line. A line that cannot be read or parsed is an error, so
+/// a run never finishes with fewer requests than the workload holds.
+fn read_workload(path: &str) -> Result<Vec<Value>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open workload {path}"))?;
+    let mut rows = Vec::new();
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("{path}:{}: read error", i + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str(&line).with_context(|| format!("{path}:{}: invalid JSON", i + 1))?);
+    }
+    if rows.is_empty() {
+        bail!("workload {path} has no requests");
+    }
+    Ok(rows)
+}
+
 fn main() -> Result<()> {
     let t_process_start = now_unix();
     let args = parse_args()?;
@@ -139,6 +157,9 @@ fn main() -> Result<()> {
     if args.concurrency > 1 {
         bail!("--concurrency is for http mode; this adapter is in-process");
     }
+    if args.repeats == 0 && args.duration.is_none() {
+        bail!("--repeats must be at least 1 unless --duration is given");
+    }
     let variant = VARIANTS
         .iter()
         .find(|v| v.name == args.variant)
@@ -146,12 +167,7 @@ fn main() -> Result<()> {
     let bench = std::env::var("BENCH_ROOT").context("BENCH_ROOT is not set (source bench/env.sh)")?;
     let (dir, sha) = model_dir(&bench, &args.model)?;
 
-    let rows: Vec<Value> = BufReader::new(std::fs::File::open(&args.workload)?)
-        .lines()
-        .filter_map(|l| l.ok())
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(&l))
-        .collect::<std::result::Result<_, _>>()?;
+    let rows = read_workload(&args.workload)?;
 
     let t_load = Instant::now();
     let opts = (variant.opts)();
