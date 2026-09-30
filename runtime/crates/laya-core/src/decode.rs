@@ -7,7 +7,7 @@
 
 use crate::backend::{BackendOutput, Batch};
 use crate::config::AgentConfig;
-use crate::pyjson::{dumps_key, round_dp};
+use crate::pyjson::{self, dumps_key, round_dp};
 use crate::question::{QType, Question};
 use crate::weights::Weights;
 use crate::{Error, Result};
@@ -221,6 +221,21 @@ pub fn act_features(logits_row: &[f32], marker_count: usize) -> [f32; 4] {
     [top1, top1 - top2, ent, k / 255.0]
 }
 
+/// A choice label as Python's `json.dumps` prints it. With `arbitrary_precision` a Number
+/// keeps its literal text and every serde serializer writes it back verbatim, so a label
+/// typed `1E5`, `1e16` or `-0` would go out as typed where upstream prints `100000.0`,
+/// `1e+16` and `0`. Re-parsing [`pyjson::dumps`] of the label puts Python's text in the
+/// Number instead. A non-finite float (`1e400`) has no JSON text and is returned unchanged;
+/// upstream's `json.dumps(allow_nan=False)` fails the whole response for that label.
+fn python_value(label: &Value) -> Value {
+    match label {
+        Value::Number(_) => {
+            serde_json::from_str(&pyjson::dumps(label)).unwrap_or_else(|_| label.clone())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Decode one state's rows (`rows[0]..rows[n]` of `out`) into the Python result object.
 pub fn decode_answers(
     out: &BackendOutput,
@@ -263,7 +278,7 @@ pub fn decode_answers(
                 }
                 json!({
                     "type": "choice",
-                    "choice": q.choice_labels[argmax],
+                    "choice": python_value(&q.choice_labels[argmax]),
                     "probabilities": probs,
                     "confidence": conf,
                     "answer_confidence": round_dp(p[argmax], 4),
@@ -581,5 +596,71 @@ mod tests {
         assert_eq!(answers["bool"]["answer_confidence"], 0.87);
         assert_eq!(answers["int"]["probabilities"]["2"], 0.87);
         assert_eq!(answers["float"]["probabilities"]["1.5"], 0.87);
+    }
+
+    /// A numeric label goes out as Python prints it, whatever the caller typed: `1E5` is
+    /// `100000.0`, `1e16` is `1e+16`, `-0` is `0`, and a big int keeps its digits. With
+    /// `arbitrary_precision` a serializer writes the Number's text verbatim, so the text
+    /// has to be Python's already. Expected strings are `json.dumps` output under Python 3.14.
+    #[test]
+    fn choice_label_is_printed_like_python() {
+        let labels: Vec<Value> =
+            serde_json::from_str("[1E5, 1e16, -0, 123456789012345678901234567890]").unwrap();
+        let q = |id: &str| Question {
+            id: id.into(),
+            qtype: QType::Choice,
+            instructions: String::new(),
+            options: labels.iter().map(pyjson::py_str).collect(),
+            choice_labels: labels.clone(),
+            score_legend: vec![],
+        };
+        let qs = [q("exp"), q("e16"), q("negzero"), q("big")];
+        let batch = Batch {
+            n: 4,
+            len: 1,
+            kmax: 4,
+            input_ids: vec![0; 4],
+            attention_mask: vec![1; 4],
+            seq_lens: vec![1; 4],
+            marker_pos: vec![0; 16],
+            marker_count: vec![4; 4],
+            qtype: vec![0; 4],
+        };
+        let mut logits = vec![0.0; 16];
+        for r in 0..4 {
+            logits[r * 4 + r] = 3.0;
+        }
+        let out = BackendOutput {
+            logits,
+            pooled: vec![0.0; 4 * 2],
+        };
+        let temps = Temperatures {
+            by_type: [1.0; 3],
+            by_options: Map::new(),
+            rejected: vec![],
+        };
+        let answers = decode_answers(&out, &batch, &zero_act_head(2), &temps, &qs, 0).unwrap();
+        let printed = |id: &str| serde_json::to_string(&answers[id]["choice"]).unwrap();
+        assert_eq!(printed("exp"), "100000.0");
+        assert_eq!(printed("e16"), "1e+16");
+        assert_eq!(printed("negzero"), "0");
+        assert_eq!(printed("big"), "123456789012345678901234567890");
+        // The probabilities keys are the same text.
+        let keys: Vec<&String> = answers["exp"]["probabilities"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(
+            keys,
+            ["100000.0", "1e+16", "0", "123456789012345678901234567890"]
+        );
+        // Strings and bools are untouched.
+        assert_eq!(python_value(&json!("1E5")), json!("1E5"));
+        assert_eq!(python_value(&json!(true)), json!(true));
+        // A non-finite float has no JSON text (`pyjson::dumps` writes `Infinity`); the label
+        // Value is returned unchanged.
+        let inf: Value = serde_json::from_str("1e400").unwrap();
+        assert_eq!(python_value(&inf), inf);
     }
 }
