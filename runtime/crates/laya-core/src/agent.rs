@@ -69,10 +69,25 @@ impl Agent {
         let weights = Weights::open(model_dir)?;
         weights.verify()?;
         let act_head = ActHead::load(&weights)?;
-        let temperatures = Temperatures::from_config(&cfg.agent);
         let backend = make_backend(&weights, &cfg, opts)?;
+        let mut agent = Self::from_parts(cfg, tokenizer, act_head, backend)?;
+        agent.model_dir = model_dir.to_path_buf();
+        Ok(agent)
+    }
+
+    /// Assemble an agent from already loaded parts. The action head must read the encoder
+    /// hidden size plus its 4 scalar features, or the rows of the backend's pooled output
+    /// would be sliced at the wrong width.
+    pub fn from_parts(
+        cfg: ModelConfig,
+        tokenizer: LayaTokenizer,
+        act_head: ActHead,
+        backend: Box<dyn Backend>,
+    ) -> Result<Self> {
+        act_head.check_pooled_width(cfg.hidden_size())?;
+        let temperatures = Temperatures::from_config(&cfg.agent);
         Ok(Self {
-            model_dir: model_dir.to_path_buf(),
+            model_dir: PathBuf::new(),
             cfg,
             tokenizer,
             temperatures,
@@ -196,6 +211,167 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AgentConfig, EncoderConfig};
+    use crate::testing::SyntheticBackend;
+    use serde_json::json;
+
+    const HIDDEN: usize = 8;
+
+    /// A whitespace word-level tokenizer over a few words; anything else is `[UNK]`.
+    fn test_tokenizer() -> LayaTokenizer {
+        let words = [
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "question", ":", "choice", "score",
+            "noul", "yes", "no", "level", "0", "1", "2", "3", "refund", "billing", "the", "a",
+            "Which", "team", "?", "How", "urgent", "Is", "money", "involved",
+        ];
+        let vocab: serde_json::Map<String, Value> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), Value::from(i as u32)))
+            .collect();
+        let spec = json!({
+            "version": "1.0",
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"},
+            "pre_tokenizer": {"type": "Whitespace"},
+        });
+        let tok = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&spec).unwrap()).unwrap();
+        LayaTokenizer::from_tokenizer(tok, &Value::Null).unwrap()
+    }
+
+    /// An action head with small, varied weights so `act_probability` depends on the row.
+    fn test_act_head(d_in: usize) -> ActHead {
+        let (h, n_act) = (6, 2);
+        let w0 = (0..h * d_in)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) / 10.0)
+            .collect();
+        let b0 = (0..h).map(|i| i as f32 / 10.0).collect();
+        let w2 = (0..n_act * h)
+            .map(|i| ((i * 5 % 7) as f32 - 3.0) / 10.0)
+            .collect();
+        ActHead::from_tensors(vec![h, d_in], w0, b0, vec![n_act, h], w2, vec![0.1, -0.1]).unwrap()
+    }
+
+    fn test_config() -> ModelConfig {
+        let encoder = EncoderConfig::from_value(&json!({
+            "model_type": "modernbert", "vocab_size": 32, "hidden_size": HIDDEN,
+            "num_hidden_layers": 2, "num_attention_heads": 2, "intermediate_size": 16,
+        }))
+        .unwrap();
+        let agent: AgentConfig = serde_json::from_value(json!({
+            "encoder": "test", "max_len": 64, "head_max_len": 32,
+            "act_costs": {"escalate": 1.0}, "temperature": [1.2, 0.8, 1.0],
+        }))
+        .unwrap();
+        ModelConfig { agent, encoder }
+    }
+
+    /// An agent over [`SyntheticBackend`] with batches padded to a multiple of `pad_to`.
+    fn test_agent(pad_to: usize) -> Agent {
+        let backend = SyntheticBackend {
+            hidden: HIDDEN,
+            pad_to,
+        };
+        Agent::from_parts(
+            test_config(),
+            test_tokenizer(),
+            test_act_head(HIDDEN + 4),
+            Box::new(backend),
+        )
+        .unwrap()
+    }
+
+    fn questions() -> Value {
+        json!({
+            "route": {"type": "choice", "instructions": "Which team ?",
+                      "criteria": {"billing": "refund the a", "tech": null, "other": ""}},
+            "urgency": {"type": "score", "instructions": "How urgent ?",
+                        "criteria": ["none", "low", "high", "now"]},
+            "money": {"type": "noul", "instructions": "Is money involved ?"},
+        })
+    }
+
+    /// States of different token lengths, including a dict and a list (truncated from the
+    /// left), so a batch pads rows differently from a single-state call.
+    fn states() -> Vec<Value> {
+        vec![
+            json!("refund the billing"),
+            json!("a a a the the no yes level 0 1 2 3 refund billing question"),
+            json!({"from": "a", "text": "the refund"}),
+            json!([
+                "yes",
+                "no",
+                "the a refund billing yes no yes no the a the a the a"
+            ]),
+            json!(""),
+        ]
+    }
+
+    /// Collating several states into one forward, with the backend's padding, gives every
+    /// state the answers it gets on its own: the same decisions, probabilities, confidences,
+    /// `act_probability` and token counts.
+    #[test]
+    fn a_batch_answers_like_one_state_at_a_time() {
+        let (questions, states) = (questions(), states());
+        for pad_to in [1, 16] {
+            let agent = test_agent(pad_to);
+            let single: Vec<Value> = states
+                .iter()
+                .map(|s| agent.predict(s, &questions).unwrap())
+                .collect();
+            // Every state in one forward, then chunks of two and of one.
+            for batch_size in [None, Some(2), Some(1)] {
+                let (batched, timing) = agent
+                    .predict_batch_timed(&states, &questions, batch_size)
+                    .unwrap();
+                assert_eq!(
+                    batched, single,
+                    "pad_to {pad_to}, batch_size {batch_size:?}"
+                );
+                assert_eq!(
+                    timing.batch_len % pad_to,
+                    0,
+                    "padded to the backend's bucket"
+                );
+            }
+            let (_, timing) = agent
+                .predict_batch_timed(&states, &questions, None)
+                .unwrap();
+            assert_eq!(
+                timing.batch_rows,
+                states.len() * 3,
+                "one forward for all rows"
+            );
+            // The order of states in the batch does not leak between rows.
+            let reversed: Vec<Value> = states.iter().rev().cloned().collect();
+            let batched = agent.predict_batch(&reversed, &questions, None).unwrap();
+            assert_eq!(batched, single.iter().rev().cloned().collect::<Vec<_>>());
+            // The backend is not constant: different states get different answers.
+            assert_ne!(single[0]["answers"], single[1]["answers"]);
+            assert_ne!(single[0]["usage"], single[1]["usage"]);
+            let route = &single[0]["answers"]["route"];
+            assert!(["billing", "tech", "other"].contains(&route["choice"].as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn from_parts_rejects_an_action_head_of_another_width() {
+        let e = Agent::from_parts(
+            test_config(),
+            test_tokenizer(),
+            test_act_head(HIDDEN + 5),
+            Box::new(SyntheticBackend {
+                hidden: HIDDEN,
+                pad_to: 1,
+            }),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap();
+        assert!(
+            e.contains("input width 13") && e.contains("hidden size 8"),
+            "{e}"
+        );
+    }
 
     #[test]
     fn default_chunk_bounds_rows_and_keeps_whole_states() {

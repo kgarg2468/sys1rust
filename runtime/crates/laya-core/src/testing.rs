@@ -1,15 +1,76 @@
-//! Shared parity/benchmark harness for backend crates (`tests/fixtures/*.json`).
+//! Shared parity/benchmark harness for backend crates (`tests/fixtures/*.json`) and a
+//! synthetic backend for tests that need answers without a model.
 
-use crate::backend::{Backend, BackendOptions};
+use crate::backend::{Backend, BackendOptions, BackendOutput, Batch};
 use crate::decode::{decode_answers, ActHead, Temperatures};
 use crate::question::parse_questions;
 use crate::weights::Weights;
-use crate::{Agent, ModelConfig, Result};
+use crate::{Agent, Error, ModelConfig, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 
 pub type Factory =
     Box<dyn FnOnce(&Weights, &ModelConfig, &BackendOptions) -> Result<Box<dyn Backend>>>;
+
+/// A backend whose outputs are a deterministic function of each row's own tokens and marker
+/// positions. The same row gets the same logits and pooled state whatever batch it sits in
+/// and however far it is padded, so a test can check the batch path against single-state
+/// calls. `pad_to` rounds the batch length up to a multiple, like a bucketing backend.
+#[derive(Debug, Clone)]
+pub struct SyntheticBackend {
+    pub hidden: usize,
+    pub pad_to: usize,
+}
+
+impl SyntheticBackend {
+    /// FNV-1a over the row's real tokens, so the hash is independent of padding.
+    fn row_hash(tokens: &[u32]) -> u64 {
+        tokens.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &t| {
+            (h ^ t as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+    /// A value in `[0, 1)` from a hash and a salt.
+    fn unit(h: u64, salt: u64) -> f32 {
+        let mut x = h ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+impl Backend for SyntheticBackend {
+    fn name(&self) -> String {
+        "synthetic".into()
+    }
+    fn padded_len(&self, len: usize, _rows: usize) -> usize {
+        let m = self.pad_to.max(1);
+        len.div_ceil(m) * m
+    }
+    fn forward(&self, b: &Batch) -> Result<BackendOutput> {
+        let mut logits = vec![-1e4f32; b.n * b.kmax];
+        let mut pooled = vec![0f32; b.n * self.hidden];
+        for r in 0..b.n {
+            let row = &b.input_ids[r * b.len..(r + 1) * b.len];
+            let mask = &b.attention_mask[r * b.len..(r + 1) * b.len];
+            let n = b.seq_lens[r];
+            if mask[..n].iter().any(|&m| m != 1) || mask[n..].iter().any(|&m| m != 0) {
+                return Err(Error::Backend(format!(
+                    "row {r}: attention mask does not match seq_len {n}"
+                )));
+            }
+            let h = Self::row_hash(&row[..n]);
+            for k in 0..b.marker_count[r] {
+                let pos = b.marker_pos[r * b.kmax + k] as u64;
+                logits[r * b.kmax + k] = Self::unit(h, pos | (k as u64) << 32) * 4.0 - 2.0;
+            }
+            for j in 0..self.hidden {
+                pooled[r * self.hidden + j] = Self::unit(h, 1_000_000 + j as u64) - 0.5;
+            }
+        }
+        Ok(BackendOutput { logits, pooled })
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CaseReport {
@@ -19,7 +80,10 @@ pub struct CaseReport {
     pub pooled_max_abs: f32,
     pub encoder_hidden_max_abs: Option<f32>,
     pub answers_equal: bool,
-    pub choice_mismatches: usize,
+    /// Answers whose decision differs from the fixture: the `choice` label, the noul
+    /// decision (`noul >= 0.5`) or the score level with the largest probability, the same
+    /// rules as `bench/harness/compare.py`. A missing answer counts too.
+    pub decision_mismatches: usize,
     pub prob_max_abs: f64,
     pub forward_ms: f64,
 }
@@ -43,8 +107,12 @@ impl ParityReport {
             .map(|c| c.prob_max_abs)
             .fold(0.0, f64::max)
     }
+    pub fn decision_mismatches(&self) -> usize {
+        self.cases.iter().map(|c| c.decision_mismatches).sum()
+    }
+    /// Same as [`ParityReport::decision_mismatches`]; the name the laya-mlx parity test uses.
     pub fn choice_mismatches(&self) -> usize {
-        self.cases.iter().map(|c| c.choice_mismatches).sum()
+        self.decision_mismatches()
     }
     pub fn all_answers_equal(&self) -> bool {
         self.cases.iter().all(|c| c.answers_equal)
@@ -53,10 +121,10 @@ impl ParityReport {
         let mut s = format!("backend {}\n", self.backend);
         for c in &self.cases {
             s += &format!(
-                "  {:<12} rows {:<3} logits {:.4}  pooled {:.4}  enc {}  probs {:.4}  choice_mismatch {}  exact {}  fwd {:.1} ms\n",
+                "  {:<12} rows {:<3} logits {:.4}  pooled {:.4}  enc {}  probs {:.4}  decision_mismatch {}  exact {}  fwd {:.1} ms\n",
                 c.name, c.rows, c.logits_max_abs, c.pooled_max_abs,
                 c.encoder_hidden_max_abs.map(|x| format!("{x:.4}")).unwrap_or_else(|| "-".into()),
-                c.prob_max_abs, c.choice_mismatches, c.answers_equal, c.forward_ms
+                c.prob_max_abs, c.decision_mismatches, c.answers_equal, c.forward_ms
             );
         }
         s
@@ -99,22 +167,59 @@ fn max_abs_diff(case: &str, what: &str, got: &[f32], want: &[f32]) -> Result<f32
         .fold(0f32, f32::max))
 }
 
-/// Walk two answer objects collecting the max abs difference over numeric leaves and the
-/// number of differing `choice` strings.
-fn compare_answers(got: &Value, want: &Value, prob_max: &mut f64, choice_mismatch: &mut usize) {
+/// The key with the largest value, first in object order on a tie (`max(probs, key=...)`).
+fn argmax_key(probs: &Value) -> Option<&str> {
+    let mut best: Option<(&str, f64)> = None;
+    for (k, v) in probs.as_object()? {
+        let x = v.as_f64()?;
+        if best.is_none_or(|(_, b)| x > b) {
+            best = Some((k, x));
+        }
+    }
+    best.map(|(k, _)| k)
+}
+
+/// What an answer decides, by the rules of `bench/harness/compare.py`: the `choice` label, the
+/// noul decision (`noul >= 0.5`), or the score level with the largest probability. `None`
+/// when the answer has no decision to read.
+pub fn decision(answer: &Value) -> Option<Value> {
+    match answer.get("type").and_then(Value::as_str)? {
+        "choice" => answer
+            .get("choice")
+            .cloned()
+            .or_else(|| argmax_key(&answer["probabilities"]).map(Value::from)),
+        "noul" => Some(Value::from(answer.get("noul")?.as_f64()? >= 0.5)),
+        "score" => match answer.get("probabilities") {
+            Some(p) if p.as_object().is_some_and(|m| !m.is_empty()) => {
+                Some(Value::from(argmax_key(p)?.parse::<i64>().ok()?))
+            }
+            _ => {
+                let s = answer.get("score")?.as_f64()?;
+                (s.fract() == 0.0).then(|| Value::from(s as i64))
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Whether two answers make the same decision (`compare.py`'s `agree`).
+pub fn same_decision(got: &Value, want: &Value) -> bool {
+    if got.get("type") != want.get("type") {
+        return false;
+    }
+    match (decision(got), decision(want)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Largest absolute difference over the numeric leaves shared by two values.
+fn numeric_max_diff(got: &Value, want: &Value, prob_max: &mut f64) {
     match (got, want) {
         (Value::Object(a), Value::Object(b)) => {
             for (k, wv) in b {
-                match a.get(k) {
-                    Some(gv) => {
-                        if k == "choice" && gv != wv {
-                            *choice_mismatch += 1;
-                        }
-                        compare_answers(gv, wv, prob_max, choice_mismatch);
-                    }
-                    None => {
-                        *choice_mismatch += 1;
-                    }
+                if let Some(gv) = a.get(k) {
+                    numeric_max_diff(gv, wv, prob_max);
                 }
             }
         }
@@ -125,6 +230,45 @@ fn compare_answers(got: &Value, want: &Value, prob_max: &mut f64, choice_mismatc
             }
         }
         _ => {}
+    }
+}
+
+/// Compare two `answers` objects: the max abs difference over numeric leaves and the number
+/// of questions whose decision differs or whose answer is missing.
+fn compare_answers(got: &Value, want: &Value) -> (f64, usize) {
+    let (mut prob_max, mut mismatches) = (0f64, 0usize);
+    let Some(want) = want.as_object() else {
+        return (prob_max, mismatches);
+    };
+    for (qid, w) in want {
+        match got.get(qid) {
+            Some(g) => {
+                if !same_decision(g, w) {
+                    mismatches += 1;
+                }
+                numeric_max_diff(g, w, &mut prob_max);
+            }
+            None => mismatches += 1,
+        }
+    }
+    (prob_max, mismatches)
+}
+
+/// Fixtures from a laya older than 0.3.21 have no `answer_confidence`; drop it from `got`
+/// so the exact comparison is over the keys the fixture has.
+fn drop_answer_confidence_if_absent(got: &mut Value, want: &Value) {
+    let fixture_has_key = want
+        .as_object()
+        .is_some_and(|m| m.values().any(|a| a.get("answer_confidence").is_some()));
+    if fixture_has_key {
+        return;
+    }
+    if let Some(answers) = got.as_object_mut() {
+        for a in answers.values_mut() {
+            if let Some(a) = a.as_object_mut() {
+                a.remove("answer_confidence");
+            }
+        }
     }
 }
 
@@ -182,10 +326,10 @@ pub fn run_parity(
             }
             _ => None,
         };
-        let answers = decode_answers(&out, &batch, &act_head, &temps, &qs, 0)?;
+        let mut answers = decode_answers(&out, &batch, &act_head, &temps, &qs, 0)?;
         let want = &case["result"]["answers"];
-        let (mut prob_max, mut choice_mismatches) = (0f64, 0usize);
-        compare_answers(&answers, want, &mut prob_max, &mut choice_mismatches);
+        drop_answer_confidence_if_absent(&mut answers, want);
+        let (prob_max, decision_mismatches) = compare_answers(&answers, want);
         report.cases.push(CaseReport {
             name,
             rows: batch.n,
@@ -193,11 +337,127 @@ pub fn run_parity(
             pooled_max_abs: pooled_max,
             encoder_hidden_max_abs,
             answers_equal: &answers == want,
-            choice_mismatches,
+            decision_mismatches,
             prob_max_abs: prob_max,
             forward_ms,
         });
     }
     let _ = d;
     Ok(Some(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn decisions_follow_compare_py() {
+        let choice =
+            json!({"type": "choice", "choice": "b", "probabilities": {"a": 0.4, "b": 0.6}});
+        assert_eq!(decision(&choice), Some(json!("b")));
+        // Without `choice`, the argmax of the probabilities; first key wins a tie.
+        let tie = json!({"type": "choice", "probabilities": {"a": 0.5, "b": 0.5}});
+        assert_eq!(decision(&tie), Some(json!("a")));
+        assert_eq!(
+            decision(&json!({"type": "noul", "noul": 0.495})),
+            Some(json!(false))
+        );
+        assert_eq!(
+            decision(&json!({"type": "noul", "noul": 0.5})),
+            Some(json!(true))
+        );
+        let score =
+            json!({"type": "score", "score": 1.7, "probabilities": {"0": 0.1, "1": 0.3, "2": 0.6}});
+        assert_eq!(decision(&score), Some(json!(2)));
+        assert_eq!(
+            decision(&json!({"type": "score", "score": 2.0})),
+            Some(json!(2))
+        );
+        assert_eq!(decision(&json!({"type": "score", "score": 1.7})), None);
+        assert_eq!(decision(&json!({"type": "other"})), None);
+    }
+
+    /// A flipped noul or a changed score level counts as a mismatch even when every number
+    /// stays within a small tolerance, and a changed type or a missing answer counts too.
+    #[test]
+    fn mismatches_count_every_decision_type() {
+        let want = json!({
+            "c": {"type": "choice", "choice": "a", "probabilities": {"a": 0.51, "b": 0.49}},
+            "n": {"type": "noul", "noul": 0.495},
+            "s": {"type": "score", "score": 1.5, "probabilities": {"0": 0.0, "1": 0.5, "2": 0.5}},
+            "m": {"type": "noul", "noul": 0.9},
+        });
+        let got = json!({
+            "c": {"type": "choice", "choice": "b", "probabilities": {"a": 0.49, "b": 0.51}},
+            "n": {"type": "noul", "noul": 0.505},
+            "s": {"type": "score", "score": 1.5, "probabilities": {"0": 0.0, "1": 0.49, "2": 0.51}},
+        });
+        let (prob_max, mismatches) = compare_answers(&got, &want);
+        assert_eq!(mismatches, 4);
+        assert!((prob_max - 0.02).abs() < 1e-9, "{prob_max}");
+        let (prob_max, mismatches) = compare_answers(&want, &want);
+        assert_eq!((prob_max, mismatches), (0.0, 0));
+        let other_type = json!({"c": {"type": "noul", "noul": 1.0}});
+        assert_eq!(compare_answers(&other_type, &json!({"c": want["c"]})).1, 1);
+    }
+
+    #[test]
+    fn answer_confidence_is_dropped_only_for_old_fixtures() {
+        let old = json!({"q": {"type": "noul", "noul": 0.7, "confidence": 0.7}});
+        let mut got = json!({"q": {"type": "noul", "noul": 0.7, "confidence": 0.7, "answer_confidence": 0.7}});
+        drop_answer_confidence_if_absent(&mut got, &old);
+        assert_eq!(got, old);
+        let new = json!({"q": {"type": "noul", "noul": 0.7, "confidence": 0.7, "answer_confidence": 0.7}});
+        let mut got = new.clone();
+        drop_answer_confidence_if_absent(&mut got, &new);
+        assert_eq!(got, new);
+    }
+
+    /// The synthetic backend depends only on a row's own tokens and markers.
+    #[test]
+    fn synthetic_backend_is_padding_and_batch_independent() {
+        let b = SyntheticBackend {
+            hidden: 4,
+            pad_to: 8,
+        };
+        let mk = |rows: Vec<Vec<u32>>, len: usize| Batch {
+            n: rows.len(),
+            len,
+            kmax: 2,
+            input_ids: rows
+                .iter()
+                .flat_map(|r| {
+                    let mut v = r.clone();
+                    v.resize(len, 0);
+                    v
+                })
+                .collect(),
+            attention_mask: rows
+                .iter()
+                .flat_map(|r| {
+                    let mut v = vec![1u32; r.len()];
+                    v.resize(len, 0);
+                    v
+                })
+                .collect(),
+            seq_lens: rows.iter().map(Vec::len).collect(),
+            marker_pos: rows.iter().flat_map(|_| [1, 3]).collect(),
+            marker_count: rows.iter().map(|_| 2).collect(),
+            qtype: rows.iter().map(|_| 0).collect(),
+        };
+        let alone = b.forward(&mk(vec![vec![5, 6, 7, 8, 9]], 5)).unwrap();
+        let padded = b
+            .forward(&mk(vec![vec![1, 2], vec![5, 6, 7, 8, 9]], 16))
+            .unwrap();
+        assert_eq!(alone.logits, padded.logits[2..4]);
+        assert_eq!(alone.pooled, padded.pooled[4..8]);
+        assert_ne!(padded.logits[..2], padded.logits[2..4]);
+        assert_eq!(b.padded_len(5, 1), 8);
+        assert_eq!(b.padded_len(16, 1), 16);
+        // A mask that disagrees with seq_lens is an error, not a silent wrong answer.
+        let mut bad = mk(vec![vec![1, 2, 3]], 4);
+        bad.attention_mask[3] = 1;
+        assert!(b.forward(&bad).is_err());
+    }
 }

@@ -132,6 +132,19 @@ impl ActHead {
         let (_, b0) = w.tensor_f32("act_head.0.bias")?;
         let (s2, w2) = w.tensor_f32("act_head.2.weight")?;
         let (_, b2) = w.tensor_f32("act_head.2.bias")?;
+        Self::from_tensors(s0, w0, b0, s2, w2, b2)
+    }
+
+    /// Build the head from the two layers' `(shape, row-major data)`, with the same checks as
+    /// [`ActHead::load`]. For tests and embedders that hold the tensors already.
+    pub fn from_tensors(
+        s0: Vec<usize>,
+        w0: Vec<f32>,
+        b0: Vec<f32>,
+        s2: Vec<usize>,
+        w2: Vec<f32>,
+        b2: Vec<f32>,
+    ) -> Result<Self> {
         if s0.len() != 2 || s2.len() != 2 || s2[1] != s0[0] {
             return Err(Error::Weights(format!(
                 "act_head shapes {s0:?} / {s2:?} are not a 2-layer MLP"
@@ -155,6 +168,15 @@ impl ActHead {
                 "act_head biases have {} and {} values; the layers have {hidden} and {n_act} outputs",
                 b0.len(),
                 b2.len()
+            )));
+        }
+        if w0.len() != hidden * d_in || w2.len() != n_act * hidden {
+            return Err(Error::Weights(format!(
+                "act_head weights have {} and {} values; shapes {s0:?} / {s2:?} need {} and {}",
+                w0.len(),
+                w2.len(),
+                hidden * d_in,
+                n_act * hidden
             )));
         }
         Ok(Self {
