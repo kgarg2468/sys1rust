@@ -189,27 +189,43 @@ pub fn validate_body(raw: &[u8], served_name: &str) -> Result<Validated, Rejecti
 
 /// [`validate_body`] for an async caller: a deep body is parsed on its own thread while the
 /// caller's task yields, so a tokio worker is never held for the parse and `/health` and the
-/// other connections keep moving. The thread owns `raw` and, if the caller is gone by the
-/// time it finishes (the client disconnected), the result dies on its stack. When the result
-/// does cross to the caller it is a [`Validated`], whose drop is flat, so the tokio side may
-/// drop it but must not walk it.
-pub async fn validate_body_async(raw: Vec<u8>, served_name: &str) -> Result<Validated, Rejection> {
+/// other connections keep moving. `hold` is whatever guard covers the request (the handler's
+/// admission permit; `()` when there is none). A shallow body is checked inline and the
+/// guard comes straight back. For a deep body the guard moves onto the parse thread with
+/// `raw` and comes back with the result; if the caller is gone by the time the thread
+/// finishes (the client disconnected), the result dies on its stack and the guard is
+/// released there, after the parse, so the permit counts the parse thread for as long as
+/// it runs. When the result does cross to the caller it is a [`Validated`], whose drop is
+/// flat, so the tokio side may drop it but must not walk it.
+pub async fn validate_body_async<H: Send + 'static>(
+    raw: Vec<u8>,
+    served_name: &str,
+    hold: H,
+) -> Result<(Validated, H), Rejection> {
     if !needs_deep_stack(&raw)? {
-        return check_parsed(&raw, served_name);
+        return check_parsed(&raw, served_name).map(|v| (v, hold));
     }
     let served_name = served_name.to_string();
-    on_deep_stack(move || check_parsed(&raw, &served_name)).await?
+    let (checked, hold) = on_deep_stack(move || check_parsed(&raw, &served_name), hold).await?;
+    checked.map(|v| (v, hold))
 }
 
-/// Run `work` on a [`deep_thread`] and await its result without blocking the runtime.
-async fn on_deep_stack<T: Send + 'static>(
+/// Run `work` on a [`deep_thread`] and await its result without blocking the runtime. The
+/// thread owns `hold` while `work` runs and sends it back with the result, so a caller that
+/// drops this future early does not release the guard: it drops on the thread once `work`
+/// returns. If the thread cannot be spawned the guard drops here with the closure, which is
+/// fine because the caller answers the error at once.
+async fn on_deep_stack<T: Send + 'static, H: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, Rejection> {
+    hold: H,
+) -> Result<(T, H), Rejection> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     deep_thread()
         .spawn(move || {
-            // A closed receiver means the caller is gone; the result is dropped right here.
-            let _ = tx.send(work());
+            let result = work();
+            // A closed receiver means the caller is gone; the result and the guard are
+            // dropped right here, after the work.
+            let _ = tx.send((result, hold));
         })
         .map_err(deep_thread_failed)?;
     // The sender is dropped without a value only when `work` panicked.
@@ -513,27 +529,39 @@ mod tests {
     }
 
     /// The async entry point gives the same answers as the sync one at the limit, one past
-    /// it and for a shallow body, and runs on a plain tokio runtime.
+    /// it and for a shallow body, and runs on a plain tokio runtime. The guard comes back
+    /// with the result on both the inline and the deep path.
     #[tokio::test]
     async fn validate_body_async_matches_the_sync_path() {
         let served = "typed-decisions";
-        let ok = validate_body_async(
+        let (ok, hold) = validate_body_async(
             body_with_state_depth(MAX_JSON_DEPTH - 1).into_bytes(),
             served,
+            "deep",
         )
         .await
         .unwrap();
+        assert_eq!(hold, "deep");
         assert_eq!(ok.questions, json!({}));
         assert!(matches!(ok.state, Value::Array(_)));
-        let e = validate_body_async(body_with_state_depth(MAX_JSON_DEPTH).into_bytes(), served)
-            .await
-            .unwrap_err();
+        let e = validate_body_async(
+            body_with_state_depth(MAX_JSON_DEPTH).into_bytes(),
+            served,
+            (),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.detail, "request body must be valid JSON");
-        let ok = validate_body_async(br#"{"state":"s","questions":{}}"#.to_vec(), served)
-            .await
-            .unwrap();
+        let (ok, hold) = validate_body_async(
+            br#"{"state":"s","questions":{}}"#.to_vec(),
+            served,
+            "shallow",
+        )
+        .await
+        .unwrap();
+        assert_eq!(hold, "shallow");
         assert_eq!(ok.state, json!("s"));
-        let e = validate_body_async(b"nope".to_vec(), served)
+        let e = validate_body_async(b"nope".to_vec(), served, ())
             .await
             .unwrap_err();
         assert_eq!(e.detail, "request body must be valid JSON");
@@ -545,10 +573,13 @@ mod tests {
     #[tokio::test]
     async fn deep_thread_does_not_block_the_runtime() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let work = on_deep_stack(move || {
-            release_rx.recv().unwrap();
-            7
-        });
+        let work = on_deep_stack(
+            move || {
+                release_rx.recv().unwrap();
+                7
+            },
+            (),
+        );
         let releaser = async {
             tokio::task::yield_now().await;
             release_tx.send(()).unwrap();
@@ -558,7 +589,7 @@ mod tests {
         })
         .await
         .expect("the runtime was blocked while the deep thread waited");
-        assert_eq!(got.unwrap(), 7);
+        assert_eq!(got.unwrap(), (7, ()));
     }
 
     /// A caller that is gone before the thread finishes (the client disconnected) leaves the
@@ -567,14 +598,17 @@ mod tests {
     async fn deep_thread_caller_gone_or_panicked() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let work = on_deep_stack(move || {
-            release_rx.recv().unwrap();
-            let _ = done_tx.send(());
-            validate_body(
-                body_with_state_depth(MAX_JSON_DEPTH - 1).as_bytes(),
-                "typed-decisions",
-            )
-        });
+        let work = on_deep_stack(
+            move || {
+                release_rx.recv().unwrap();
+                let _ = done_tx.send(());
+                validate_body(
+                    body_with_state_depth(MAX_JSON_DEPTH - 1).as_bytes(),
+                    "typed-decisions",
+                )
+            },
+            (),
+        );
         // Poll once so the thread starts, then drop the future.
         let mut work = Box::pin(work);
         assert!(futures_poll_once(&mut work).is_none());
@@ -583,11 +617,44 @@ mod tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the thread ran to completion on its own");
-        let e = on_deep_stack(|| -> usize { panic!("boom") })
+        let e = on_deep_stack(|| -> usize { panic!("boom") }, ())
             .await
             .unwrap_err();
         assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(e.detail, "inference failed");
+    }
+
+    /// The guard outlives a dropped caller: with the handler's future gone (the client
+    /// disconnected) the admission permit stays taken while the thread still works, and
+    /// comes back only once the work ends. Every step is gated on a channel, so the
+    /// assertions never race the thread.
+    #[tokio::test]
+    async fn deep_thread_holds_the_guard_until_the_work_ends() {
+        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admission.clone().acquire_owned().await.unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = on_deep_stack(
+            move || {
+                release_rx.recv().unwrap();
+            },
+            permit,
+        );
+        // Poll once so the thread starts with the permit, then drop the future.
+        let mut work = Box::pin(work);
+        assert!(futures_poll_once(&mut work).is_none());
+        drop(work);
+        // The thread is blocked in `work`, so the permit cannot have been released yet.
+        assert_eq!(admission.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        // The thread returns from `work`, finds the receiver gone and drops the permit.
+        let reacquired =
+            tokio::time::timeout(std::time::Duration::from_secs(10), admission.acquire())
+                .await
+                .expect("the permit was not released after the work ended")
+                .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+        drop(reacquired);
+        assert_eq!(admission.available_permits(), 1);
     }
 
     /// Poll `fut` once with a no-op waker.
