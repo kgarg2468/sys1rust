@@ -107,12 +107,64 @@ fn metallib_dir(mlx_c_root: &Path) -> PathBuf {
         .join(mlx_c_key(mlx_c_root))
 }
 
+/// The MLX version the vendored mlx-c is written against (`GIT_TAG` in `src/mlx-c/CMakeLists.txt`).
+/// A prebuilt MLX must be exactly this version: mlx-c is compiled against its headers and the
+/// C++ ABI changes between MLX releases.
+const MLX_VERSION: &str = "0.32.2";
+
+/// Read `PACKAGE_VERSION` from the prebuilt install's `share/cmake/MLX/MLXConfigVersion.cmake`.
+fn prebuilt_mlx_version(prebuilt: &Path) -> String {
+    let path = prebuilt.join("share/cmake/MLX/MLXConfigVersion.cmake");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "MLX_SYS_PREBUILT_DIR={} does not look like an MLX install: cannot read {} ({e})",
+            prebuilt.display(),
+            path.display()
+        )
+    });
+    text.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("set(PACKAGE_VERSION")?
+                .trim()
+                .strip_suffix(')')?
+                .trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_owned)
+        })
+        .next()
+        .unwrap_or_else(|| panic!("no set(PACKAGE_VERSION ...) line in {}", path.display()))
+}
+
 /// sys1rust patch: build only mlx-c and link it against a prebuilt MLX, such as the `mlx` Python
 /// wheel's `site-packages/mlx` directory (`include/`, `lib/libmlx.dylib`, `lib/mlx.metallib`,
 /// `share/cmake/MLX`). Building MLX itself from source needs Apple's separately downloaded Metal
 /// toolchain. libmlx finds `mlx.metallib` next to itself, so no metallib path is set here. The
 /// final binary needs an rpath to `<dir>/lib`.
 fn build_and_link_mlx_c_prebuilt(prebuilt: &Path) {
+    // CMake resolves a relative MLX_DIR against its own build directory, so make the path
+    // absolute first. This also catches a missing directory with a clear message.
+    let prebuilt = prebuilt.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "MLX_SYS_PREBUILT_DIR={} cannot be resolved to an absolute path ({e})",
+            prebuilt.display()
+        )
+    });
+    let prebuilt = prebuilt.as_path();
+    let version = prebuilt_mlx_version(prebuilt);
+    if version != MLX_VERSION {
+        panic!(
+            "MLX_SYS_PREBUILT_DIR={} is MLX {version}, but the vendored mlx-c needs MLX {MLX_VERSION}",
+            prebuilt.display()
+        );
+    }
+    // Cargo only watches the variable's value. Watch the install too, so a replaced wheel at
+    // the same path rebuilds mlxc instead of reusing an object compiled against the old one.
+    for input in ["lib/libmlx.dylib", "share/cmake/MLX/MLXConfigVersion.cmake"] {
+        println!("cargo:rerun-if-changed={}", prebuilt.join(input).display());
+    }
+
     let mlx_c_root = Path::new("src/mlx-c");
     let mut config = Config::new(mlx_c_root);
     config.define("CMAKE_INSTALL_PREFIX", ".");
@@ -126,7 +178,10 @@ fn build_and_link_mlx_c_prebuilt(prebuilt: &Path) {
 
     println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
     println!("cargo:rustc-link-lib=static=mlxc");
-    println!("cargo:rustc-link-search=native={}", prebuilt.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        prebuilt.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=dylib=mlx");
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=dylib=objc");

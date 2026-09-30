@@ -16,3 +16,15 @@ temporary build directory.
 Set `MLX_RS_METAL_PATH` to use a different directory verbatim as CMake's `MLX_METAL_PATH`.
 When this override is set, the build does not read or write `HOME`, which supports sandboxed and
 Nix builds.
+
+## Prebuilt MLX (sys1rust)
+
+Set `MLX_SYS_PREBUILT_DIR` to an MLX install such as the `mlx` Python wheel's `site-packages/mlx`
+directory. The build then compiles only mlx-c and links it against `lib/libmlx.dylib` from that
+directory. The install must be MLX `0.32.2`; the build reads
+`share/cmake/MLX/MLXConfigVersion.cmake` and fails on any other version. The path is resolved to
+an absolute path, and the build reruns when `lib/libmlx.dylib` or the version file changes.
+
+The two locations above do not apply to prebuilt builds. `MLX_RS_METAL_PATH` is ignored, and
+`libmlx.dylib` loads `mlx.metallib` from its own directory (`lib/`), so keep the two files
+together. The final binary needs an rpath to that `lib/` directory.
