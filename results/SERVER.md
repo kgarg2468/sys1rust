@@ -56,13 +56,20 @@ Building the server found two bugs in the runtime, fixed in e758bfa.
 
 ## Running it
 
-`sys1d` has to be built first. The `runtime/` workspace arrives later in this PR stack, and the top-level `README.md` has the build steps. The commands below use the bench setup. `bench/env.sh` points the build at the MLX in the laya-mlx contender's venv (`bench/contenders/laya-mlx/NOTES.md`), and puts the Cargo output and the Hugging Face cache under `bench/`. The revision is the typed-decisions pin in `bench/models.lock.json`, which these measurements used.
+`sys1d` has to be built first. The `runtime/` workspace arrives later in this PR stack. To build outside the bench, use the steps in the top-level `README.md`: a venv on Python 3.10 or newer with `mlx==0.32.2` and `huggingface_hub`, and `MLX_SYS_PREBUILT_DIR` taken from `mlx.core.__file__`.
+
+The commands below use the bench setup these measurements used. `bench/env.sh` points the build at the MLX in the laya-mlx contender's venv and puts the Cargo output and the Hugging Face cache under `bench/`. It does not create that venv, so the first step sets it up once, as in `bench/contenders/laya-mlx/NOTES.md`. That step needs `uv`. The venv also has the `hf` CLI, which the download step calls by its path. The revision is the typed-decisions pin in `bench/models.lock.json`.
 
 ```bash
 source bench/env.sh
+# Once: the laya-mlx contender's venv, with MLX 0.32.2 and the hf CLI.
+git clone https://github.com/mizorewww/laya-mlx bench/contenders/laya-mlx/src
+(cd bench/contenders/laya-mlx/src && git checkout -q 0a859518634112655cb97c745dbf04f5191aaf13 &&
+  UV_PROJECT_ENVIRONMENT=../.venv uv sync --frozen --python 3.12 --managed-python)
+
 cargo build --release --manifest-path runtime/Cargo.toml -p sys1d
 REV=1a793eb568e6718f15941d08f85432581df534e3
-hf download convaiinnovations/laya-typed-decisions --revision $REV   # once; sys1d never downloads
+bench/contenders/laya-mlx/.venv/bin/hf download convaiinnovations/laya-typed-decisions --revision $REV   # once; sys1d never downloads
 $CARGO_TARGET_DIR/release/sys1d --model typed-decisions --revision $REV --port 8000
 ```
 
