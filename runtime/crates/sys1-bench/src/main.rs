@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use laya_core::{Agent, BackendOptions};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const CONTENDER: &str = "sys1rust";
@@ -118,24 +118,6 @@ fn parse_duration(s: &str) -> Result<f64> {
     Ok(d)
 }
 
-/// `$HF_HOME/hub/models--org--name/snapshots/<sha>` for the model's pin in `models.lock.json`.
-fn model_dir(bench: &str, model: &str) -> Result<(PathBuf, String)> {
-    let lock: Value = serde_json::from_str(&std::fs::read_to_string(format!("{bench}/models.lock.json"))?)?;
-    let pin = lock.get(model).with_context(|| format!("{model} is not in models.lock.json"))?;
-    let repo = pin["repo"].as_str().context("repo")?;
-    let sha = pin["sha"].as_str().context("sha")?;
-    let hf = std::env::var("HF_HOME").context("HF_HOME is not set (source bench/env.sh)")?;
-    let dir = PathBuf::from(hf)
-        .join("hub")
-        .join(format!("models--{}", repo.replace('/', "--")))
-        .join("snapshots")
-        .join(sha);
-    if !dir.exists() {
-        bail!("{} is not downloaded", dir.display());
-    }
-    Ok((dir, sha.to_string()))
-}
-
 /// One request per non-blank JSONL line. A line that cannot be read or parsed is an error, so
 /// a run never finishes with fewer requests than the workload holds.
 fn read_workload(path: &str) -> Result<Vec<Value>> {
@@ -182,7 +164,7 @@ fn main() -> Result<()> {
         laya_mlx::check_settings(spec).with_context(|| format!("variant {}: settings `{spec}`", variant.name))?;
     }
     let bench = std::env::var("BENCH_ROOT").context("BENCH_ROOT is not set (source bench/env.sh)")?;
-    let (dir, sha) = model_dir(&bench, &args.model)?;
+    let (dir, sha) = sys1_bench::pinned_model_dir(Path::new(&bench), &args.model)?;
 
     let rows = read_workload(&args.workload)?;
 

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use laya_core::{Agent, BackendOptions};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 fn main() -> Result<()> {
@@ -46,16 +46,11 @@ fn main() -> Result<()> {
         return micro();
     }
     let bench = std::env::var("BENCH_ROOT").context("source bench/env.sh")?;
-    let lock: Value = serde_json::from_str(&std::fs::read_to_string(format!("{bench}/models.lock.json"))?)?;
-    let pin = &lock[&model];
-    let dir = PathBuf::from(std::env::var("HF_HOME")?)
-        .join("hub")
-        .join(format!("models--{}", pin["repo"].as_str().context("repo")?.replace('/', "--")))
-        .join("snapshots")
-        .join(pin["sha"].as_str().context("sha")?);
+    let (dir, _sha) = sys1_bench::pinned_model_dir(Path::new(&bench), &model)?;
 
     let mut picked: Vec<(String, Value)> = Vec::new();
-    for line in BufReader::new(std::fs::File::open(&workload)?).lines() {
+    let file = std::fs::File::open(&workload).with_context(|| format!("open workload {workload}"))?;
+    for line in BufReader::new(file).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
