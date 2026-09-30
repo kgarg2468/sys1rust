@@ -166,8 +166,10 @@ async fn systemone(
 ) -> Result<Response<Body>, Rejection> {
     check_auth(&st, req.headers().get(AUTHORIZATION))?;
     // Non-blocking: over-cap load is refused, not queued, so the bodies buffered at once stay
-    // bounded. The permit lives until this function returns, i.e. through inference.
-    let _permit = st.admission.clone().try_acquire_owned().map_err(|_| {
+    // bounded. The permit lives until this function returns, i.e. through inference, except
+    // that a deep body's parse thread carries it (see `validate_body_async` below), so it
+    // covers the parse even if the client leaves and this future is dropped mid-parse.
+    let permit = st.admission.clone().try_acquire_owned().map_err(|_| {
         // Admission turns over at inference speed, so one second is the honest hint.
         Rejection::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -201,7 +203,12 @@ async fn systemone(
     // From here on this task holds no request-derived `Value`: a deep body is parsed on its
     // own thread, what comes back is a `Validated` (flat drop) that goes straight to the
     // inference thread, and the answer is the serialized body. See `validate::DEEP_STACK`.
-    let v = validate_body_async(raw, &st.served.name).await?;
+    // The permit goes along: a deep parse holds it on its thread and hands it back with the
+    // result, so a disconnect mid-parse frees the slot only once the 64 MiB thread is done
+    // and the parse threads alive at once never exceed the admission cap. The inference
+    // path needs no such care, its channel is bounded and the worker skips a job whose
+    // reply is closed.
+    let (v, _permit) = validate_body_async(raw, &st.served.name, permit).await?;
     let pred = match st.worker.predict(v, st.routing.clone()).await {
         Ok(p) => p,
         Err(PredictError::Question(m)) => {
