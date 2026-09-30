@@ -8,7 +8,11 @@
 //! Changed in sys1rust from laya-r-mlx 914c9a7: `Knobs` (settings from
 //! `BackendOptions::tuning` or `SYS1_MLX`), the `f16gelu` fix for the f16 -> f32 promotion in
 //! GELU, length buckets with warm-up at load, MLX cache and wired limits, optional boolean
-//! masks, and diagnostic timing.
+//! masks, and diagnostic timing. Work-reduction knobs, off unless asked for (measured in
+//! `results/SPEED.md`): `dense_upto` (the dense/chunked local-attention switch), `headprune`
+//! (last head layer only on the rows the scorer reads) and `unpad` (hidden states packed to
+//! the real tokens outside attention). Experiments that gained nothing (`split`, `rope1`,
+//! `splitk`) were removed after commit 0495800; that commit has their code.
 
 use laya_core::weights::{to_f16, to_f32};
 use laya_core::{
@@ -42,9 +46,9 @@ const GEGLU_MAX_SHAPES: usize = 64;
 struct Knobs {
     /// `shapeless` (default): split outside, GELU * gate compiled once for all shapes.
     /// `compiled`: split + GELU + gate compiled per input shape, one trace per distinct
-    /// `(rows, len)` that MLX never frees, so at most [`GEGLU_MAX_SHAPES`] shapes are compiled
-    /// this way and every new shape after that runs the shapeless trace; for experiments only.
-    /// `plain`: no compile.
+    /// `(rows, len)`, or per packed token count with `unpad`, that MLX never frees, so at most
+    /// [`GEGLU_MAX_SHAPES`] shapes are compiled this way and every new shape after that runs
+    /// the shapeless trace; for experiments only. `plain`: no compile.
     geglu: String,
     /// Fuse residual adds into the gemm with `addmm` (default) or use matmul + add.
     addmm: bool,
@@ -80,6 +84,19 @@ struct Knobs {
     cache_mb: Option<usize>,
     /// MLX wired-memory limit in MiB (keeps the weights resident).
     wired_mb: Option<usize>,
+    /// Local attention runs dense (full `len x len` masks) while the padded length is at most
+    /// this, chunked above it (`dense_upto=512`). `None` is the upstream `4 * window`.
+    /// `windowed=0` still means never chunk.
+    dense_upto: Option<usize>,
+    /// Last head layer: queries, out_proj, norm2 and the FFN only for the rows the scorer
+    /// reads (position 0 and every marker slot); keys and values still from every token.
+    /// The other positions of that layer are never computed, so its output is a
+    /// [`ScorerRows`] and nothing else: a consumer that needs per-token head output has to
+    /// run with `headprune=0`.
+    headprune: bool,
+    /// Keep hidden states packed as `[T, d]` (real tokens only) through embeddings, norms,
+    /// linears and GeGLU; expand to `[n, len, ...]` only around attention.
+    unpad: bool,
 }
 
 impl Knobs {
@@ -110,6 +127,9 @@ impl Knobs {
             warm: Vec::new(),
             cache_mb: None,
             wired_mb: None,
+            dense_upto: None,
+            headprune: false,
+            unpad: false,
         };
         for kv in spec.split(',').filter(|s| !s.is_empty()) {
             let (key, val) = match kv.split_once('=') {
@@ -160,6 +180,9 @@ impl Knobs {
                 "warm" => k.warm = list()?,
                 "cache" => k.cache_mb = Some(number(value()?)?),
                 "wired" => k.wired_mb = Some(number(value()?)?),
+                "dense_upto" => k.dense_upto = Some(number(value()?)?),
+                "headprune" => k.headprune = flag()?,
+                "unpad" => k.unpad = flag()?,
                 _ => return Err(Error::Config(format!("mlx settings: unknown setting `{key}` in `{spec}`"))),
             }
         }
@@ -194,12 +217,13 @@ type CompiledFn = Box<dyn for<'a> FnMut(&'a [Array]) -> std::result::Result<Vec<
 /// compiled they cost ~0.08 ms. The compiled state is not thread-safe, hence the mutex.
 ///
 /// The default is the shapeless trace: GELU * gate is elementwise, so one trace serves every
-/// input shape and the split (which needs concrete shapes) happens outside as two views. Paired
-/// A/B on the timing workload against the per-shape trace, `f16gelu,cache=512,wired=2048`:
-/// 1.002 on typed-decisions, identical answers. The per-shape mode (`geglu=compiled`) stays
-/// for experiments; MLX keeps one trace per distinct input shape for the life of the process,
-/// so the mode compiles at most [`GEGLU_MAX_SHAPES`] shapes and hands every new shape after
-/// that to the shapeless trace ([`ShapeBudget`]).
+/// input shape and the split (which needs concrete shapes) happens outside as two views. This
+/// matters with `unpad`, where the input shape is the request's total token count. Paired A/B
+/// on the timing workload against the per-shape trace, sys1d's settings: 1.001 typed-decisions,
+/// 1.013 and 1.004 (sides swapped) multilingual, identical answers. The per-shape mode
+/// (`geglu=compiled`) stays for experiments; MLX keeps one trace per distinct input shape for
+/// the life of the process, so the mode compiles at most [`GEGLU_MAX_SHAPES`] shapes and hands
+/// every new shape after that to the shapeless trace ([`ShapeBudget`]).
 struct GeGlu {
     mode: String,
     keep: bool,
@@ -477,6 +501,8 @@ struct EncoderLayer {
 struct HeadLayer {
     norm1: Norm,
     in_proj: Linear,
+    /// `in_proj` cut into its q rows and its k|v rows, for the pruned last layer (`headprune`).
+    split_proj: Option<(Linear, Linear)>,
     out_proj: Linear,
     norm2: Norm,
     linear1: Linear,
@@ -505,7 +531,18 @@ impl Loader<'_> {
     }
 
     fn linear(&self, w: &str, b: Option<&str>) -> Result<Linear> {
-        let w = self.get(w)?;
+        let b = b.map(|n| self.get(n)).transpose()?;
+        self.linear_from(self.get(w)?, b)
+    }
+
+    /// Output rows `rows` of a linear layer as a layer of their own.
+    fn linear_rows(&self, w: &str, b: Option<&str>, rows: std::ops::Range<i32>) -> Result<Linear> {
+        let w = self.get(w)?.index((rows.clone(), ..));
+        let b = b.map(|n| self.get(n)).transpose()?.map(|b| b.index(rows));
+        self.linear_from(w, b)
+    }
+
+    fn linear_from(&self, w: Array, b: Option<Array>) -> Result<Linear> {
         let wt = match self.wcopy.as_str() {
             "t" => ops::transpose(&w).lx()?.contiguous().lx()?,
             "gpu" => {
@@ -514,7 +551,6 @@ impl Loader<'_> {
             }
             _ => ops::transpose(&w).lx()?,
         };
-        let b = b.map(|n| self.get(n)).transpose()?;
         Ok(Linear { wt, b })
     }
 
@@ -557,9 +593,10 @@ pub struct MlxBackend {
 ///
 /// The dense window masks are one array each, for the longest length seen so far; shorter
 /// lengths take a view of it (see [`MlxBackend::window_mask`]). One mask per distinct length
-/// would pile up: without length buckets, a server seeing every length up to 1,024 would hold
-/// about 700 MB of masks that nothing frees. The gather indices of the windowed path are built
-/// inside the forward graph instead ([`window_key_idx`]), so they need no cache at all.
+/// would pile up: with `dense_upto=1024` and no length buckets, a server seeing every length
+/// up to 1,024 would hold about 700 MB of masks that nothing frees. The gather indices of the
+/// windowed path are built inside the forward graph instead ([`window_key_idx`]), so they need
+/// no cache at all. The compiled GeGLU trace is shapeless (see [`GeGlu`]).
 #[derive(Default)]
 struct Caches {
     /// Dense sliding-window additive mask `[1, 1, L, L]` for the longest `L` so far.
@@ -609,6 +646,103 @@ struct AttnCtx {
     /// Key-padding mask `[n, 1, 1, len]`.
     pad: Array,
     local: LocalAttn,
+}
+
+/// Decision-head output as the scorer reads it.
+///
+/// Every consumer has to match all three variants: with `headprune` the last head layer is
+/// computed at the scorer's rows only, so `Rows` holds no per-token output and cannot be
+/// turned into one. Anything that needs every token's head output (per-token embeddings,
+/// say) must run with `headprune=0` and take `Full` or `Packed`.
+enum HeadOut {
+    /// Every token, `[n, len, d]`.
+    Full(Array),
+    /// Every real token, `[T, d]` in [`Packing`] order (`unpad`).
+    Packed(Array),
+    /// The scorer's rows only (`headprune`).
+    Rows(ScorerRows),
+}
+
+/// The last head layer at the rows the scorer reads and nowhere else: position 0 followed by
+/// the `kmax` marker slots of each row, `[n, 1 + kmax, d]`. Padded marker slots hold position
+/// 0's output (their logits are masked afterwards, as in the full layer). The array is private
+/// so that it cannot be mistaken for a `[n, len, d]` per-token output.
+struct ScorerRows(Array);
+
+impl ScorerRows {
+    /// Position 0 of every row, `[n, d]`: a range view of the `[n, 1 + kmax, d]` array with its
+    /// middle axis squeezed (an integer index would gather a copy).
+    fn pooled(&self) -> Result<Array> {
+        self.0.index((.., ..1, ..)).squeeze_axes(&[1]).lx()
+    }
+
+    /// The marker slots of every row, `[n * kmax, d]`.
+    fn markers(&self, n: i32, kmax: i32, d: i32) -> Result<Array> {
+        self.0.index((.., 1.., ..)).reshape(&[n * kmax, d]).lx()
+    }
+}
+
+/// Token packing for `unpad`: hidden states live as `[T, d]` over the real tokens only and
+/// are expanded to the padded `[n, len, ...]` layout just for attention. Every row has at
+/// least one real token (its `[CLS]`), which the padding positions borrow.
+struct Packing {
+    /// `[T]` padded positions `r * len + pos` of the packed tokens, row-major.
+    pack: Array,
+    /// `[n * len]` packed index of every padded position. Padding points at its row's token 0,
+    /// so expanded values stay finite; they are masked as keys and dropped as queries.
+    unpack: Array,
+    /// `[T]` row of every packed token.
+    row: Array,
+    /// Packed index of position 0 of every row.
+    offsets: Vec<u32>,
+}
+
+impl Packing {
+    fn new(batch: &Batch) -> Self {
+        let mut pack: Vec<u32> = Vec::with_capacity(batch.total_tokens());
+        let mut unpack: Vec<u32> = Vec::with_capacity(batch.n * batch.len);
+        let mut row: Vec<u32> = Vec::with_capacity(batch.total_tokens());
+        let mut offsets = Vec::with_capacity(batch.n);
+        for r in 0..batch.n {
+            let first = pack.len() as u32;
+            offsets.push(first);
+            for pos in 0..batch.len {
+                let flat = r * batch.len + pos;
+                if batch.attention_mask[flat] == 1 {
+                    unpack.push(pack.len() as u32);
+                    pack.push(flat as u32);
+                    row.push(r as u32);
+                } else {
+                    unpack.push(first);
+                }
+            }
+        }
+        Self {
+            pack: Array::from_slice(&pack, &[pack.len() as i32]),
+            unpack: Array::from_slice(&unpack, &[unpack.len() as i32]),
+            row: Array::from_slice(&row, &[row.len() as i32]),
+            offsets,
+        }
+    }
+
+    /// `[T, c] -> [n, len, c]`.
+    fn expand(&self, x: &Array, n: i32, len: i32) -> Result<Array> {
+        x.take_axis(&self.unpack, 0).lx()?.reshape(&[n, len, x.dim(-1)]).lx()
+    }
+
+    /// `[n, len, c] -> [T, c]`.
+    fn compact(&self, x: &Array, n: i32, len: i32) -> Result<Array> {
+        x.reshape(&[n * len, x.dim(-1)]).lx()?.take_axis(&self.pack, 0).lx()
+    }
+}
+
+/// Encoder output for one batch.
+struct Encoded {
+    /// `last_hidden_state`: `[n, len, d]`, or `[T, d]` when `packing` is set.
+    h: Array,
+    /// Additive key-padding mask `[n, 1, 1, len]`.
+    pad: Array,
+    packing: Option<Packing>,
 }
 
 // SAFETY: `mlx_rs::Array` is a reference-counted handle to immutable, already-evaluated
@@ -668,18 +802,28 @@ impl MlxBackend {
                 });
             }
             let mut head = Vec::with_capacity(cfg.agent.head_layers);
+            let d = enc.hidden_size as i32;
             for j in 0..cfg.agent.head_layers {
                 let p = format!("head.layers.{j}");
+                let (in_w, in_b) = (
+                    format!("{p}.self_attn.in_proj_weight"),
+                    format!("{p}.self_attn.in_proj_bias"),
+                );
                 head.push(HeadLayer {
                     norm1: loader.norm(
                         &format!("{p}.norm1.weight"),
                         Some(&format!("{p}.norm1.bias")),
                         1e-5,
                     )?,
-                    in_proj: loader.linear(
-                        &format!("{p}.self_attn.in_proj_weight"),
-                        Some(&format!("{p}.self_attn.in_proj_bias")),
-                    )?,
+                    in_proj: loader.linear(&in_w, Some(&in_b))?,
+                    split_proj: if knobs.headprune && j + 1 == cfg.agent.head_layers {
+                        Some((
+                            loader.linear_rows(&in_w, Some(&in_b), 0..d)?,
+                            loader.linear_rows(&in_w, Some(&in_b), d..3 * d)?,
+                        ))
+                    } else {
+                        None
+                    },
                     out_proj: loader.linear(
                         &format!("{p}.self_attn.out_proj.weight"),
                         Some(&format!("{p}.self_attn.out_proj.bias")),
@@ -784,6 +928,10 @@ impl MlxBackend {
         for h in &self.head {
             push_norm(&mut v, &h.norm1);
             push_lin(&mut v, &h.in_proj);
+            if let Some((q, kv)) = &h.split_proj {
+                push_lin(&mut v, q);
+                push_lin(&mut v, kv);
+            }
             push_lin(&mut v, &h.out_proj);
             push_norm(&mut v, &h.norm2);
             push_lin(&mut v, &h.linear1);
@@ -819,7 +967,8 @@ impl MlxBackend {
     /// mask is boolean, whichever path the length takes.
     fn attn_ctx(&self, batch: &Batch) -> Result<AttnCtx> {
         let has_local = self.layers.iter().any(|l| l.local);
-        let windowed = self.knobs.windowed && batch.len > 4 * self.window;
+        let dense_upto = self.knobs.dense_upto.unwrap_or(4 * self.window);
+        let windowed = self.knobs.windowed && batch.len > dense_upto;
         let (n, len) = (batch.n as i32, batch.len as i32);
         let pad = if self.knobs.bool_mask {
             Array::from_slice(&batch.attention_mask, &[n, 1, 1, len])
@@ -997,9 +1146,9 @@ impl MlxBackend {
         })
     }
 
-    /// `[n, len, d] -> [n, heads, len, hd]`.
+    /// `[n, len, heads * hd] -> [n, heads, len, hd]`.
     fn split_heads(&self, x: &Array, n: i32, len: i32, heads: usize) -> Result<Array> {
-        let hd = (self.hidden / heads) as i32;
+        let hd = x.dim(-1) / heads as i32;
         x.reshape(&[n, len, heads as i32, hd])
             .lx()?
             .transpose_axes(&[0, 2, 1, 3])
@@ -1014,17 +1163,69 @@ impl MlxBackend {
             .lx()
     }
 
-    /// ModernBERT encoder; returns `last_hidden_state [n, len, d]` and the pad mask.
-    fn encode(&self, batch: &Batch) -> Result<(Array, Array)> {
+    /// Encoder `qkv [n, len, 3d]` -> roped `q`, roped `k` and `v`, each `[n, H, len, hd]`.
+    fn qkv_rope(&self, qkv: &Array, n: i32, len: i32, theta: f32) -> Result<(Array, Array, Array)> {
+        let rope = |x: &Array| -> Result<Array> {
+            fast::rope(x, self.head_dim as i32, false, theta, 1.0, 0, None::<&Array>).lx()
+        };
+        let parts = qkv.split_equal(3, -1).lx()?;
+        let q = self.split_heads(&parts[0], n, len, self.n_heads)?;
+        let k = self.split_heads(&parts[1], n, len, self.n_heads)?;
+        let v = self.split_heads(&parts[2], n, len, self.n_heads)?;
+        Ok((rope(&q)?, rope(&k)?, v))
+    }
+
+    /// Token index of position 0 of every row: `r * len` in the padded layout, the packing
+    /// offsets when the hidden states are packed.
+    fn row_starts(batch: &Batch, packing: Option<&Packing>) -> Vec<u32> {
+        match packing {
+            Some(p) => p.offsets.clone(),
+            None => (0..batch.n as u32).map(|r| r * batch.len as u32).collect(),
+        }
+    }
+
+    /// Flat token indices of the rows the scorer reads: position 0 of every row followed by
+    /// its `kmax` marker slots (padded slots point at position 0, as in `Batch`).
+    fn scorer_rows(batch: &Batch, starts: &[u32]) -> Array {
+        let kmax = batch.kmax;
+        let flat: Vec<u32> = (0..batch.n)
+            .flat_map(|r| {
+                let base = starts[r];
+                std::iter::once(base)
+                    .chain(batch.marker_pos[r * kmax..(r + 1) * kmax].iter().map(move |&p| base + p))
+            })
+            .collect();
+        Array::from_slice(&flat, &[flat.len() as i32])
+    }
+
+    /// ModernBERT encoder; returns `last_hidden_state` (`[n, len, d]`, or packed `[T, d]` when
+    /// `unpad` is allowed and the batch has padding) and the pad mask.
+    fn encode(&self, batch: &Batch, unpad: bool) -> Result<Encoded> {
         let (n, len) = (batch.n as i32, batch.len as i32);
         let d = self.hidden as i32;
-        let ids = Array::from_slice(&batch.input_ids, &[batch.n as i32 * len]);
-        let mut h = self
-            .tok_emb
-            .take_axis(&ids, 0)
-            .lx()?
-            .reshape(&[n, len, d])
-            .lx()?;
+        // `unpad` only pays off when there is padding; a batch without any runs the plain path.
+        let packing = if unpad && batch.total_tokens() < batch.n * batch.len {
+            Some(Packing::new(batch))
+        } else {
+            None
+        };
+        let mut h = match &packing {
+            Some(_) => {
+                let ids: Vec<u32> = batch
+                    .input_ids
+                    .iter()
+                    .zip(&batch.attention_mask)
+                    .filter(|(_, &m)| m == 1)
+                    .map(|(&id, _)| id)
+                    .collect();
+                let ids = Array::from_slice(&ids, &[ids.len() as i32]);
+                self.tok_emb.take_axis(&ids, 0).lx()?
+            }
+            None => {
+                let ids = Array::from_slice(&batch.input_ids, &[batch.n as i32 * len]);
+                self.tok_emb.take_axis(&ids, 0).lx()?.reshape(&[n, len, d]).lx()?
+            }
+        };
         h = self.emb_norm.apply(&h)?;
 
         let ctx = self.attn_ctx(batch)?;
@@ -1062,31 +1263,13 @@ impl MlxBackend {
             };
             mark("attn_norm", &[&a])?;
             let qkv = layer.wqkv.apply(&a)?;
+            // Packed: back to `[n, len, 3d]` for attention.
+            let qkv = match &packing {
+                Some(p) => p.expand(&qkv, n, len)?,
+                None => qkv,
+            };
             mark("wqkv", &[&qkv])?;
-            let parts = qkv.split_equal(3, -1).lx()?;
-            let q = self.split_heads(&parts[0], n, len, self.n_heads)?;
-            let k = self.split_heads(&parts[1], n, len, self.n_heads)?;
-            let v = self.split_heads(&parts[2], n, len, self.n_heads)?;
-            let q = fast::rope(
-                &q,
-                self.head_dim as i32,
-                false,
-                layer.rope_theta,
-                1.0,
-                0,
-                None::<&Array>,
-            )
-            .lx()?;
-            let k = fast::rope(
-                &k,
-                self.head_dim as i32,
-                false,
-                layer.rope_theta,
-                1.0,
-                0,
-                None::<&Array>,
-            )
-            .lx()?;
+            let (q, k, v) = self.qkv_rope(&qkv, n, len, layer.rope_theta)?;
             mark("split+rope", &[&q, &k, &v])?;
             let att = match (&ctx.local, layer.local) {
                 (LocalAttn::Windowed(w), true) => self.windowed_attention(&q, &k, &v, w, scale)?,
@@ -1101,6 +1284,10 @@ impl MlxBackend {
             };
             mark(if layer.local { "sdpa_local" } else { "sdpa_global" }, &[&att])?;
             let att = self.merge_heads(&att, n, len)?;
+            let att = match &packing {
+                Some(p) => p.compact(&att, n, len)?,
+                None => att,
+            };
             h = self.lin_add(&layer.wo, &att, &h)?;
             mark("merge+wo", &[&h])?;
 
@@ -1123,55 +1310,114 @@ impl MlxBackend {
         if self.knobs.layers {
             eprintln!("layers_us n={} len={} emb+masks={} layers={:?}", batch.n, batch.len, lt[0], &lt[1..]);
         }
-        Ok((self.final_norm.apply(&h)?, ctx.pad))
+        Ok(Encoded {
+            h: self.final_norm.apply(&h)?,
+            pad: ctx.pad,
+            packing,
+        })
     }
 
-    /// Decision-head transformer layers on top of the encoder output.
-    fn head_forward(&self, batch: &Batch, enc: &Array, pad: &Array) -> Result<Array> {
+    /// Decision-head transformer layers on top of the encoder output. With `headprune` the
+    /// last layer is only computed at the scorer's rows, and the result says so in its type
+    /// (see [`HeadOut`]).
+    fn head_forward(&self, batch: &Batch, enc: &Encoded) -> Result<HeadOut> {
         let (n, len) = (batch.n as i32, batch.len as i32);
+        let d = self.hidden as i32;
+        let packing = enc.packing.as_ref();
         let qtype = Array::from_slice(&batch.qtype, &[n]);
-        let te = self
-            .type_emb
-            .take_axis(&qtype, 0)
-            .lx()?
-            .reshape(&[n, 1, self.hidden as i32])
-            .lx()?;
-        let mut h = ops::add(enc, &te).lx()?;
+        let te = self.type_emb.take_axis(&qtype, 0).lx()?;
+        let mut h = match packing {
+            // Packed tokens take their row's type embedding row by row.
+            Some(p) => ops::add(&enc.h, &te.take_axis(&p.row, 0).lx()?).lx()?,
+            None => ops::add(&enc.h, &te.reshape(&[n, 1, d]).lx()?).lx()?,
+        };
         let scale = head_scale(self.hidden, self.head_nheads);
+        let sdpa = |q: &Array, k: &Array, v: &Array| -> Result<Array> {
+            fast::scaled_dot_product_attention(q, k, v, scale, &enc.pad, None::<&Array>).lx()
+        };
+        // Around attention only: `[T, c] -> [n, len, c]` and back (identity when not packed).
+        let expand = |x: Array| -> Result<Array> {
+            match packing {
+                Some(p) => p.expand(&x, n, len),
+                None => Ok(x),
+            }
+        };
+        let compact = |x: Array| -> Result<Array> {
+            match packing {
+                Some(p) => p.compact(&x, n, len),
+                None => Ok(x),
+            }
+        };
         for layer in &self.head {
             let x = layer.norm1.apply(&h)?;
-            let qkv = layer.in_proj.apply(&x)?;
+            if let Some((wq, wkv)) = &layer.split_proj {
+                // `headprune` (last layer only): every token still supplies a key and a value,
+                // but queries, out_proj, norm2 and the FFN run only for the rows the scorer
+                // reads. A token's output depends on the other tokens only through attention,
+                // so the picked rows come out the same as in the full layer.
+                let kv = expand(wkv.apply(&x)?)?;
+                let parts = kv.split_equal(2, -1).lx()?;
+                let k = self.split_heads(&parts[0], n, len, self.head_nheads)?;
+                let v = self.split_heads(&parts[1], n, len, self.head_nheads)?;
+                let r = 1 + batch.kmax as i32;
+                let idx = Self::scorer_rows(batch, &Self::row_starts(batch, packing));
+                let pick = |a: &Array| -> Result<Array> {
+                    a.reshape(&[-1, d]).lx()?.take_axis(&idx, 0).lx()?.reshape(&[n, r, d]).lx()
+                };
+                let q = self.split_heads(&wq.apply(&pick(&x)?)?, n, r, self.head_nheads)?;
+                let att = self.merge_heads(&sdpa(&q, &k, &v)?, n, r)?;
+                let hs = self.lin_add(&layer.out_proj, &att, &pick(&h)?)?;
+                let x = layer.norm2.apply(&hs)?;
+                let x = nn::relu(&layer.linear1.apply(&x)?).lx()?;
+                return Ok(HeadOut::Rows(ScorerRows(self.lin_add(&layer.linear2, &x, &hs)?)));
+            }
+            let qkv = expand(layer.in_proj.apply(&x)?)?;
             let parts = qkv.split_equal(3, -1).lx()?;
             let q = self.split_heads(&parts[0], n, len, self.head_nheads)?;
             let k = self.split_heads(&parts[1], n, len, self.head_nheads)?;
             let v = self.split_heads(&parts[2], n, len, self.head_nheads)?;
-            let att =
-                fast::scaled_dot_product_attention(&q, &k, &v, scale, pad, None::<&Array>).lx()?;
-            let att = self.merge_heads(&att, n, len)?;
+            let att = compact(self.merge_heads(&sdpa(&q, &k, &v)?, n, len)?)?;
             h = self.lin_add(&layer.out_proj, &att, &h)?;
 
             let x = layer.norm2.apply(&h)?;
             let x = nn::relu(&layer.linear1.apply(&x)?).lx()?;
             h = self.lin_add(&layer.linear2, &x, &h)?;
         }
-        Ok(h)
+        Ok(match packing {
+            Some(_) => HeadOut::Packed(h),
+            None => HeadOut::Full(h),
+        })
     }
 
     /// Scorer logits `[n * kmax]` (unmasked) and pooled `[n, d]` as f32 arrays.
-    fn score(&self, batch: &Batch, h: &Array) -> Result<(Array, Array)> {
+    fn score(&self, batch: &Batch, h: &HeadOut, packing: Option<&Packing>) -> Result<(Array, Array)> {
         let (n, len, kmax) = (batch.n as i32, batch.len as i32, batch.kmax as i32);
         let d = self.hidden as i32;
-        let pooled = h
-            .take_axis(Array::from_slice(&[0u32], &[1]), 1)
-            .lx()?
-            .reshape(&[n, d])
-            .lx()?;
-        let flat: Vec<u32> = (0..batch.n)
-            .flat_map(|r| (0..batch.kmax).map(move |k| (r, k)))
-            .map(|(r, k)| r as u32 * len as u32 + batch.marker_pos[r * batch.kmax + k])
-            .collect();
-        let idx = Array::from_slice(&flat, &[n * kmax]);
-        let m = h.reshape(&[n * len, d]).lx()?.take_axis(&idx, 0).lx()?;
+        let (pooled, m) = match h {
+            HeadOut::Full(h) => {
+                let pooled = h
+                    .take_axis(Array::from_slice(&[0u32], &[1]), 1)
+                    .lx()?
+                    .reshape(&[n, d])
+                    .lx()?;
+                let flat: Vec<u32> = (0..batch.n)
+                    .flat_map(|r| (0..batch.kmax).map(move |k| (r, k)))
+                    .map(|(r, k)| r as u32 * len as u32 + batch.marker_pos[r * batch.kmax + k])
+                    .collect();
+                let idx = Array::from_slice(&flat, &[n * kmax]);
+                (pooled, h.reshape(&[n * len, d]).lx()?.take_axis(&idx, 0).lx()?)
+            }
+            HeadOut::Packed(h) => {
+                let starts = Self::row_starts(batch, packing);
+                let pooled = h.take_axis(Array::from_slice(&starts, &[n]), 0).lx()?;
+                let flat: Vec<u32> = (0..batch.n)
+                    .flat_map(|r| (0..batch.kmax).map(move |k| (r, k)))
+                    .map(|(r, k)| starts[r] + batch.marker_pos[r * batch.kmax + k])
+                    .collect();
+                (pooled, h.take_axis(Array::from_slice(&flat, &[n * kmax]), 0).lx()?)
+            }
+            HeadOut::Rows(rows) => (rows.pooled()?, rows.markers(n, kmax, d)?),
+        };
         let s = self.scorer_norm.apply(&m)?;
         let s = gelu_erf_as(&self.scorer1.apply(&s)?, self.knobs.f16gelu).lx()?;
         let logits = self.scorer3.apply(&s)?.reshape(&[n * kmax]).lx()?;
@@ -1201,9 +1447,9 @@ impl Backend for MlxBackend {
         let stream = self.stream();
         mlx_rs::with_stream(&stream, || {
             let t0 = std::time::Instant::now();
-            let (enc, pad) = self.encode(batch)?;
-            let h = self.head_forward(batch, &enc, &pad)?;
-            let (logits, pooled) = self.score(batch, &h)?;
+            let enc = self.encode(batch, self.knobs.unpad)?;
+            let h = self.head_forward(batch, &enc)?;
+            let (logits, pooled) = self.score(batch, &h, enc.packing.as_ref())?;
             let t1 = std::time::Instant::now();
             transforms::eval([&logits, &pooled]).lx()?;
             if self.knobs.trace {
@@ -1229,13 +1475,18 @@ impl Backend for MlxBackend {
         })
     }
 
+    /// The full `[n, len, d]` last hidden state, computed at every position including padding.
+    /// This debug hook therefore runs the encoder in the padded layout whatever `unpad` says:
+    /// the packed path never computes the padding positions, and filling them in with some
+    /// other token's state would look like a computed result to the parity harness.
     fn encoder_hidden(&self, batch: &Batch) -> Result<Option<Vec<f32>>> {
         let stream = self.stream();
         mlx_rs::with_stream(&stream, || {
-            let (enc, _) = self.encode(batch)?;
-            let enc = to_f32_contiguous(&enc)?;
-            enc.eval().lx()?;
-            Ok(Some(host_f32(&enc)?))
+            let enc = self.encode(batch, false)?;
+            debug_assert!(enc.packing.is_none());
+            let h = to_f32_contiguous(&enc.h)?;
+            h.eval().lx()?;
+            Ok(Some(host_f32(&h)?))
         })
     }
 }
@@ -1243,6 +1494,46 @@ impl Backend for MlxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knobs_default_off_and_parse() {
+        let k = Knobs::from_spec(Some("")).unwrap();
+        assert_eq!(k.dense_upto, None);
+        assert!(!k.headprune && !k.unpad);
+        let k = Knobs::from_spec(Some("dense_upto=512,headprune,unpad")).unwrap();
+        assert_eq!(k.dense_upto, Some(512));
+        assert!(k.headprune && k.unpad);
+        let k = Knobs::from_spec(Some("headprune=0,unpad=0")).unwrap();
+        assert!(!k.headprune && !k.unpad);
+    }
+
+    /// The padding rows of a batch go through the packing as their row's token 0, and every
+    /// scorer row (position 0 and the marker slots) lands on the right packed token.
+    #[test]
+    fn packing_indexes_real_tokens_and_scorer_rows() {
+        let batch = Batch {
+            n: 3,
+            len: 4,
+            kmax: 2,
+            input_ids: vec![1, 2, 0, 0, 3, 4, 5, 6, 7, 0, 0, 0],
+            attention_mask: vec![1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0],
+            seq_lens: vec![2, 4, 1],
+            marker_pos: vec![1, 0, 1, 3, 0, 0],
+            marker_count: vec![1, 2, 0],
+            qtype: vec![0, 1, 2],
+        };
+        let p = Packing::new(&batch);
+        assert_eq!(p.offsets, vec![0, 2, 6]);
+        assert_eq!(p.pack.as_slice::<u32>(), &[0, 1, 4, 5, 6, 7, 8]);
+        assert_eq!(p.unpack.as_slice::<u32>(), &[0, 1, 0, 0, 2, 3, 4, 5, 6, 6, 6, 6]);
+        assert_eq!(p.row.as_slice::<u32>(), &[0, 0, 1, 1, 1, 1, 2]);
+        // Padded layout: row start `r * len`; packed: the offsets. Padded marker slots point
+        // at position 0 in both.
+        let padded = MlxBackend::scorer_rows(&batch, &MlxBackend::row_starts(&batch, None));
+        assert_eq!(padded.as_slice::<u32>(), &[0, 1, 0, 4, 5, 7, 8, 8, 8]);
+        let packed = MlxBackend::scorer_rows(&batch, &MlxBackend::row_starts(&batch, Some(&p)));
+        assert_eq!(packed.as_slice::<u32>(), &[0, 1, 0, 2, 3, 5, 6, 6, 6]);
+    }
 
     #[test]
     fn settings_parse_every_kind_of_value() {
@@ -1274,6 +1565,10 @@ mod tests {
         assert!(err("pad=0").contains("pad must be at least 1"));
         assert!(err("pad=-1").contains("`-1` is not a whole number"));
         assert!(err("cache").contains("needs a value"));
+        assert!(err("dense_upto=abc").contains("`abc` is not a whole number"));
+        assert!(err("dense_upto").contains("needs a value"));
+        assert!(err("unpad=yes").contains("`yes` is not 0 or 1"));
+        assert!(err("headprune=on").contains("`on` is not 0 or 1"));
         assert!(err("wired=2048,f16gelu,cache=512 ").contains("`cache=512 `"));
         assert_eq!(check_settings("f16gelu,cache=512,wired=2048").ok(), Some(()));
         assert!(check_settings("f16gelu,cache=512x").is_err());
@@ -1434,5 +1729,19 @@ mod tests {
         }
         // The chunk that motivates the padded-query term.
         assert!(!key_ok[((nc + 3) * 3 * s)..((nc + 4) * 3 * s)].iter().any(|&v| v));
+    }
+
+    /// `pooled` is position 0 of every row, as a view (same values as a gather would give).
+    #[test]
+    fn scorer_rows_pooled_is_position_zero_of_every_row() {
+        let (n, r, d) = (2, 3, 4);
+        let vals: Vec<f32> = (0..(n * r * d)).map(|x| x as f32).collect();
+        let rows = ScorerRows(Array::from_slice(&vals, &[n, r, d]));
+        let pooled = rows.pooled().unwrap();
+        assert_eq!(pooled.shape(), &[n, d]);
+        let want: Vec<f32> = (0..n).flat_map(|b| (0..d).map(move |k| (b * r * d + k) as f32)).collect();
+        assert_eq!(pooled.contiguous().unwrap().as_slice::<f32>(), &want[..]);
+        let markers = rows.markers(n, r - 1, d).unwrap();
+        assert_eq!(markers.shape(), &[n * (r - 1), d]);
     }
 }

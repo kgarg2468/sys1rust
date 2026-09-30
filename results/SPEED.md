@@ -126,7 +126,7 @@ All three published Laya models now run in the Rust runtime. Before this round o
 
 - The lead over Python laya-mlx comes from doing less work, not from Rust. Python could copy head pruning (its research notes already list it) and, with more work, unpadding. Today no released runtime does either.
 - The settings are reviewed, tested on all three Laya models, and the `sys1d` default.
-- Still open: MLX compiles the GeGLU step once per input shape. With `unpad` the shape depends on the request's total token count, so each new count pays a trace and adds a cache entry. The old path had the same behavior per padded length. The benchmarks repeat their requests, so they do not show this cost; it is not measured.
+- Closed after review: MLX used to compile the GeGLU step once per input shape, and with `unpad` the shape is the request's total token count, so each new count paid a trace and added a cache entry. The GeGLU trace is now shapeless (one trace for every shape; the split happens outside it). Paired A/B against the per-shape trace on the timing workload with the default settings: 1.001 on typed-decisions, 1.013 and 1.004 (sides swapped) on multilingual, identical answers.
 
 ## Files
 
