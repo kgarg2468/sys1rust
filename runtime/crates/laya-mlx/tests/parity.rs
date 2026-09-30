@@ -20,7 +20,7 @@ fn check(fixture: &str, subfolder: Option<&str>, opts: &BackendOptions) {
         );
     };
     println!("{}", report.summary());
-    assert_eq!(report.choice_mismatches(), 0, "choice mismatches");
+    assert_eq!(report.decision_mismatches(), 0, "decision mismatches");
     assert!(
         report.logits_max_abs() < 0.15,
         "logits max abs diff {}",
