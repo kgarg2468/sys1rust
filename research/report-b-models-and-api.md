@@ -78,9 +78,9 @@ Sources: docs.typesafe.ai/api.md, docs.typesafe.ai/confidence.md, laya docs/http
 {
   "model": "jev-1.13.0",
   "answers": {
-    "<id>": { "type": "noul", "noul": 0.87 },
-    "<id>": { "type": "choice", "choice": "billing", "probabilities": {"billing": 0.81, ...}, "confidence": 0.72 },
-    "<id>": { "type": "score", "score": 2, "legend": {"0": "low", ...}, "probabilities": {...}, "confidence": 0.6 }
+    "is_urgent": { "type": "noul", "noul": 0.87 },
+    "category": { "type": "choice", "choice": "billing", "probabilities": {"billing": 0.81, ...}, "confidence": 0.72 },
+    "severity": { "type": "score", "score": 2, "legend": {"0": "low", ...}, "probabilities": {...}, "confidence": 0.6 }
   },
   "usage": { "input_tokens": 1234, "output_tokens": 0 }
 }
