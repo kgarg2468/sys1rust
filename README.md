@@ -1,6 +1,6 @@
 # sys1rust
 
-Run Laya System 1 decision models locally on Apple silicon. sys1rust is a Rust runtime on Apple's MLX with no Python at run time. Its server, `sys1d`, speaks the same `/v1/systemone` API as upstream `laya serve`, so Jev and Laya clients can point at it without changes. Unlike `laya serve`, which listens on 0.0.0.0, `sys1d` listens on 127.0.0.1 by default. Clients on other machines need the `--host` setting in [Run](#run).
+Run Laya System 1 decision models locally on Apple silicon. sys1rust is a Rust runtime on Apple's MLX with no Python at run time. Its server, `sys1d`, speaks the same `/v1/systemone` API as upstream `laya serve`, so Jev and Laya clients can point at it without changes. Unlike `laya serve`, which listens on 0.0.0.0, `sys1d` listens on 127.0.0.1 by default. Clients on other machines should reach it through a reverse proxy, as [Run](#run) describes.
 
 ## Status
 
@@ -68,12 +68,16 @@ The reply (usage and routing fields cut):
 
 Flags take the same environment variables as `laya serve`: `LAYA_HOST`, `LAYA_PORT`, `LAYA_API_KEY` and `LAYA_MAX_CONCURRENT`. `--model` (`SYS1_MODEL`) picks the checkpoint. `sys1d --help` lists the rest.
 
-`sys1d` listens on 127.0.0.1 by default, so only programs on the same Mac can reach it. To serve clients on other machines, listen on all interfaces with `--host 0.0.0.0` or `LAYA_HOST=0.0.0.0`. The server then accepts connections from anyone who can reach this Mac on the network, so set an API key too. With `LAYA_API_KEY` set, `/v1/systemone` answers only requests that send `Authorization: Bearer <key>`.
+`sys1d` listens on 127.0.0.1 by default, so only programs on the same Mac can reach it. Keep that default. `sys1d` speaks plain HTTP without TLS, and it has no header read timeout and no connection limit. Only the request body has a deadline, and a body that takes over 10 s gets `408`. An API key alone does not make remote serving safe. With `LAYA_API_KEY` set, `/v1/systemone` answers only requests that send `Authorization: Bearer <key>`, but over plain HTTP anyone on the network path can read that key. The key is checked only once the headers have arrived, so it does nothing against connections that never finish sending them. Each such connection holds a socket for as long as the client keeps it open, and nothing caps how many there are.
+
+To serve clients on other machines, run a reverse proxy on the same Mac in front of `sys1d`. The proxy should terminate TLS, time out slow headers, limit connections and forward to 127.0.0.1. Set an API key as well:
 
 ```sh
 export LAYA_API_KEY=replace-with-a-secret
-runtime/target/release/sys1d --model typed-decisions --host 0.0.0.0 --port 8000
+runtime/target/release/sys1d --model typed-decisions --port 8000   # the proxy forwards to 127.0.0.1:8000
 ```
+
+`--host` (`LAYA_HOST`) changes the bind address, but any client that can reach a wider address talks to `sys1d` directly, with none of the proxy's protections.
 
 ## Build and run inside the benchmark setup
 
