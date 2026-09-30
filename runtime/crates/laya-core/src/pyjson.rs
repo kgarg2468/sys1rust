@@ -96,13 +96,19 @@ enum Num {
 }
 
 impl Num {
+    /// `json.loads` types a number by its literal: no `.`, `e` or `E` means an `int` of any
+    /// size, anything else a `float` (`1e400` is `inf`). serde_json's `arbitrary_precision`
+    /// keeps the literal, so an integer beyond `u64::MAX` keeps its digits and `1.10` is a
+    /// float even though `1.0` would parse as an integer.
     fn of(n: &Number) -> Self {
-        if let Some(i) = n.as_i64() {
-            Num::Int(i.to_string())
-        } else if let Some(u) = n.as_u64() {
-            Num::Int(u.to_string())
+        let lit = n.to_string();
+        if lit.contains(['.', 'e', 'E']) {
+            Num::Float(lit.parse().unwrap_or(f64::NAN))
+        } else if lit == "-0" {
+            // Python's `int("-0")` is `0`.
+            Num::Int("0".into())
         } else {
-            Num::Float(n.as_f64().unwrap_or(0.0))
+            Num::Int(lit)
         }
     }
 
@@ -597,6 +603,42 @@ mod tests {
         assert_eq!(dumps_key(&json!(1.5)), "1.5");
         assert_eq!(dumps_key(&json!(1e16)), "1e+16");
         assert_eq!(dumps_key(&Value::Null), "null");
+    }
+
+    /// Numbers follow `json.dumps(json.loads(text))`: an integer literal of any size keeps its
+    /// digits, `-0` is the int `0`, and a literal with `.`, `e` or `E` is a float printed
+    /// with Python's repr (so `1e400` overflows to `Infinity`). Expected strings are the
+    /// Python 3.14 output for the same text.
+    #[test]
+    fn dumps_numbers_like_python_loads_then_dumps() {
+        let text = "[18446744073709551616, -0, 1.10, 1e400, 1E5, -1e400, 0.0, -0.0, 1.0e2, 123456789012345678901234567890, -9223372036854775809]";
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            dumps(&v),
+            "[18446744073709551616, 0, 1.1, Infinity, 100000.0, -Infinity, 0.0, -0.0, 100.0, 123456789012345678901234567890, -9223372036854775809]"
+        );
+        assert_eq!(repr(&v[0]), "18446744073709551616");
+        assert_eq!(repr(&v[1]), "0");
+        assert_eq!(repr(&v[2]), "1.1");
+        assert_eq!(repr(&v[3]), "inf");
+        assert_eq!(repr(&v[4]), "100000.0");
+        assert_eq!(repr(&v[5]), "-inf");
+        assert_eq!(type_name(&v[0]), "int");
+        assert_eq!(type_name(&v[4]), "float");
+        // Python `==` on the same values: `-0 == 0.0`, `1E5 == 100000`, and a big int equals
+        // the float with the same value but not its neighbour.
+        assert!(py_eq(&v[1], &json!(0.0)));
+        assert!(py_eq(&v[4], &json!(100000)));
+        let big: Value = serde_json::from_str(
+            "[18446744073709551616, 18446744073709551616.0, 18446744073709551617]",
+        )
+        .unwrap();
+        assert!(py_eq(&big[0], &big[1]));
+        assert!(!py_eq(&big[2], &big[1]));
+        // `as_f64` users (temperatures, config floats) still read a plain literal.
+        assert_eq!(v[2].as_f64(), Some(1.1));
+        assert_eq!(v[0].as_u64(), None);
+        assert_eq!(v[0].as_f64(), Some(18446744073709551616.0));
     }
 
     #[test]

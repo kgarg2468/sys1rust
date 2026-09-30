@@ -7,7 +7,9 @@ description = "Backend-independent Laya decision-engine runtime: tokenizer, sequ
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `arbitrary_precision`: a number keeps its literal, so an integer beyond u64 serializes with
+# its digits as Python does, instead of as an f64 in scientific notation (see pyjson).
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
 safetensors = { workspace = true }
