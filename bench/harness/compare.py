@@ -19,12 +19,16 @@ Probability drift per question: max |p - p_ref| over options (noul: |noul - noul
 Near tie: the reference's top-two margin is below 0.05 (noul: |2p - 1| < 0.05).
 Every repeat of a request is compared. Agreement below 99% is flagged with "LOW".
 
+An answer agrees only if its `type` matches the reference's type. Gold checks also require the
+type of the workload question.
+
 Unsupported vs error: a result line with "unsupported" (the contender declines the request by
 design, for example a state longer than its fixed bucket) is counted apart from a line with
 "error" (it tried and failed). `coverage` is supported requests / requests, where supported means
-not "unsupported". Agreement, drift and gold accuracy are computed over the questions of answered
-requests only, so they describe what the contender does on the requests it accepts; read them
-together with coverage and errors.
+not "unsupported". Agreement, drift and gold accuracy leave out unsupported requests, so they
+describe what the contender does on the requests it accepts; read them together with coverage.
+A question the contender should have answered but did not (left out of a result, or part of a
+request that ended in "error") is counted in `missing` and as a disagreement and a gold miss.
 """
 import argparse
 import json
@@ -80,6 +84,8 @@ def margin(a):
 
 
 def drift(a, r):
+    if a.get("type") != r.get("type"):
+        return None
     if r.get("type") == "noul":
         if a.get("noul") is None:
             return None
@@ -91,6 +97,9 @@ def drift(a, r):
 
 
 def agree(a, r):
+    # Without this check a score level 1 would equal a noul True, since 1 == True in Python.
+    if a.get("type") != r.get("type"):
+        return False
     ca, cr = categorical(a), categorical(r)
     if a.get("type") == "score" and ca is None and a.get("score") is not None:
         return abs(float(a["score"]) - float(r["score"])) <= 0.05
@@ -132,13 +141,33 @@ def compare(result_path, reference_path=None, workload_path=None, gold_only=Fals
         key = "s%s_q%s" % (sh.get("state_tokens", "?"), sh.get("n_questions", "?"))
         for st in (shapes.setdefault(key, new_stats()), total):
             st["requests"] += 1
-        if "error" in res or "unsupported" in res:
+        if "unsupported" in res:
             for st in (shapes[key], total):
-                st["unsupported" if "unsupported" in res else "errors"] += 1
+                st["unsupported"] += 1
             continue
-        answers = res.get("answers") or {}
+        if "error" in res:
+            for st in (shapes[key], total):
+                st["errors"] += 1
+            answers = {}
+        else:
+            answers = res.get("answers") or {}
         ref_ans = (ref.get(rid) or {}).get("answers")
         gold = w.get("gold") or {}
+        wq = (w.get("body") or {}).get("questions") or {}
+        expected = set(wq) | set(ref_ans or {})
+        missing = expected - set(answers)
+        upd = defaultdict(float)
+        for qid in missing:
+            upd["missing"] += 1
+            if ref_ans is not None and qid in ref_ans:
+                upd["questions"] += 1
+            if qid in gold:
+                upd["gold_n"] += 1
+                if ref_ans is not None and qid in ref_ans:
+                    upd["ref_gold_ok"] += categorical(ref_ans[qid]) == gold[qid]
+        for st in (shapes[key], total):
+            for k, v in upd.items():
+                st[k] += v
         for qid, a in answers.items():
             upd = defaultdict(float)
             if ref_ans is not None and qid in ref_ans:
@@ -154,8 +183,9 @@ def compare(result_path, reference_path=None, workload_path=None, gold_only=Fals
                     upd["n_drift"] += 1
                     upd["_drift"] = d
             if qid in gold:
+                qtype = (wq.get(qid) or {}).get("type")
                 upd["gold_n"] += 1
-                upd["gold_ok"] += categorical(a) == gold[qid]
+                upd["gold_ok"] += (qtype is None or a.get("type") == qtype) and categorical(a) == gold[qid]
                 if ref_ans is not None and qid in ref_ans:
                     upd["ref_gold_ok"] += categorical(ref_ans[qid]) == gold[qid]
             for st in (shapes[key], total):
@@ -164,10 +194,6 @@ def compare(result_path, reference_path=None, workload_path=None, gold_only=Fals
                         st["max_drift"] = max(st["max_drift"], v)
                     else:
                         st[k] += v
-        if ref_ans is not None:
-            missing = len(set(ref_ans) - set(answers))
-            for st in (shapes[key], total):
-                st["missing"] += missing
     expected = set(wl) if wl else set()
     out = {"result": result_path, "meta": meta, "workload": wname, "reference": reference_path,
            "not_run": len(expected - seen) if expected else None,
@@ -218,6 +244,10 @@ def markdown(rep):
             fmt(s["agreement"], True),
             s["near_tie_disagree"], fmt(s["max_drift"]), fmt(s["mean_drift"]), fmt(s["gold_acc"], True),
             fmt(s["ref_gold_acc"], True), s["flag"]))
+    if rep["total"]["missing"]:
+        lines.append("")
+        lines.append("%d questions have no answer; they count as disagreements and gold misses."
+                     % rep["total"]["missing"])
     if rep.get("not_run"):
         lines.append("")
         lines.append("%d workload requests have no result line." % rep["not_run"])

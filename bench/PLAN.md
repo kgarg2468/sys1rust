@@ -53,7 +53,7 @@ run --variant V --model M --workload FILE --out FILE [--warmup N] [--repeats R] 
 
 ## Correctness
 
-The harness compares every result to the reference for the same model: categorical agreement (choice label, noul value, score level or value within the reference's rounding) and the largest absolute probability difference. Runs below 99% agreement are flagged in every table. Contenders that run different weights (cbjev, OpenDecider-nano, decision-modernbert) are scored against gold answers instead, and are not compared with the reference.
+The harness compares every result to the reference for the same model: categorical agreement (choice label, noul value, score level or value within the reference's rounding) and the largest absolute probability difference. An answer whose type differs from the reference's disagrees. A question left unanswered, either left out of a result or in a request that ended in an error, also counts as a disagreement. Runs below 99% agreement are flagged in every table. Contenders that run different weights (cbjev, OpenDecider-nano, decision-modernbert) are scored against gold answers instead, and are not compared with the reference.
 
 Smoke check before handing off: run `smoke.jsonl` and, if `reference/<model>/smoke.jsonl` exists, report agreement. If the reference is not ready yet, say "built, not validated".
 
