@@ -1,0 +1,17 @@
+[package]
+name = "sys1-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bench adapter (bench/PLAN.md, Adapter interface) for the sys1rust runtime."
+
+[[bin]]
+name = "sys1-bench"
+path = "src/main.rs"
+
+[dependencies]
+laya-core = { workspace = true }
+laya-mlx = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+mlx-rs = "0.32"
