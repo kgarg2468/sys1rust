@@ -68,7 +68,7 @@ The reply (usage and routing fields cut):
   "answer_confidence":0.8703,"action":{"act_probability":1.0}}}, ...}
 ```
 
-Flags take the same environment variables as `laya serve`: `LAYA_HOST`, `LAYA_PORT`, `LAYA_API_KEY` and `LAYA_MAX_CONCURRENT`. `--model` (`SYS1_MODEL`) picks the checkpoint. `sys1d --help` lists the rest.
+Flags take the same environment variables as `laya serve`: `LAYA_HOST`, `LAYA_PORT`, `LAYA_API_KEY` and `LAYA_MAX_CONCURRENT`. `--model` (`SYS1_MODEL`) picks the checkpoint. `runtime/target/release/sys1d --help` lists the rest.
 
 `sys1d` listens on 127.0.0.1 by default, so only programs on the same Mac can reach it. Keep that default. `sys1d` speaks plain HTTP without TLS, and it has no header read timeout and no connection limit. Only the request body has a deadline, and a body that takes over 10 s gets `408`. An API key alone does not make remote serving safe. With `LAYA_API_KEY` set, `/v1/systemone` answers only requests that send `Authorization: Bearer <key>`, but over plain HTTP anyone on the network path can read that key. The key is checked only once the headers have arrived, so it does nothing against connections that never finish sending them. Each such connection holds a socket for as long as the client keeps it open, and nothing caps how many there are.
 
