@@ -3,7 +3,7 @@
 //! Run from the repo root with:
 //! `cargo test --manifest-path runtime/Cargo.toml -p laya-mlx --release --test bench -- --ignored --nocapture`.
 
-use laya_core::testing::{checkpoint_dir, checkpoint_repo, fixtures_path};
+use laya_core::testing::{checkpoint_dir, fixtures_path};
 use laya_core::{parse_questions, Agent, BackendOptions};
 use serde_json::Value;
 
@@ -14,7 +14,7 @@ fn bench(fixture: &str, variant: Option<&str>, opts: &BackendOptions) {
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
     let fx: Value = serde_json::from_slice(&bytes).unwrap();
     let dir = checkpoint_dir(variant)
-        .unwrap_or_else(|e| panic!("checkpoint {}: {e}", checkpoint_repo(variant)));
+        .unwrap_or_else(|e| panic!("checkpoint {}: {e}", variant.unwrap_or("english")));
     let agent = Agent::load(&dir, opts, laya_mlx::factory()).unwrap();
     println!("{} [{}]", fixture, agent.backend_name());
     for case in fx["cases"].as_array().unwrap() {

@@ -7,17 +7,22 @@
 //! that reproduce laya-r-mlx 914c9a7, GELU promoted to f32 included. The f16 production path
 //! is checked against the upstream reference in `tests/reference.rs`.
 
-use laya_core::testing::{checkpoint_repo, fixtures_path, run_parity};
+use laya_core::testing::{checkpoint_dir, fixtures_path, run_parity};
 use laya_core::BackendOptions;
 
 /// `variant` names the checkpoint as `laya_core::testing::checkpoint_dir` does: `None` for
 /// English, `Some("multilingual")` for `convaiinnovations/laya-multilingual`.
 fn check(fixture: &str, variant: Option<&str>, opts: &BackendOptions) {
     let Some(report) = run_parity(fixture, variant, laya_mlx::factory(), opts).expect("parity run") else {
+        // run_parity only says that something is missing; checkpoint_dir's error names the
+        // pinned repo and revision it looked for.
+        let checkpoint = match checkpoint_dir(variant) {
+            Ok(dir) => format!("checkpoint found at {}", dir.display()),
+            Err(e) => e.to_string(),
+        };
         panic!(
-            "{fixture}: fixture {} or checkpoint {} not available; this test cannot pass without them",
+            "{fixture}: fixture {} or checkpoint not available ({checkpoint}); this test cannot pass without them",
             fixtures_path(fixture).display(),
-            checkpoint_repo(variant)
         );
     };
     println!("{}", report.summary());
