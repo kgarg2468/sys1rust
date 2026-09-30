@@ -7,7 +7,8 @@ parses its NUL-separated plist stream into timestamped samples, and stops it cle
 If `sudo -n` is refused, it logs that and exits 0 so a run carries on without energy.
 
 Usage:
-  power.py check                          3-second check that sudo -n powermetrics works
+  power.py check [--out SAMPLES.jsonl]    3-second check that sudo -n powermetrics works
+                                          (default output: $BENCH_ROOT/tmp/power_check.jsonl)
   power.py start --out SAMPLES.jsonl      start a background logger (pidfile SAMPLES.jsonl.pid)
   power.py stop  --out SAMPLES.jsonl      stop it
   power.py run   --out SAMPLES.jsonl -- CMD ARGS...   log while CMD runs
@@ -17,7 +18,8 @@ Sample line (powers in milliwatts; a sample covers [t_start, t]; t = arrival tim
   {"t": 1790000000.1, "t_start": t - elapsed, "elapsed_ms": 1003.2, "t_plist": <1 s resolution>,
    "cpu_mw": ..., "gpu_mw": ..., "ane_mw": ..., "combined_mw": ..., "thermal_pressure": "Nominal"}
 Plus a first line {"type": "power_meta", ...} and, on failure, {"type": "power_error", ...}.
-Energy for a window = sum over samples of combined_mw * overlap_seconds (millijoules).
+Energy for a window = sum over samples of combined_mw * overlap_seconds (millijoules). A window
+with a stretch of more than 0.5 s that no sample covers has no energy value.
 """
 import argparse
 import datetime as dt
@@ -29,6 +31,9 @@ import subprocess
 import sys
 import time
 
+BENCH = os.environ.get("BENCH_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Largest uncovered stretch, in seconds, allowed at a window edge or between two samples.
+GAP_TOLERANCE_S = 0.5
 CMD = ["sudo", "-n", "/usr/bin/powermetrics", "--samplers", "cpu_power,gpu_power,ane_power,thermal",
        "-i", "1000", "-n", "21600", "-f", "plist"]
 
@@ -235,15 +240,27 @@ def load_samples(path):
 
 
 def energy_mj(samples, t0, t1, key="combined_mw"):
-    """Integrate power over [t0, t1] (seconds) -> millijoules. None if the window is not covered."""
+    """Integrate power over [t0, t1] (seconds) -> millijoules. None if the window is not covered.
+
+    The window is incomplete if the samples leave a stretch longer than GAP_TOLERANCE_S
+    uncovered, at either edge or in the middle (a missed or unreadable sample)."""
     if not samples or t1 <= t0:
         return None
-    if t0 < samples[0]["t_start"] - 0.5 or t1 > samples[-1]["t"] + 0.5:
+    inside = sorted((s for s in samples if s["t"] > t0 and s["t_start"] < t1 and s.get(key) is not None),
+                    key=lambda s: s["t_start"])
+    if not inside:
+        return None
+    covered = t0
+    for s in inside:
+        if s["t_start"] > covered + GAP_TOLERANCE_S:
+            return None
+        covered = max(covered, s["t"])
+    if covered < t1 - GAP_TOLERANCE_S:
         return None
     e = 0.0
-    for s in samples:
+    for s in inside:
         a, b = max(t0, s["t_start"]), min(t1, s["t"])
-        if b > a and s.get(key) is not None:
+        if b > a:
             e += s[key] * (b - a)
     return e
 
@@ -257,9 +274,10 @@ def main():
     if args.cmd == "_logger":
         return logger(args.out)
     if args.cmd == "check":
-        out = args.out or "/tmp/bench_power_check.jsonl"
-        if os.path.exists(out):
-            os.remove(out)
+        out = args.out or os.path.join(BENCH, "tmp", "power_check.jsonl")
+        for path in (out, out + ".raw.plist"):
+            if os.path.exists(path):
+                os.remove(path)
         start(out)
         time.sleep(3)
         stop(out)
