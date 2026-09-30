@@ -4,6 +4,10 @@
 //!
 //! Order inside `/v1/systemone`, as upstream: bearer auth, non-blocking admission, declared
 //! body length, streamed body cap, JSON and limit checks, then the forward.
+//!
+//! One intentional difference: the body must arrive within [`BODY_READ_TIMEOUT`] or the
+//! request gets 408. Upstream (uvicorn) waits for a stalled body forever, and here that would
+//! hold an admission slot and block graceful shutdown.
 
 use crate::config::ServedModel;
 use crate::validate::{validate_body, Rejection, MAX_BODY_BYTES};
@@ -21,9 +25,14 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+
+/// How long a request body may take to arrive once admitted. 2 MiB (the cap) in 10 s is
+/// 200 KiB/s, far below any loopback or LAN client; a peer slower than that is stalled.
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything the handlers share.
 pub struct AppState {
@@ -34,6 +43,8 @@ pub struct AppState {
     /// `Bearer <key>` as bytes, compared in constant time against the raw header value.
     expected_auth: Option<Vec<u8>>,
     admission: Arc<Semaphore>,
+    /// [`BODY_READ_TIMEOUT`]; public so tests can shorten it.
+    pub body_timeout: Duration,
 }
 
 impl AppState {
@@ -54,6 +65,7 @@ impl AppState {
                 .filter(|k| !k.is_empty())
                 .map(|k| format!("Bearer {k}").into_bytes()),
             admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            body_timeout: BODY_READ_TIMEOUT,
         })
     }
 }
@@ -72,6 +84,12 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Serve `app` on `listener` with HTTP/1.1 keep-alive, `TCP_NODELAY` on every accepted
 /// socket (Nagle delayed upstream's small responses on macOS) and graceful shutdown: once
 /// `shutdown` completes, stop accepting and finish the in-flight requests.
+///
+/// There is no header read timeout and no connection cap, like uvicorn's defaults upstream.
+/// `axum::serve` builds the hyper connection without a timer, so neither is reachable from
+/// here. A connection that never completes its headers costs a socket and a task but no
+/// admission slot. The default bind is loopback; a deployment that listens wider should put
+/// a reverse proxy in front for header timeouts and connection limits.
 pub async fn serve<F>(listener: TcpListener, app: Router, shutdown: F) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -161,7 +179,11 @@ async fn systemone(
             return Err(body_too_large());
         }
     }
-    let raw = read_body_capped(req.into_body()).await?;
+    let raw = tokio::time::timeout(st.body_timeout, read_body_capped(req.into_body()))
+        .await
+        .map_err(|_| {
+            Rejection::new(StatusCode::REQUEST_TIMEOUT, "request body read timed out")
+        })??;
     let v = validate_body(&raw, &st.served.name)?;
     let pred = match st.worker.predict(v.state, v.questions).await {
         Ok(p) => p,

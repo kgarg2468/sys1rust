@@ -44,7 +44,26 @@ impl TestServer {
         let factory = Box::new(move || Ok(Box::new(predictor) as Box<dyn Predictor>));
         let (worker, ready) = Worker::spawn(factory, max_concurrent);
         let ready = ready.recv().unwrap().expect("fake predictor loads");
-        Self::start_with_worker(worker, ready.engine, max_concurrent, api_key).await
+        Self::start_with_worker(worker, ready.engine, max_concurrent, api_key, None).await
+    }
+
+    /// Like [`start`], with a shorter body read deadline than the default 10 s.
+    pub async fn start_with_body_timeout(
+        predictor: Arc<dyn Predictor + Send + Sync>,
+        max_concurrent: usize,
+        body_timeout: std::time::Duration,
+    ) -> TestServer {
+        let factory = Box::new(move || Ok(Box::new(predictor) as Box<dyn Predictor>));
+        let (worker, ready) = Worker::spawn(factory, max_concurrent);
+        let ready = ready.recv().unwrap().expect("fake predictor loads");
+        Self::start_with_worker(
+            worker,
+            ready.engine,
+            max_concurrent,
+            None,
+            Some(body_timeout),
+        )
+        .await
     }
 
     /// Start over a worker whose thread has already ended (the factory failed).
@@ -52,7 +71,7 @@ impl TestServer {
         let factory = Box::new(|| Err(anyhow::anyhow!("no checkpoint")));
         let (worker, ready) = Worker::spawn(factory, 4);
         assert!(ready.recv().unwrap().is_err());
-        Self::start_with_worker(worker, "fake".into(), 4, None).await
+        Self::start_with_worker(worker, "fake".into(), 4, None, None).await
     }
 
     async fn start_with_worker(
@@ -60,8 +79,9 @@ impl TestServer {
         engine: String,
         max_concurrent: usize,
         api_key: Option<&str>,
+        body_timeout: Option<std::time::Duration>,
     ) -> TestServer {
-        let state = AppState::new(
+        let mut state = AppState::new(
             worker.handle.clone(),
             served(),
             engine,
@@ -69,6 +89,11 @@ impl TestServer {
             api_key.map(str::to_string),
             max_concurrent,
         );
+        if let Some(d) = body_timeout {
+            Arc::get_mut(&mut state)
+                .expect("state not shared yet")
+                .body_timeout = d;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel();

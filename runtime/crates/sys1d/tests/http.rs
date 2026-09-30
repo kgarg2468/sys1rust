@@ -1,6 +1,6 @@
 //! HTTP-layer tests over fake predictors (no MLX, no checkpoint): every status code, every
-//! limit, auth, admission, the streamed body cap, the model-field rules, headers, `/health`,
-//! a panicking predictor and a client that disconnects while queued.
+//! limit, auth, admission, the streamed body cap, the body read deadline, the model-field
+//! rules, headers, `/health`, a panicking predictor and a client that disconnects while queued.
 
 mod common;
 
@@ -475,6 +475,44 @@ async fn chunked_body_over_cap_is_413_while_streaming() {
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     assert!(head.starts_with("HTTP/1.1 413"), "{head}");
     let _ = writer.await;
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_body_is_408_and_frees_its_admission_slot() {
+    let timeout = std::time::Duration::from_millis(300);
+    let srv = TestServer::start_with_body_timeout(Arc::new(Echo), 1, timeout).await;
+    let body = valid_body().to_string();
+    // Declare the full length, send half, then stop. The only admission slot is now held.
+    let mut s = srv.connect().await;
+    let head = format!(
+        "POST /v1/systemone HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    send(&mut s, head.as_bytes()).await;
+    send(&mut s, &body.as_bytes()[..body.len() / 2]).await;
+    let t = std::time::Instant::now();
+    let r = read_response(&mut s).await;
+    assert_eq!(
+        (r.status, r.detail()),
+        (408, "request body read timed out".to_string())
+    );
+    assert!(t.elapsed() >= timeout, "answered before the deadline");
+    assert!(
+        t.elapsed() < timeout * 10,
+        "took {:?} for a {timeout:?} deadline",
+        t.elapsed()
+    );
+    // The slot is free again: a complete request on a fresh connection is served.
+    let r = srv.post_json(&valid_body()).await;
+    assert_eq!(r.status, 200, "{:?}", String::from_utf8_lossy(&r.body));
+    // A body that arrives in pieces within the deadline is fine.
+    let mut s = srv.connect().await;
+    send(&mut s, head.as_bytes()).await;
+    send(&mut s, &body.as_bytes()[..body.len() / 2]).await;
+    tokio::time::sleep(timeout / 3).await;
+    send(&mut s, &body.as_bytes()[body.len() / 2..]).await;
+    assert_eq!(read_response(&mut s).await.status, 200);
     srv.stop().await;
 }
 
