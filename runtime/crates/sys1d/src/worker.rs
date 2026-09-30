@@ -2,6 +2,13 @@
 //! and used only here; HTTP handlers send validated jobs over a bounded channel and wait on
 //! a oneshot for the answer. One forward at a time, in arrival order, no cross-request
 //! batching (measured to gain nothing on this laptop).
+//!
+//! The answer that crosses back is the serialized response body, not a `Value`: a score
+//! answer's `legend` copies the request's criteria, which may be nested [`MAX_JSON_DEPTH`]
+//! deep, and walking that (serializing or dropping it) takes far more stack than a tokio
+//! worker has. Everything that touches the result happens here, on [`DEEP_STACK`].
+//!
+//! [`MAX_JSON_DEPTH`]: crate::validate::MAX_JSON_DEPTH
 
 use crate::config::MAX_CONCURRENT_CAP;
 use crate::validate::{Validated, DEEP_STACK};
@@ -48,10 +55,12 @@ pub struct Ready {
     pub warmup_ms: f64,
 }
 
-/// One answered prediction; `infer_ms` is the time inside `predict`, not the queue wait.
+/// One answered prediction: the complete response body (the predictor's result with the
+/// `routing` block appended, serialized on the inference thread) and the time inside
+/// `predict`, not the queue wait.
 #[derive(Debug, Clone)]
 pub struct Prediction {
-    pub result: Value,
+    pub body: Vec<u8>,
     pub infer_ms: f64,
 }
 
@@ -69,9 +78,11 @@ pub enum PredictError {
 
 /// A queued request. `req` keeps its non-recursive drop, so a job that dies on a tokio thread
 /// (the inference thread is gone, or the client left while the send was pending) is safe at
-/// any nesting depth.
+/// any nesting depth. `routing` is the small constant block the HTTP layer adds to every
+/// result (upstream's `Router.predict` sets it); it is appended here, before serialization.
 struct Job {
     req: Validated,
+    routing: Value,
     reply: oneshot::Sender<Result<Prediction, PredictError>>,
 }
 
@@ -87,11 +98,20 @@ impl WorkerHandle {
         !self.tx.is_closed()
     }
 
-    /// Queue one prediction and wait for its answer.
-    pub async fn predict(&self, req: Validated) -> Result<Prediction, PredictError> {
+    /// Queue one prediction and wait for its answer: the response body with `routing`
+    /// appended to the result.
+    pub async fn predict(
+        &self,
+        req: Validated,
+        routing: Value,
+    ) -> Result<Prediction, PredictError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job { req, reply })
+            .send(Job {
+                req,
+                routing,
+                reply,
+            })
             .await
             .map_err(|_| PredictError::Dead)?;
         // The worker drops a job without answering only when it skips it because this
@@ -118,7 +138,8 @@ impl Worker {
         let (tx, rx) = mpsc::channel::<Job>(capacity.clamp(1, MAX_CONCURRENT_CAP));
         let (ready_tx, ready_rx) = std_mpsc::channel();
         // The thread renders the state and the criteria as Python text (laya-core's dumps
-        // and repr recurse once per level), so its stack is sized for MAX_JSON_DEPTH.
+        // and repr recurse once per level), copies criteria into the result and serializes
+        // it, so its stack is sized for MAX_JSON_DEPTH.
         let thread = std::thread::Builder::new()
             .name("sys1d-infer".into())
             .stack_size(DEEP_STACK)
@@ -188,13 +209,34 @@ fn run(
         }));
         let infer_ms = t.elapsed().as_secs_f64() * 1000.0;
         let out = match outcome {
-            Ok(Ok(result)) => Ok(Prediction { result, infer_ms }),
+            Ok(Ok(result)) => {
+                serialize(result, job.routing).map(|body| Prediction { body, infer_ms })
+            }
             Ok(Err(laya_core::Error::Question(m))) => Err(PredictError::Question(m)),
             Ok(Err(e)) => Err(PredictError::Failed(e.to_string())),
             Err(payload) => Err(PredictError::Panicked(panic_message(payload.as_ref()))),
         };
+        // A closed reply means the client left; `out` dies here, on this stack.
         let _ = job.reply.send(out);
+        // `job.req` and the result are dropped here too, never on a tokio thread.
     }
+}
+
+/// Append `routing` to the predictor's result and serialize it, all on this thread. The
+/// result is deep only through a score `legend`, which copies a criterion of the request:
+/// the response is never nested deeper than the request that produced it, and upstream's
+/// `json.dumps` (JSONResponse) serializes everything its `json.loads` accepted, so a deep
+/// legend is a 200 there and here. The result is an object in `Agent::predict`'s contract;
+/// anything else is a predictor bug reported as the opaque 500.
+fn serialize(result: Value, routing: Value) -> Result<Vec<u8>, PredictError> {
+    let Value::Object(mut map) = result else {
+        return Err(PredictError::Failed(
+            "predictor returned a result that is not an object".into(),
+        ));
+    };
+    map.insert("routing".into(), routing);
+    serde_json::to_vec(&map)
+        .map_err(|e| PredictError::Failed(format!("serializing the result: {e}")))
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {

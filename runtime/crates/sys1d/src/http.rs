@@ -10,7 +10,7 @@
 //! hold an admission slot and block graceful shutdown.
 
 use crate::config::{ServedModel, MAX_CONCURRENT_CAP};
-use crate::validate::{validate_body, Rejection, MAX_BODY_BYTES};
+use crate::validate::{validate_body_async, Rejection, MAX_BODY_BYTES};
 use crate::worker::{PredictError, WorkerHandle};
 use crate::{log, sanitize};
 use axum::body::Body;
@@ -38,6 +38,8 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct AppState {
     worker: WorkerHandle,
     served: ServedModel,
+    /// Upstream's `routing` block, appended to every result by the inference thread.
+    routing: Value,
     engine: String,
     tuning: String,
     /// `Bearer <key>` as bytes, compared in constant time against the raw header value.
@@ -56,9 +58,15 @@ impl AppState {
         api_key: Option<String>,
         max_concurrent: usize,
     ) -> Arc<Self> {
+        let routing = json!({
+            "model": served.name,
+            "repo": served.repo,
+            "reason": "only checkpoint served",
+        });
         Arc::new(AppState {
             worker,
             served,
+            routing,
             engine,
             tuning,
             expected_auth: api_key
@@ -115,12 +123,18 @@ impl IntoResponse for Rejection {
 }
 
 fn json_response(status: StatusCode, body: &Value) -> Response<Body> {
+    serialized_response(
+        status,
+        serde_json::to_vec(body).expect("json value serializes"),
+    )
+}
+
+/// A response whose body is already JSON bytes.
+fn serialized_response(status: StatusCode, body: Vec<u8>) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(Body::from(
-            serde_json::to_vec(body).expect("json value serializes"),
-        ))
+        .body(Body::from(body))
         .expect("valid response")
 }
 
@@ -184,8 +198,11 @@ async fn systemone(
         .map_err(|_| {
             Rejection::new(StatusCode::REQUEST_TIMEOUT, "request body read timed out")
         })??;
-    let v = validate_body(&raw, &st.served.name)?;
-    let pred = match st.worker.predict(v).await {
+    // From here on this task holds no request-derived `Value`: a deep body is parsed on its
+    // own thread, what comes back is a `Validated` (flat drop) that goes straight to the
+    // inference thread, and the answer is the serialized body. See `validate::DEEP_STACK`.
+    let v = validate_body_async(raw, &st.served.name).await?;
+    let pred = match st.worker.predict(v, st.routing.clone()).await {
         Ok(p) => p,
         Err(PredictError::Question(m)) => {
             return Err(Rejection::new(StatusCode::UNPROCESSABLE_ENTITY, m))
@@ -209,14 +226,8 @@ async fn systemone(
             ));
         }
     };
-    let mut result = pred.result;
-    result["routing"] = json!({
-        "model": st.served.name,
-        "repo": st.served.repo,
-        "reason": "only checkpoint served",
-    });
     let ms = format!("{:.2}", pred.infer_ms);
-    let mut resp = json_response(StatusCode::OK, &result);
+    let mut resp = serialized_response(StatusCode::OK, pred.body);
     let headers = resp.headers_mut();
     headers.insert(
         "Server-Timing",

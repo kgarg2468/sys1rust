@@ -10,11 +10,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use sys1d::config::MAX_CONCURRENT_CAP;
-use sys1d::validate::{validate_body, MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_STATE_CHARS};
+use sys1d::validate::{
+    nesting_depth, validate_body, MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_STATE_CHARS,
+};
 use sys1d::worker::{Predictor, Worker};
 use tokio::io::AsyncWriteExt;
 
-/// Answers every question with choice `a`; `usage.input_tokens` is the state's char count.
+/// Answers every question with choice `a`, except a score question, which gets laya-core's
+/// `legend` (a copy of its criteria, one key per level); `usage.input_tokens` is the state's
+/// char count.
 struct Echo;
 
 impl Predictor for Echo {
@@ -22,8 +26,21 @@ impl Predictor for Echo {
         let answers: Map<String, Value> = questions
             .as_object()
             .unwrap()
-            .keys()
-            .map(|k| (k.clone(), json!({"type": "choice", "choice": "a"})))
+            .iter()
+            .map(|(k, q)| {
+                let answer = match (&q["type"], &q["criteria"]) {
+                    (Value::String(t), Value::Array(levels)) if t == "score" => {
+                        let legend: Map<String, Value> = levels
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| (i.to_string(), c.clone()))
+                            .collect();
+                        json!({"type": "score", "score": 1.0, "legend": legend})
+                    }
+                    _ => json!({"type": "choice", "choice": "a"}),
+                };
+                (k.clone(), answer)
+            })
             .collect();
         let n = match state {
             Value::String(s) => s.chars().count(),
@@ -817,9 +834,150 @@ async fn deep_request_to_a_dead_worker_is_503() {
     assert!(worker.join(std::time::Duration::from_secs(5)));
     let req = validate_body(&deep_body(MAX_JSON_DEPTH - 1, &json!({})), SERVED_NAME).unwrap();
     assert!(matches!(
-        handle.predict(req).await,
+        handle.predict(req, json!({})).await,
         Err(sys1d::worker::PredictError::Dead)
     ));
+}
+
+/// A score request whose one criterion is nested as deep as the document limit allows:
+/// root, `questions`, the question and `criteria` are four levels, the criterion the rest.
+fn deep_score_body() -> (Vec<u8>, String) {
+    let criterion = format!(
+        "{}{}",
+        "[".repeat(MAX_JSON_DEPTH - 4),
+        "]".repeat(MAX_JSON_DEPTH - 4)
+    );
+    let body = format!(
+        r#"{{"state": "s", "questions": {{"q": {{"type": "score", "instructions": "rate", "criteria": [{criterion}]}}}}}}"#
+    );
+    assert_eq!(nesting_depth(body.as_bytes()), MAX_JSON_DEPTH);
+    (body.into_bytes(), criterion)
+}
+
+/// The answer to a deep score request copies the criterion into `legend`, so the response is
+/// as deep as the request. It is serialized on the inference thread and the handler only
+/// forwards bytes, so a 2 MiB tokio thread never walks it: the response carries the criterion
+/// byte for byte and the server is still up afterwards. In a debug build serializing this on
+/// the handler's thread would need 16 MiB of stack and abort the process, so the test fails
+/// loudly in debug and release alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_score_legend_is_served_and_the_server_survives() {
+    let srv = echo_server().await;
+    let (body, criterion) = deep_score_body();
+    let r = srv.post_bytes(&body, &[]).await;
+    assert_eq!(
+        r.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&r.body[..200.min(r.body.len())])
+    );
+    assert_eq!(nesting_depth(&r.body), MAX_JSON_DEPTH);
+    let legend = format!(r#""legend":{{"0":{criterion}}}"#);
+    assert!(
+        r.body.windows(legend.len()).any(|w| w == legend.as_bytes()),
+        "legend carries the criterion byte for byte"
+    );
+    assert!(r.body.ends_with(
+        format!(
+            r#","routing":{{"model":"{SERVED_NAME}","repo":"{SERVED_REPO}","reason":"only checkpoint served"}}}}"#
+        )
+        .as_bytes()
+    ));
+    let h = srv.request("GET", "/health", &[], None).await;
+    assert_eq!(h.status, 200);
+    let r = srv.post_json(&valid_body()).await;
+    assert_eq!(r.status, 200);
+    srv.stop().await;
+}
+
+/// The client of a deep score request leaves while its forward runs; the deep answer has
+/// nowhere to go and dies on the inference thread. The server goes on serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_answer_for_a_gone_client_dies_on_the_inference_thread() {
+    let (gate, started, release) = Gated::new();
+    let srv = TestServer::start(gate.clone(), 8, None).await;
+    let (body, _) = deep_score_body();
+    let mut a = srv.connect().await;
+    send(
+        &mut a,
+        &build_request(
+            "POST",
+            "/v1/systemone",
+            &[("Content-Type", "application/json")],
+            Some(&body),
+        ),
+    )
+    .await;
+    started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    drop(a);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    release.send(()).unwrap();
+    // The next request gets the second forward.
+    let shallow = valid_body().to_string();
+    let mut b = srv.connect().await;
+    send(
+        &mut b,
+        &build_request(
+            "POST",
+            "/v1/systemone",
+            &[("Content-Type", "application/json")],
+            Some(shallow.as_bytes()),
+        ),
+    )
+    .await;
+    started
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    release.send(()).unwrap();
+    assert_eq!(read_response(&mut b).await.status, 200);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+    srv.stop().await;
+}
+
+/// Deep bodies are parsed off the runtime: on this single-threaded runtime four of them are
+/// in flight while `/health` and a shallow request are answered. The parses are each near the
+/// body cap so they take real time, and every request still completes.
+#[tokio::test]
+async fn health_answers_while_deep_bodies_parse() {
+    let srv = echo_server().await;
+    // A deep state padded with a long string: about 1.9 MiB, under the body cap, over the
+    // state cap (a 413 once parsed and measured).
+    let padding = "x".repeat(MAX_BODY_BYTES - 2 * MAX_JSON_DEPTH - 4096);
+    let body = format!(
+        r#"{{"state": {}"{padding}"{}, "questions": {{}}}}"#,
+        "[".repeat(MAX_JSON_DEPTH - 1),
+        "]".repeat(MAX_JSON_DEPTH - 1)
+    )
+    .into_bytes();
+    assert!(body.len() <= MAX_BODY_BYTES);
+    let req = build_request(
+        "POST",
+        "/v1/systemone",
+        &[("Content-Type", "application/json")],
+        Some(&body),
+    );
+    let mut conns = Vec::new();
+    for _ in 0..4 {
+        let mut c = srv.connect().await;
+        send(&mut c, &req).await;
+        conns.push(c);
+    }
+    let h = srv.request("GET", "/health", &[], None).await;
+    assert_eq!(h.status, 200);
+    let r = srv.post_json(&valid_body()).await;
+    assert_eq!(r.status, 200);
+    for mut c in conns {
+        let r = read_response(&mut c).await;
+        assert_eq!(r.status, 413, "{}", r.detail());
+        assert!(
+            r.detail().starts_with("state too large ("),
+            "{}",
+            r.detail()
+        );
+    }
+    srv.stop().await;
 }
 
 // --- capacity -------------------------------------------------------------------------------
