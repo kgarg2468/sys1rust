@@ -216,6 +216,70 @@ mod tests {
         assert_eq!(cfg.layer_is_local, [false, true, false, true, false, true]);
     }
 
+    /// The attention layout of the three published checkpoints, copied from their
+    /// `encoder/config.json` (convaiinnovations/laya-typed-decisions at transformers 5.17.0,
+    /// laya-multilingual and laya at 5.0.0). Every one ships `global_attn_every_n_layers: 3`
+    /// and a `layer_types` list; the two must agree with the rule transformers' ModernBERT
+    /// applies. `ModernBertConfig.__init__` fills a missing list with `"sliding_attention" if
+    /// bool(i % global_attn_every_n_layers) else "full_attention"` and `ModernBertAttention`
+    /// reads `config.layer_types[layer_idx]`. The full-model answer check for this pattern is
+    /// `crates/laya-mlx/tests/reference.rs`.
+    #[test]
+    fn published_encoders_match_the_transformers_layer_rule() {
+        const S: &str = "sliding_attention";
+        const F: &str = "full_attention";
+        // 28 layers: laya-typed-decisions and laya (ModernBERT-large).
+        let large = [
+            F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F,
+        ];
+        // 22 layers: laya-multilingual (ModernBERT-base).
+        let base = [
+            F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F,
+        ];
+        for (name, hidden, types) in [
+            ("laya-typed-decisions", 1024, &large[..]),
+            ("laya-multilingual", 768, &base[..]),
+            ("laya", 1024, &large[..]),
+        ] {
+            let n = types.len();
+            let published = json!({
+                "model_type": "modernbert", "vocab_size": 50368, "hidden_size": hidden,
+                "num_hidden_layers": n, "num_attention_heads": hidden / 64,
+                "intermediate_size": hidden * 5 / 2, "global_attn_every_n_layers": 3,
+                "local_attention": 128, "layer_types": types,
+            });
+            let cfg = EncoderConfig::from_value(&published).unwrap();
+            let rule: Vec<bool> = (0..n).map(|i| i % 3 != 0).collect();
+            assert_eq!(
+                cfg.layer_is_local, rule,
+                "{name}: layer_types vs the % 3 rule"
+            );
+            assert_eq!(cfg.layer_is_local.len(), n, "{name}");
+            // The transformers 4.x layout of the same file has no `layer_types`; the pattern
+            // must not depend on which layout the checkpoint was saved with.
+            let mut older = published.clone();
+            older.as_object_mut().unwrap().remove("layer_types");
+            let cfg_older = EncoderConfig::from_value(&older).unwrap();
+            assert_eq!(
+                cfg_older.layer_is_local, cfg.layer_is_local,
+                "{name}: 4.x layout"
+            );
+        }
+    }
+
+    /// `layer_types` wins over the interval when a config carries both, since that is what
+    /// transformers reads first.
+    #[test]
+    fn layer_types_override_the_interval() {
+        let cfg = EncoderConfig::from_value(&minimal(json!({
+            "global_attn_every_n_layers": 3,
+            "layer_types": ["sliding_attention", "full_attention", "sliding_attention",
+                            "sliding_attention", "full_attention", "sliding_attention"],
+        })))
+        .unwrap();
+        assert_eq!(cfg.layer_is_local, [true, false, true, true, false, true]);
+    }
+
     #[test]
     fn zero_global_attn_interval_is_a_config_error() {
         let e = EncoderConfig::from_value(&minimal(json!({"global_attn_every_n_layers": 0})))
