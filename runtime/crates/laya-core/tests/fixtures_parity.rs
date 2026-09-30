@@ -1,8 +1,9 @@
 //! Parity against the Python package, using fixtures dumped by the fork's `scripts/ref_dump.py`
 //! into `runtime/tests/fixtures/<name>.json`. The fixtures are not in the repository and the
 //! checks need the checkpoints in the HF cache, so the tests are ignored by default. Run them
-//! with `cargo test -p laya-core --test fixtures_parity -- --ignored`; a missing fixture or
-//! checkpoint then fails instead of passing silently.
+//! from the repository root with
+//! `cargo test --manifest-path runtime/Cargo.toml -p laya-core --test fixtures_parity -- --ignored`;
+//! a missing fixture or checkpoint then fails instead of passing silently.
 
 use laya_core::backend::{Backend, BackendOptions, BackendOutput, Batch};
 use laya_core::decode::{act_features, ActHead, Temperatures};
@@ -91,7 +92,15 @@ fn check_checkpoint(name: &str, subfolder: Option<&str>) {
         let cname = case["name"].as_str().unwrap();
         let qs = parse_questions(&case["questions"]).unwrap();
         let items = agent.encode(&case["state"], &qs).unwrap();
-        for (it, want) in items.iter().zip(case["items"].as_array().unwrap()) {
+        let want_items = case["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            want_items.len(),
+            "{name}/{cname}: encoded {} items, the fixture has {}",
+            items.len(),
+            want_items.len()
+        );
+        for (it, want) in items.iter().zip(want_items) {
             let want_ids: Vec<u32> = want["ids"]
                 .as_array()
                 .unwrap()
