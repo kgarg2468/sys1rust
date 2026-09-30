@@ -7,6 +7,7 @@
 //! Only the transformer forward (encoder + decision head transformer + scorer) is delegated
 //! to a [`Backend`] implementation (MLX, candle, ...).
 
+pub mod agent;
 pub mod backend;
 pub mod config;
 pub mod decode;
@@ -15,9 +16,11 @@ pub mod pyjson;
 pub mod question;
 pub mod resolve;
 pub mod sequence;
+pub mod testing;
 pub mod tokenizer;
 pub mod weights;
 
+pub use agent::Agent;
 pub use backend::{Backend, BackendOptions, BackendOutput, Batch, Device};
 pub use config::{AgentConfig, EncoderConfig, ModelConfig};
 pub use error::Error;

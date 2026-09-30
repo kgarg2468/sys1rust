@@ -45,8 +45,14 @@ impl LayaTokenizer {
             Ok(b) => serde_json::from_slice(&b)?,
             Err(_) => Value::Null,
         };
+        Self::from_tokenizer(tok, &cfg)
+    }
+
+    /// Wrap a loaded tokenizer. `cfg` is the `tokenizer_config.json` object naming the special
+    /// tokens, or `Null` to find them by their usual names.
+    pub fn from_tokenizer(tok: Tokenizer, cfg: &Value) -> Result<Self> {
         let pick = |key: &str, fallbacks: &[&str]| -> Result<(u32, String)> {
-            let mut names: Vec<String> = special_str(&cfg, key).into_iter().collect();
+            let mut names: Vec<String> = special_str(cfg, key).into_iter().collect();
             names.extend(fallbacks.iter().map(|s| s.to_string()));
             for n in &names {
                 if let Some(id) = tok.token_to_id(n) {

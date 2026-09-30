@@ -25,7 +25,7 @@ fn hf_cache_dir_from(env: impl Fn(&str) -> Option<String>) -> PathBuf {
     cache.join("huggingface").join("hub")
 }
 
-fn is_checkpoint(dir: &Path) -> bool {
+pub(crate) fn is_checkpoint(dir: &Path) -> bool {
     dir.join("rl_agent_config.json").exists() && dir.join("model.safetensors").exists()
 }
 
