@@ -1,0 +1,10 @@
+{
+  "_note": "Pinned Hugging Face revisions. Every contender must load these exact revisions (pass revision=<sha>). Record any derived format (MLX, Core ML, ONNX, GGUF) with the source sha it came from.",
+  "typed-decisions": {"repo": "convaiinnovations/laya-typed-decisions", "sha": "1a793eb568e6718f15941d08f85432581df534e3", "license": "apache-2.0"},
+  "multilingual":    {"repo": "convaiinnovations/laya-multilingual",    "sha": "e4e9ddf21a7b1903b7acffd8814ad4307bf63a67", "license": "apache-2.0"},
+  "english":         {"repo": "convaiinnovations/laya",                 "sha": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851", "license": "apache-2.0"},
+  "fluid-coreml":    {"repo": "FluidInference/laya-coreml",             "sha": "7b8d7a2b7e28e746c6ecaad44bbcd5cf251a4fcc", "license": "apache-2.0"},
+  "decision-modernbert-coreml": {"repo": "FluidInference/decision-modernbert-base-coreml", "sha": "26b3403d0c40347f6f45d383a380537dc0bf749f", "license": "cc-by-nc-4.0"},
+  "cbjev":           {"repo": "0010101010-1/cbjev",                     "sha": "a921c4eed97cc74da68ec180bf48977aff186b05", "license": "gpl-3.0"},
+  "opendecider-nano":{"repo": "manjunathshiva/opendecider-nano",        "sha": "280219bdb3110ad73c4fb7123987925d9a7fccd7", "license": "apache-2.0"}
+}

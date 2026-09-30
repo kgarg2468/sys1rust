@@ -1,0 +1,16 @@
+#!/bin/bash
+# Bench adapter entry point for the sys1rust runtime (bench/PLAN.md). exec keeps one PID.
+# In-process variants run in sys1-bench. `http*` variants and --list-variants go to
+# http_adapter.py, which drives the sys1d server and merges both variant lists.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/../../env.sh"
+RT="$HERE/../../../runtime"
+export SYS1_CODE_VERSION="$(git -C "$RT" describe --always --dirty 2>/dev/null || echo unknown)"
+prev=""
+for a in "$@"; do
+    if [[ "$a" == "--list-variants" || ( "$prev" == "--variant" && "$a" == http* ) ]]; then
+        exec "$BENCH_ROOT/harness/.venv/bin/python" "$HERE/http_adapter.py" "$@"
+    fi
+    prev="$a"
+done
+exec "$CARGO_TARGET_DIR/release/sys1-bench" "$@"
