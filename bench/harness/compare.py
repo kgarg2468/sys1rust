@@ -6,8 +6,9 @@ Usage:
              [--gold-only] [--json OUT.json]
 
 Defaults: the model comes from the result's meta line, the workload name from the result file
-name (<workload>-<timestamp>.jsonl), the reference from bench/reference/<model>/<workload>.jsonl
-and gold from bench/workloads/<workload>.jsonl. `--gold-only` skips the reference (contenders
+name (<workload>-<timestamp>.jsonl, or <workload>-<anything>.jsonl for a workload in
+bench/workloads), the reference from bench/reference/<model>/<workload>.jsonl and gold from
+bench/workloads/<workload>.jsonl. `--gold-only` skips the reference (contenders
 that run different weights: cbjev, opendecider-nano, decision-modernbert).
 
 Categorical answer per question:
@@ -48,9 +49,18 @@ def read_jsonl(path):
 
 
 def workload_name(result_path):
+    """Workload of a result file. Runner files are <workload>-<timestamp>.jsonl. Other names, such as
+    bench/spike/explore.sh's <workload>-r<repeats>-<knobs>.jsonl, count when they start with the
+    name of a file in bench/workloads followed by "-". Otherwise the whole file stem is the name."""
     base = os.path.basename(result_path)
     m = re.match(r"(.+?)-\d{8}T\d{6}.*\.jsonl$", base)
-    return m.group(1) if m else os.path.splitext(base)[0]
+    if m:
+        return m.group(1)
+    stem = os.path.splitext(base)[0]
+    wl_dir = os.path.join(BENCH, "workloads")
+    known = [f[:-len(".jsonl")] for f in os.listdir(wl_dir) if f.endswith(".jsonl")] if os.path.isdir(wl_dir) else []
+    hits = [w for w in known if stem.startswith(w + "-")]
+    return max(hits, key=len) if hits else stem
 
 
 def argmax_key(probs):

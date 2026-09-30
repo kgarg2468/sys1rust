@@ -17,7 +17,7 @@ for f in sys.argv[1:]:
     pct = lambda v, q: sorted(v)[min(len(v) - 1, int(q * len(v)))]
     sp = sum(r["latency_ms"] > 2 * med[wl[r["id"]]] for r in rows) / len(rows)
     caches = [r.get("mlx_mb", {}).get("cache", 0) for r in rows]
-    print(f.split("results/")[1])
+    print(f.split("results/")[-1])
     print("  requests %d, req/s by minute %s" % (len(rows), " ".join("%.2f" % (n / 60) for n in per_min[:5])))
     print("  " + " ".join("%s %.0f/%.0f" % (s, pct(by[s], .5), pct(by[s], .95)) for s in ["s128_q1", "s512_q1", "s512_q10"]),
           "spikes %.2f%%" % (100 * sp), "cache first/max/last %s/%s/%s" % (caches[0], max(caches), caches[-1]))
