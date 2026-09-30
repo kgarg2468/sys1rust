@@ -3,9 +3,13 @@
 //! two rules this spec adds: budget overrides are refused, and a `model` naming another
 //! checkpoint is an error rather than a routing hint.
 
+mod py_repr;
+
 use crate::config::checkpoint_name;
 use axum::http::StatusCode;
 use serde_json::Value;
+
+pub use py_repr::py_repr;
 
 pub const MAX_QUESTIONS: usize = 64;
 pub const MAX_STATE_CHARS: usize = 50_000;
@@ -174,49 +178,23 @@ pub fn check_model(model: Option<&Value>, served_name: &str) -> Result<(), Rejec
     }
 }
 
-/// Python's `repr()` of a `str`, as used by upstream's `%r` in the option-count details:
-/// single quotes unless the text has a `'` and no `"`, with backslash, quote and control
-/// characters escaped. Printable non-ASCII is kept as-is, like Python 3.
-pub fn py_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push(quote);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if (c as u32) < 0x20 || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The question id in a 413 detail is Python's `repr`, escapes included.
     #[test]
-    fn py_repr_matches_python_quote_rules() {
-        assert_eq!(py_repr("pick"), "'pick'");
-        assert_eq!(py_repr("it's"), "\"it's\"");
-        assert_eq!(py_repr("say \"hi\""), "'say \"hi\"'");
-        assert_eq!(py_repr("both ' \""), "'both \\' \"'");
-        assert_eq!(py_repr("a\\b\n"), "'a\\\\b\\n'");
-        assert_eq!(py_repr("\x01"), "'\\x01'");
-        assert_eq!(py_repr("café"), "'café'");
+    fn option_limit_detail_uses_python_repr() {
+        let opts: serde_json::Map<String, Value> =
+            (0..101).map(|i| (format!("o{i}"), json!("x"))).collect();
+        let body = json!({"state": "s", "questions": {"zero\u{200b}width": {"type": "choice", "criteria": opts}}});
+        let e = validate_body(body.to_string().as_bytes(), "typed-decisions").unwrap_err();
+        assert_eq!(e.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            e.detail,
+            "too many choice options for 'zero\\u200bwidth' (101 > 100)"
+        );
     }
 
     #[test]

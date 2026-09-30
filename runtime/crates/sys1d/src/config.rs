@@ -22,6 +22,8 @@ pub const CHECKPOINTS: [(&str, &str); 3] = [
 
 /// Published ids a client may put in `model`. `convaiinnovations/laya` is deliberately absent,
 /// as upstream: it means "let the server choose", which here is the only checkpoint served.
+/// The CLI's `--model` has no such meaning and takes every repo in [`CHECKPOINTS`], see
+/// [`cli_checkpoint_name`].
 pub const PUBLISHED_MODEL_IDS: [(&str, &str); 2] = [
     ("convaiinnovations/laya-multilingual", "multilingual"),
     ("convaiinnovations/laya-typed-decisions", "typed-decisions"),
@@ -33,11 +35,13 @@ pub const PUBLISHED_MODEL_IDS: [(&str, &str); 2] = [
     about = "Local HTTP server for Laya System 1 decisions (POST /v1/systemone, GET /health)"
 )]
 pub struct Config {
-    /// Checkpoint to serve: `typed-decisions`, `multilingual`, `english`, a published repo id,
-    /// or a local checkpoint directory. Hub ids are only looked up in the local HF cache.
+    /// Checkpoint to serve: `typed-decisions`, `multilingual`, `english`, one of their repo
+    /// ids (`convaiinnovations/laya` is `english`), or a local checkpoint directory. Hub ids
+    /// are only looked up in the local HF cache.
     #[arg(long, env = "SYS1_MODEL", default_value = "typed-decisions")]
     pub model: String,
-    /// Use `snapshots/<sha>` of the cached repo instead of the newest snapshot.
+    /// Use `snapshots/<sha>` of the cached repo instead of the newest snapshot. A single
+    /// directory name: letters, digits, `.`, `_` and `-`, not `.` or `..`.
     #[arg(long, env = "SYS1_REVISION")]
     pub revision: Option<String>,
     /// Bind address. Upstream defaults to 0.0.0.0; this is a local runtime.
@@ -120,6 +124,35 @@ pub fn checkpoint_name(s: &str) -> Option<&'static str> {
         })
 }
 
+/// What `--model` accepts: everything [`checkpoint_name`] does, plus every checkpoint's repo
+/// id. On the command line `convaiinnovations/laya` selects the English checkpoint; only in a
+/// request's `model` field does it mean "let the server choose".
+pub fn cli_checkpoint_name(s: &str) -> Option<&'static str> {
+    let key = s.trim().to_ascii_lowercase();
+    checkpoint_name(&key).or_else(|| {
+        CHECKPOINTS
+            .iter()
+            .find(|(_, repo)| *repo == key)
+            .map(|(name, _)| *name)
+    })
+}
+
+/// A revision must name one directory under `snapshots/`: `..`, path separators or an empty
+/// name would resolve to a checkpoint outside the selected repo while `/health` and routing
+/// still report the requested one.
+pub fn check_revision(rev: &str) -> Result<()> {
+    let plain = rev
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if rev.is_empty() || rev == "." || rev == ".." || !plain {
+        bail!(
+            "invalid revision {rev:?}: expected a snapshot directory name \
+             (letters, digits, '.', '_' and '-')"
+        );
+    }
+    Ok(())
+}
+
 fn repo_of(name: &str) -> Option<&'static str> {
     CHECKPOINTS
         .iter()
@@ -142,10 +175,11 @@ pub struct ServedModel {
 /// Resolve `--model` / `--revision` to a checkpoint directory. Never downloads.
 pub fn resolve_served(model: &str, revision: Option<&str>) -> Result<ServedModel> {
     let model = model.trim();
-    if let Some(name) = checkpoint_name(model) {
+    if let Some(name) = cli_checkpoint_name(model) {
         let repo = repo_of(name).expect("every known name has a repo");
         let dir = match revision {
             Some(rev) => {
+                check_revision(rev)?;
                 let snap = hf_cache_dir()
                     .join(format!("models--{}", repo.replace('/', "--")))
                     .join("snapshots")
@@ -252,6 +286,49 @@ mod tests {
         );
         assert_eq!(checkpoint_name("convaiinnovations/laya"), None);
         assert_eq!(checkpoint_name("jev-1"), None);
+    }
+
+    #[test]
+    fn cli_model_takes_every_repo_id() {
+        assert_eq!(cli_checkpoint_name("english"), Some("english"));
+        assert_eq!(
+            cli_checkpoint_name("convaiinnovations/laya"),
+            Some("english")
+        );
+        assert_eq!(
+            cli_checkpoint_name(" Convaiinnovations/Laya-Multilingual "),
+            Some("multilingual")
+        );
+        assert_eq!(
+            cli_checkpoint_name("convaiinnovations/laya-typed-decisions"),
+            Some("typed-decisions")
+        );
+        assert_eq!(cli_checkpoint_name("jev-1"), None);
+        assert_eq!(cli_checkpoint_name("./laya"), None);
+    }
+
+    #[test]
+    fn revision_must_be_one_directory_name() {
+        assert!(check_revision("1a793eb568e6718f15941d08f85432581df534e3").is_ok());
+        assert!(check_revision("v1.2_rc-3").is_ok());
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../laya-multilingual/snapshots/abc",
+            "a/b",
+            "a\\b",
+            "é",
+        ] {
+            let e = check_revision(bad).unwrap_err();
+            assert!(
+                e.to_string().starts_with("invalid revision"),
+                "{bad:?}: {e}"
+            );
+        }
+        // Checked before the cache is touched, so a traversal never reaches the filesystem.
+        let e = resolve_served("typed-decisions", Some("../other/snapshots/x")).unwrap_err();
+        assert!(e.to_string().starts_with("invalid revision"), "{e}");
     }
 
     #[test]
