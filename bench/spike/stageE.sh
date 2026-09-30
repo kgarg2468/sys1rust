@@ -1,0 +1,18 @@
+#!/bin/bash
+# Stage E: the exact speed settings (dense local attention, last head layer pruned, unpadding)
+# against Python laya-mlx at its fastest (compiled, cache capped) and against our current default.
+# Two rounds in opposite order, so drift in machine state hits every contender.
+cd "$(dirname "${BASH_SOURCE[0]}")"
+S=20260929T140500
+export SYS1_MLX="f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad"
+./run_stage.sh $S-E \
+  "sys1rust mlx-env typed-decisions correctness 5 1" \
+  "sys1rust mlx-env typed-decisions timing 12 2" \
+  "laya-mlx mlx-fp16-opt-c512 typed-decisions timing 12 2" \
+  "sys1rust mlx-fp16-fast typed-decisions timing 12 2"
+./run_stage.sh $S-E2 \
+  "sys1rust mlx-fp16-fast typed-decisions timing 12 2" \
+  "laya-mlx mlx-fp16-opt-c512 typed-decisions timing 12 2" \
+  "sys1rust mlx-env typed-decisions timing 12 2" \
+  "sys1rust mlx-env typed-decisions short 5 5" \
+  "laya-mlx mlx-fp16-opt-c512 typed-decisions short 5 5"
