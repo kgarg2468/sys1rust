@@ -15,6 +15,7 @@ Limits today:
 
 - Building needs a prebuilt MLX 0.32.2, which currently comes from the `mlx` Python wheel. The built binary links it by path. A self-contained release is the next step.
 - The runtime finds models in the local Hugging Face cache. It does not download them.
+- A choice answer can differ from upstream's bytes. When two of its labels print as the same JSON key, such as `"1"` and `1`, upstream writes that key twice in `probabilities` and `sys1d` writes it once with the second label's probability. JSON parsers keep the last duplicate, so a client that parses the response gets the same object from both servers.
 - The GPU runs one forward pass at a time, so more clients do not get more throughput. `sys1d` holds up to `LAYA_MAX_CONCURRENT` requests at once (16 by default), one running and the rest waiting their turn. A request that arrives while all those slots are held is not queued. It gets `503` with `Retry-After: 1` at once, so clients must retry it.
 
 ## Supported models
