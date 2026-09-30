@@ -19,7 +19,6 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{fast, nn, ops, transforms, Array, Dtype, Stream};
 use safetensors::SafeTensors;
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Finite "minus infinity" for additive attention masks (safe in f16, no NaN rows).
@@ -31,8 +30,9 @@ const LOGIT_MASKED: f32 = -1e4;
 /// list, e.g. `f16gelu,mask=bool`). Defaults reproduce laya-r-mlx 914c9a7.
 #[derive(Debug, Clone)]
 struct Knobs {
-    /// `compiled`: split + GELU + gate compiled per shape (default). `plain`: no compile.
-    /// `shapeless`: split outside, GELU * gate compiled once for all shapes.
+    /// `shapeless` (default): split outside, GELU * gate compiled once for all shapes.
+    /// `compiled`: split + GELU + gate compiled per input shape, so one trace per distinct
+    /// `(rows, len)` that MLX never frees; for experiments only. `plain`: no compile.
     geglu: String,
     /// Fuse residual adds into the gemm with `addmm` (default) or use matmul + add.
     addmm: bool,
@@ -51,7 +51,10 @@ struct Knobs {
     /// Linear weights: `view` keeps the host-loaded `[out, in]` array behind a transposed view
     /// (default); `gpu` copies it on the GPU first; `t` stores a GPU-written contiguous `[in, out]`.
     wcopy: String,
-    /// Keep GELU in the compute dtype (fixes the upstream f16 -> f32 promotion).
+    /// Keep GELU in the compute dtype (fixes the upstream f16 -> f32 promotion). Off by
+    /// default like every knob here, so that `BackendOptions::default()` reproduces upstream's
+    /// numerics and the bench's `mlx-fp16` control variant measures the promotion. Everything
+    /// that serves answers (`sys1d`, the other bench variants) sets `f16gelu`.
     f16gelu: bool,
     /// Pad the sequence length up to the first of these that fits (`buckets=128:256:512`).
     buckets: Vec<usize>,
@@ -69,7 +72,7 @@ struct Knobs {
 impl Knobs {
     fn from_spec(tuning: Option<&str>) -> Self {
         let mut k = Knobs {
-            geglu: "compiled".into(),
+            geglu: "shapeless".into(),
             addmm: true,
             bool_mask: false,
             windowed: true,
@@ -137,6 +140,12 @@ type CompiledFn = Box<dyn for<'a> FnMut(&'a [Array]) -> std::result::Result<Vec<
 ///
 /// Unfused, the split + five elementwise passes cost ~0.8 ms per layer at 4x512 tokens;
 /// compiled they cost ~0.08 ms. The compiled state is not thread-safe, hence the mutex.
+///
+/// The default is the shapeless trace: GELU * gate is elementwise, so one trace serves every
+/// input shape and the split (which needs concrete shapes) happens outside as two views. Paired
+/// A/B on the timing workload against the per-shape trace, `f16gelu,cache=512,wired=2048`:
+/// 1.002 on typed-decisions, identical answers. The per-shape mode (`geglu=compiled`) stays
+/// for experiments; MLX keeps one trace per distinct input shape for the life of the process.
 struct GeGlu {
     mode: String,
     keep: bool,
@@ -163,7 +172,8 @@ impl GeGlu {
                     let ig = a[0].split_equal(2, -1).expect("geglu split");
                     vec![ops::multiply(gelu_erf_as(&ig[0], keep).expect("gelu"), &ig[1]).expect("geglu gate")]
                 },
-                // Not shapeless: `split` needs concrete shapes; MLX caches one trace per input shape.
+                // Not shapeless: `split` needs concrete shapes; MLX caches one trace per input
+                // shape and never drops one, which is why this is not the default.
                 false,
             ))
         };
@@ -380,16 +390,36 @@ pub struct MlxBackend {
     knobs: Knobs,
 }
 
-/// Per-length constants reused across forwards.
+/// Constants reused across forwards. Nothing here is keyed by request shape.
+///
+/// The dense window masks are one array each, for the longest length seen so far; shorter
+/// lengths take a view of it (see [`MlxBackend::window_mask`]). One mask per distinct length
+/// would pile up: without length buckets, a server seeing every length up to 1,024 would hold
+/// about 700 MB of masks that nothing frees. The gather indices of the windowed path are built
+/// inside the forward graph instead ([`window_key_idx`]), so they need no cache at all.
 #[derive(Default)]
 struct Caches {
-    /// Dense sliding-window additive masks `[1, 1, len, len]`.
-    window_masks: HashMap<usize, Array>,
-    /// Flat key gather indices `[n * H * n_chunks * 3S]` into `[n * H * len, hd]` rows for
-    /// the windowed path, keyed by `(n, len)`.
-    key_idx: HashMap<(usize, usize), Array>,
-    /// Boolean sliding-window masks `[1, 1, len, len]` (`mask=bool`).
-    window_bool: HashMap<usize, Array>,
+    /// Dense sliding-window additive mask `[1, 1, L, L]` for the longest `L` so far.
+    window_mask: Option<Array>,
+    /// Boolean sliding-window mask `[1, 1, L, L]` for the longest `L` so far (`mask=bool`).
+    window_bool: Option<Array>,
+}
+
+/// Flat key gather indices `[rows * nc * 3S]` into the `[rows * len, hd]` view of the keys for
+/// the windowed path: chunk `c` of row `r` gathers positions `(c - 1) * S + j` for `j < 3S`,
+/// clamped into `0..len` (the mask hides the clamped slots), as `r * len + pos`. Two small host
+/// tables and one broadcast add on the device, part of the forward graph: no per-shape cache
+/// and no early evaluation.
+fn window_key_idx(s: usize, rows: usize, len: usize, nc: usize) -> Result<Array> {
+    let ks = 3 * s;
+    let pos: Vec<u32> = (0..nc)
+        .flat_map(|c| (0..ks).map(move |j| (c as i64 - 1) * s as i64 + j as i64))
+        .map(|p| p.clamp(0, len as i64 - 1) as u32)
+        .collect();
+    let pos = Array::from_slice(&pos, &[1, nc as i32, ks as i32]);
+    let base: Vec<u32> = (0..rows as u32).map(|r| r * len as u32).collect();
+    let base = Array::from_slice(&base, &[rows as i32, 1, 1]);
+    ops::add(&base, &pos).lx()?.reshape(&[(rows * nc * ks) as i32]).lx()
 }
 
 /// How local (sliding-window) layers attend for the current batch shape.
@@ -649,25 +679,7 @@ impl MlxBackend {
             let (n, len) = (batch.n, batch.len);
             let nc = len.div_ceil(s);
             let ks = 3 * s;
-            let rows = n * self.n_heads;
-            let mut caches = self.lock_caches()?;
-            let key_idx = match caches.key_idx.get(&(n, len)) {
-                Some(a) => a.clone(),
-                None => {
-                    let idx: Vec<u32> = (0..rows)
-                        .flat_map(|r| (0..nc).map(move |c| (r, c)))
-                        .flat_map(|(r, c)| {
-                            (0..ks).map(move |j| (r, (c as i64 - 1) * s as i64 + j as i64))
-                        })
-                        .map(|(r, pos)| (r * len) as u32 + pos.clamp(0, len as i64 - 1) as u32)
-                        .collect();
-                    let a = Array::from_slice(&idx, &[(rows * nc * ks) as i32]);
-                    a.eval().lx()?;
-                    caches.key_idx.insert((n, len), a.clone());
-                    a
-                }
-            };
-            drop(caches);
+            let key_idx = window_key_idx(s, n * self.n_heads, len, nc)?;
             // Key validity per (row, chunk, key slot): in range and not padding.
             let mut vals = vec![MASK_NEG; n * nc * ks];
             for b in 0..n {
@@ -710,22 +722,22 @@ impl MlxBackend {
             .map_err(|_| Error::Backend("mask cache poisoned".into()))
     }
 
-    /// Boolean sliding-window mask `[1, 1, len, len]` (true = may attend), cached per `len`.
+    /// Boolean sliding-window mask `[1, 1, len, len]` (true = may attend); see
+    /// [`Self::window_mask`] for the caching.
     fn window_mask_bool(&self, len: usize) -> Result<Array> {
         let mut caches = self.lock_caches()?;
-        if let Some(m) = caches.window_bool.get(&len) {
-            return Ok(m.clone());
-        }
-        let mut vals = vec![false; len * len];
-        for i in 0..len {
-            for j in 0..len {
-                vals[i * len + j] = i.abs_diff(j) <= self.window;
+        if caches.window_bool.as_ref().is_none_or(|m| (m.dim(2) as usize) < len) {
+            let mut vals = vec![false; len * len];
+            for i in 0..len {
+                for j in 0..len {
+                    vals[i * len + j] = i.abs_diff(j) <= self.window;
+                }
             }
+            let m = Array::from_slice(&vals, &[1, 1, len as i32, len as i32]);
+            m.eval().lx()?;
+            caches.window_bool = Some(m);
         }
-        let m = Array::from_slice(&vals, &[1, 1, len as i32, len as i32]);
-        m.eval().lx()?;
-        caches.window_bool.insert(len, m.clone());
-        Ok(m)
+        Ok(Self::window_view(caches.window_bool.as_ref().expect("set above"), len))
     }
 
     /// `residual + x @ W^T (+ b)`, fused into the gemm unless `addmm=0`.
@@ -736,26 +748,40 @@ impl MlxBackend {
         ops::add(&l.apply(x)?, residual).lx()
     }
 
-    /// Additive sliding-window mask `[1, 1, len, len]`, cached per `len`.
+    /// Additive sliding-window mask `[1, 1, len, len]`. Whether `i` may see `j` depends on
+    /// `|i - j|` alone, so the mask for `len` is the top-left corner of any longer one: one
+    /// array for the longest length so far is kept and shorter lengths get a view of it.
+    ///
+    /// The new mask is evaluated here, on purpose: the cached array is shared by every later
+    /// forward and must hold data, not a graph node those forwards would all point into. This
+    /// happens once per new longest length, a few times in the life of a server.
     fn window_mask(&self, len: usize) -> Result<Array> {
         let mut caches = self.lock_caches()?;
-        if let Some(m) = caches.window_masks.get(&len) {
-            return Ok(m.clone());
-        }
-        let mut vals = vec![0f32; len * len];
-        for i in 0..len {
-            for j in 0..len {
-                if i.abs_diff(j) > self.window {
-                    vals[i * len + j] = MASK_NEG;
+        if caches.window_mask.as_ref().is_none_or(|m| (m.dim(2) as usize) < len) {
+            let mut vals = vec![0f32; len * len];
+            for i in 0..len {
+                for j in 0..len {
+                    if i.abs_diff(j) > self.window {
+                        vals[i * len + j] = MASK_NEG;
+                    }
                 }
             }
+            let m = Array::from_slice(&vals, &[1, 1, len as i32, len as i32])
+                .as_dtype(self.dtype)
+                .lx()?;
+            m.eval().lx()?;
+            caches.window_mask = Some(m);
         }
-        let m = Array::from_slice(&vals, &[1, 1, len as i32, len as i32])
-            .as_dtype(self.dtype)
-            .lx()?;
-        m.eval().lx()?;
-        caches.window_masks.insert(len, m.clone());
-        Ok(m)
+        Ok(Self::window_view(caches.window_mask.as_ref().expect("set above"), len))
+    }
+
+    /// The `[1, 1, len, len]` corner of a `[1, 1, L, L]` window mask, `L >= len`.
+    fn window_view(m: &Array, len: usize) -> Array {
+        if m.dim(2) as usize == len {
+            m.clone()
+        } else {
+            m.index((.., .., ..len as i32, ..len as i32))
+        }
     }
 
     /// Sliding-window attention by chunks. Queries `[n, H, len, hd]` are padded to a multiple
@@ -1047,5 +1073,51 @@ impl Backend for MlxBackend {
             enc.eval().lx()?;
             Ok(Some(host_f32(&enc)?))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One window mask serves every shorter length as a view with the same values.
+    #[test]
+    fn window_view_is_the_corner_of_the_longer_mask() {
+        let full = window_mask_values(8, 2);
+        let m = Array::from_slice(&full, &[1, 1, 8, 8]);
+        assert_eq!(MlxBackend::window_view(&m, 8).as_slice::<f32>(), &full[..]);
+        let corner = MlxBackend::window_view(&m, 5).contiguous().unwrap();
+        assert_eq!(corner.shape(), &[1, 1, 5, 5]);
+        assert_eq!(corner.as_slice::<f32>(), &window_mask_values(5, 2)[..]);
+    }
+
+    /// Reference values of the additive window mask for `len` and window `w`.
+    fn window_mask_values(len: usize, w: usize) -> Vec<f32> {
+        let mut vals = vec![0f32; len * len];
+        for i in 0..len {
+            for j in 0..len {
+                if i.abs_diff(j) > w {
+                    vals[i * len + j] = MASK_NEG;
+                }
+            }
+        }
+        vals
+    }
+
+    /// The device-built gather indices are the ones the host loop used to build and cache:
+    /// `r * len + clamp((c - 1) * S + j, 0, len - 1)`, row-major over `(r, c, j)`.
+    #[test]
+    fn window_key_idx_matches_the_host_formula() {
+        for (s, rows, len) in [(2usize, 3usize, 7usize), (4, 1, 4), (64, 2, 130)] {
+            let nc = len.div_ceil(s);
+            let want: Vec<u32> = (0..rows)
+                .flat_map(|r| (0..nc).map(move |c| (r, c)))
+                .flat_map(|(r, c)| (0..3 * s).map(move |j| (r, (c as i64 - 1) * s as i64 + j as i64)))
+                .map(|(r, pos)| (r * len) as u32 + pos.clamp(0, len as i64 - 1) as u32)
+                .collect();
+            let got = window_key_idx(s, rows, len, nc).unwrap();
+            assert_eq!(got.shape(), &[(rows * nc * 3 * s) as i32]);
+            assert_eq!(got.as_slice::<u32>(), &want[..], "s={s} rows={rows} len={len}");
+        }
     }
 }

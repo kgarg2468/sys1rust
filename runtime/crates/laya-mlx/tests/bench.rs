@@ -1,4 +1,5 @@
-//! Repeated-forward timing of the MLX backend on the fixture cases (ignored by default).
+//! Repeated-forward timing of the MLX backend on the fixture cases (ignored by default; a
+//! missing fixture or checkpoint fails loudly when run with `--ignored`).
 //! Run with: `cargo test -p laya-mlx --release --test bench -- --ignored --nocapture`.
 
 use laya_core::testing::fixtures_path;
@@ -6,13 +7,11 @@ use laya_core::{parse_questions, Agent, BackendOptions};
 use serde_json::Value;
 
 fn bench(fixture: &str, subfolder: Option<&str>, opts: &BackendOptions) {
-    let Ok(bytes) = std::fs::read(fixtures_path(fixture)) else {
-        return;
-    };
+    let path = fixtures_path(fixture);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
     let fx: Value = serde_json::from_slice(&bytes).unwrap();
-    let Ok(dir) = laya_core::resolve::resolve_model_dir("convaiinnovations/laya", subfolder) else {
-        return;
-    };
+    let dir = laya_core::resolve::resolve_model_dir("convaiinnovations/laya", subfolder)
+        .unwrap_or_else(|e| panic!("checkpoint convaiinnovations/laya {subfolder:?}: {e}"));
     let agent = Agent::load(&dir, opts, laya_mlx::factory()).unwrap();
     println!("{} [{}]", fixture, agent.backend_name());
     for case in fx["cases"].as_array().unwrap() {
