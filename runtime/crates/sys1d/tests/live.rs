@@ -1,10 +1,12 @@
 //! Live end-to-end test (ignored by default; needs the typed-decisions checkpoint at the
 //! revision pinned in `bench/models.lock.json` in the HF cache, `source bench/env.sh` first).
-//! Starts the real `sys1d` binary on port 0 at that revision, posts every request in
-//! `bench/workloads/smoke.jsonl`, checks the answers against an in-process `Agent::predict`
-//! of the same revision and against the fp32 CPU reference (key sets and order, every numeric
-//! field within a tolerance, categorical agreement), then stops it with SIGINT. The child is
-//! killed if the test fails or hangs at any point.
+//! Starts the real `sys1d` binary on port 0 at that revision with every server setting
+//! pinned (the caller's environment cannot change them), posts every request in
+//! `bench/workloads/smoke.jsonl`, requires each answer to equal an in-process
+//! `Agent::predict` of the same revision and engine settings byte for byte, checks it against
+//! the fp32 CPU reference (key sets and order, every numeric field within a tolerance,
+//! categorical agreement), then stops it with SIGINT. The child is killed if the test fails
+//! or hangs at any point.
 //!
 //! Run from the repository root with:
 //! `cargo test --manifest-path runtime/Cargo.toml -p sys1d --release --test live -- --ignored --nocapture`
@@ -14,18 +16,21 @@ mod common;
 use common::{build_request, read_response, send, Resp};
 use laya_core::{Agent, BackendOptions};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use sys1d::config::{DEFAULT_MAX_CONCURRENT, DEFAULT_TUNING};
 use tokio::net::TcpStream;
 
 /// Upstream's name for the served checkpoint, and its key in `bench/models.lock.json`.
 const MODEL: &str = "typed-decisions";
+/// Rows in `bench/workloads/smoke.jsonl`, and answer rows in its reference file. Asserted, so
+/// a smoke set that loses rows cannot pass by checking fewer requests.
+const SMOKE_REQUESTS: usize = 24;
 
-/// Served (f16 on the GPU) against in-process with the same engine: the same numbers.
-const SAME_ENGINE_TOL: f64 = 1e-3;
 /// Served (f16 GPU) against the fp32 CPU reference, for `probabilities`, `noul`,
 /// `confidence`, `answer_confidence` and `action.act_probability`. Measured over the 120
 /// smoke answers: 0.0008, 0.0008, 0.0009 and 0.0000 (`results/SERVER.md`). 2.5x the largest
@@ -125,20 +130,60 @@ fn field_diff(a: &Value, b: &Value, key: &str) -> Option<f64> {
     Some((x - b[key].as_f64().unwrap_or(f64::NAN)).abs())
 }
 
+/// Every environment variable the server's configuration reads, taken from the clap
+/// definition so the list cannot fall behind `config.rs`.
+fn config_env_vars() -> Vec<String> {
+    use clap::CommandFactory;
+    sys1d::Config::command()
+        .get_arguments()
+        .filter_map(|a| a.get_env().map(|e| e.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// The introspection above sees the settings this test depends on.
+#[test]
+fn config_env_vars_are_known() {
+    let vars = config_env_vars();
+    for name in ["LAYA_API_KEY", "SYS1_F32", "SYS1_MLX_TUNING", "SYS1_MODEL"] {
+        assert!(vars.iter().any(|v| v == name), "{name} not in {vars:?}");
+    }
+    assert_eq!(vars.iter().collect::<BTreeSet<_>>().len(), vars.len());
+}
+
 /// The `sys1d` child. Dropping it kills the process if it is still running, so a failed
 /// assertion or a timeout never leaves a server holding the model and GPU memory.
 struct Server(Child);
 
 impl Server {
-    /// Start the binary on a free port, serving `MODEL` at snapshot `revision`.
+    /// Start the binary on a free port, serving `MODEL` at snapshot `revision`. Every server
+    /// setting is pinned on the command line and its variable removed from the child's
+    /// environment: an inherited `LAYA_API_KEY` would answer these unauthenticated requests
+    /// with 401, and `SYS1_F32` or `SYS1_MLX_TUNING` would give the child an engine the
+    /// in-process agent below does not have.
     fn spawn(revision: &str) -> Server {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sys1d"));
+        for var in config_env_vars() {
+            cmd.env_remove(var);
+        }
         Server(
-            Command::new(env!("CARGO_BIN_EXE_sys1d"))
-                .args(["--port", "0", "--model", MODEL, "--revision", revision])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .expect("spawn sys1d"),
+            cmd.args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--model",
+                MODEL,
+                "--revision",
+                revision,
+                "--tuning",
+                DEFAULT_TUNING,
+                "--max-concurrent",
+                &DEFAULT_MAX_CONCURRENT.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn sys1d"),
         )
     }
 
@@ -204,10 +249,22 @@ impl Drop for Server {
 async fn smoke_workload_through_the_real_server() {
     let bench = bench_root();
     let workload = read_jsonl(&bench.join("workloads/smoke.jsonl"));
-    let reference = read_jsonl(&bench.join("reference/typed-decisions/smoke.jsonl"));
-    assert!(!workload.is_empty());
-    // The reference was produced from the pinned revision; serve and load that same one.
+    assert_eq!(workload.len(), SMOKE_REQUESTS, "smoke workload rows");
+    // The reference file is one `meta` row (the run that produced it) and one `result` row
+    // per smoke request. The reference was produced from the pinned revision; serve and load
+    // that same one.
     let sha = pinned_sha(&bench, MODEL);
+    let reference = read_jsonl(&bench.join("reference/typed-decisions/smoke.jsonl"));
+    let meta = reference
+        .iter()
+        .find(|r| r["type"] == "meta")
+        .expect("reference meta row");
+    assert_eq!(
+        meta["model_sha"], sha,
+        "reference revision is the pinned one"
+    );
+    let reference: Vec<&Value> = reference.iter().filter(|r| r["type"] == "result").collect();
+    assert_eq!(reference.len(), SMOKE_REQUESTS, "reference answer rows");
 
     // Start the binary on a free port and parse its ready line.
     let t0 = Instant::now();
@@ -281,52 +338,64 @@ async fn smoke_workload_through_the_real_server() {
     let exit = server.stop();
     assert_eq!(exit.code(), Some(0), "clean shutdown exit code");
 
-    // In-process answers from the same revision with the same engine settings must match the
-    // served ones. Resolve it the way the binary did, so both sides read one snapshot.
+    // In-process answers from the same revision with the same engine settings (the ones
+    // pinned on the child's command line: the default tuning, f16) must equal the served
+    // ones byte for byte. Resolve it the way the binary did, so both sides read one snapshot.
     let local_model = sys1d::config::resolve_served(MODEL, Some(&sha)).unwrap();
     assert_eq!(local_model.revision.as_deref(), Some(sha.as_str()));
     let dir = local_model.dir;
     let opts = BackendOptions {
-        tuning: Some(sys1d::config::DEFAULT_TUNING.into()),
+        f32: false,
+        tuning: Some(DEFAULT_TUNING.into()),
         ..Default::default()
     };
     let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend)).unwrap();
-    let mut exact = 0usize;
-    let mut worst = 0.0f64;
     for (row, (id, over_http)) in workload.iter().zip(&served) {
         let local = agent
             .predict(&row["body"]["state"], &row["body"]["questions"])
             .unwrap();
         assert_eq!(local["usage"], over_http["usage"], "{id}");
-        let (la, ha) = (
-            local["answers"].as_object().unwrap(),
-            over_http["answers"].as_object().unwrap(),
-        );
-        assert_eq!(la.len(), ha.len(), "{id}");
-        if local["answers"] == over_http["answers"] {
-            exact += 1;
-        }
-        for (qid, a) in la {
-            let b = &ha[qid];
-            assert_eq!(
-                categorical(a),
-                categorical(b),
-                "{id}/{qid}: served {b} vs in-process {a}"
+        if local["answers"] != over_http["answers"] {
+            // Name the question and the size of the gap before failing.
+            let (la, ha) = (
+                local["answers"].as_object().unwrap(),
+                over_http["answers"].as_object().unwrap(),
             );
-            let d = max_prob_diff(a, b);
-            assert!(d <= SAME_ENGINE_TOL, "{id}/{qid}: probability diff {d}");
-            worst = worst.max(d);
+            for (qid, a) in la {
+                let b = &ha[qid];
+                if a != b {
+                    panic!(
+                        "{id}/{qid}: served answer differs from Agent::predict (probability diff {:.2e}): served {b} in-process {a}",
+                        max_prob_diff(a, b)
+                    );
+                }
+            }
+            panic!(
+                "{id}: answers differ: served {} in-process {}",
+                over_http["answers"], local["answers"]
+            );
         }
     }
     eprintln!(
-        "in-process agreement: {}/{} requests byte-identical answers, max probability diff {worst:.2e}",
-        exact,
+        "in-process agreement: {}/{} requests byte-identical answers",
+        served.len(),
         served.len()
     );
 
-    // Against the fp32 CPU reference: every answer has the reference's key set in the
-    // reference's order, every numeric field is within its tolerance, and the categorical
-    // answer (argmax choice, rounded score, noul side) agrees on at least 99% of answers.
+    // Against the fp32 CPU reference: every reference request was served, every answer has
+    // the reference's key set in the reference's order, every numeric field is within its
+    // tolerance, and the categorical answer (argmax choice, rounded score, noul side) agrees
+    // on at least 99% of answers.
+    let served_ids: BTreeSet<&str> = served.iter().map(|(id, _)| id.as_str()).collect();
+    let reference_ids: BTreeSet<&str> = reference
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        served_ids, reference_ids,
+        "every reference request is served, once"
+    );
+    assert_eq!(served_ids.len(), SMOKE_REQUESTS);
     let mut agree = 0usize;
     let mut total = 0usize;
     let mut disagreements = Vec::new();
