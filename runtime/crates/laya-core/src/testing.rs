@@ -110,10 +110,6 @@ impl ParityReport {
     pub fn decision_mismatches(&self) -> usize {
         self.cases.iter().map(|c| c.decision_mismatches).sum()
     }
-    /// Same as [`ParityReport::decision_mismatches`]; the name the laya-mlx parity test uses.
-    pub fn choice_mismatches(&self) -> usize {
-        self.decision_mismatches()
-    }
     pub fn all_answers_equal(&self) -> bool {
         self.cases.iter().all(|c| c.answers_equal)
     }
