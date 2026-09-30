@@ -45,8 +45,8 @@ The paired timing runs put 10q @512 at 483 to 496 ms on AC, the same as the spik
 
 ## Correctness checks
 
-- `cargo test -p sys1d` runs 8 unit tests and 19 HTTP tests against a fake model. They cover auth, every limit, every error code, admission (`503` with `Retry-After: 1`), a panic in inference, and a client that disconnects while its request waits.
-- A live test (`cargo test -p sys1d --test live -- --ignored`) sends 24 requests to the real model. The HTTP answers are byte-identical to in-process `predict`. All 120 answers have the reference's key order, the largest probability difference is 0.0008, and 39 of 39 choices match.
+- `cargo test --manifest-path runtime/Cargo.toml -p sys1d` runs 8 unit tests and 19 HTTP tests against a fake model. They cover auth, every limit, every error code, admission (`503` with `Retry-After: 1`), a panic in inference, and a client that disconnects while its request waits.
+- A live test (`cargo test --manifest-path runtime/Cargo.toml -p sys1d --release --test live -- --ignored`) sends 24 requests to the real model. The HTTP answers are byte-identical to in-process `predict`. All 120 answers have the reference's key order, the largest probability difference is 0.0008, and 39 of 39 choices match.
 - The correctness workload over HTTP: 300 requests with 0 errors. 1,498 of 1,500 answers agree with the reference, and gold accuracy is 75.8%, the same as in-process.
 
 Building the server found two bugs in the runtime, fixed in e758bfa.
