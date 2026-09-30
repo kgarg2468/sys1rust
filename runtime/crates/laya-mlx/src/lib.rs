@@ -52,7 +52,8 @@ struct Knobs {
     geglu: String,
     /// Fuse residual adds into the gemm with `addmm` (default) or use matmul + add.
     addmm: bool,
-    /// Boolean attention masks (as Python laya-mlx) instead of additive f16 masks.
+    /// Boolean attention masks (as Python laya-mlx) instead of additive f16 masks, on every
+    /// path of the forward: key padding, dense and chunked local attention, and the head.
     bool_mask: bool,
     /// Chunked sliding-window attention for long inputs (default) or dense masks always.
     windowed: bool,
@@ -354,21 +355,64 @@ fn gelu_erf_as(x: &Array, keep_dtype: bool) -> std::result::Result<Array, Except
     ops::multiply(ops::multiply(x, c(0.5)?)?, ops::add(&e, c(1.0)?)?)
 }
 
-/// Chunk-local band mask `[1, 1, 1, S, 3S]`: query `i` of a chunk may see gathered key slot
+/// The chunk-local band, `[S, 3S]` row-major: query `i` of a chunk may see gathered key slot
 /// `j` (global offset `j - S` relative to the chunk start) iff `|S + i - j| <= S`.
-fn band_mask(s: usize, dtype: Dtype) -> Result<Array> {
+fn band_allows(s: usize) -> Vec<bool> {
     let ks = 3 * s;
-    let mut vals = vec![MASK_NEG; s * ks];
+    let mut vals = vec![false; s * ks];
     for i in 0..s {
         for j in i..=i + 2 * s {
-            vals[i * ks + j] = 0.0;
+            vals[i * ks + j] = true;
         }
     }
-    let m = Array::from_slice(&vals, &[1, 1, 1, s as i32, ks as i32])
+    vals
+}
+
+/// Additive chunk-local band mask `[1, 1, 1, S, 3S]` (0 where [`band_allows`], else `MASK_NEG`).
+fn band_mask(s: usize, dtype: Dtype) -> Result<Array> {
+    let vals: Vec<f32> = band_allows(s).iter().map(|&ok| if ok { 0.0 } else { MASK_NEG }).collect();
+    let m = Array::from_slice(&vals, &[1, 1, 1, s as i32, 3 * s as i32])
         .as_dtype(dtype)
         .lx()?;
     m.eval().lx()?;
     Ok(m)
+}
+
+/// Boolean chunk-local band mask `[1, 1, 1, S, 3S]` (true where [`band_allows`]), for `mask=bool`.
+fn band_mask_bool(s: usize) -> Result<Array> {
+    let m = Array::from_slice(&band_allows(s), &[1, 1, 1, s as i32, 3 * s as i32]);
+    m.eval().lx()?;
+    Ok(m)
+}
+
+/// Key validity of the chunked path, `[n, nc, 3S]` row-major: gathered slot `j` of chunk `c`
+/// holds position `(c - 1) * S + j`, valid when that lies in `0..len` and is not padding.
+fn window_key_valid(attention_mask: &[u32], n: usize, len: usize, s: usize, nc: usize) -> Vec<bool> {
+    let ks = 3 * s;
+    let mut ok = vec![false; n * nc * ks];
+    for b in 0..n {
+        for c in 0..nc {
+            for j in 0..ks {
+                let pos = (c as i64 - 1) * s as i64 + j as i64;
+                ok[(b * nc + c) * ks + j] =
+                    pos >= 0 && (pos as usize) < len && attention_mask[b * len + pos as usize] == 1;
+            }
+        }
+    }
+    ok
+}
+
+/// Padded queries of the chunked path, `[n, nc, S]` row-major: query `i` of chunk `c` is
+/// position `c * S + i`, padded when it is past `len` (the tail of the last chunk when `len` is
+/// not a multiple of `S`) or padding in its row.
+fn window_query_padded(attention_mask: &[u32], n: usize, len: usize, s: usize, nc: usize) -> Vec<bool> {
+    let mut padded = vec![true; n * nc * s];
+    for b in 0..n {
+        for pos in 0..len {
+            padded[b * nc * s + pos] = attention_mask[b * len + pos] != 1;
+        }
+    }
+    padded
 }
 
 /// Cast to f32 and force a row-contiguous layout so the result can be read from the host.
@@ -529,7 +573,8 @@ pub struct MlxBackend {
     scorer_norm: Norm,
     scorer1: Linear,
     scorer3: Linear,
-    /// Chunk-local band mask `[1, 1, 1, S, 3S]` for the windowed attention path.
+    /// Chunk-local band mask `[1, 1, 1, S, 3S]` for the windowed attention path: additive, or
+    /// boolean with `mask=bool`.
     band: Array,
     caches: Mutex<Caches>,
     geglu: GeGlu,
@@ -569,9 +614,10 @@ fn window_key_idx(s: usize, rows: usize, len: usize, nc: usize) -> Result<Array>
     ops::add(&base, &pos).lx()?.reshape(&[(rows * nc * ks) as i32]).lx()
 }
 
-/// How local (sliding-window) layers attend for the current batch shape.
+/// How local (sliding-window) layers attend for the current batch shape. Every mask here is
+/// additive, or boolean (true = may attend) with `mask=bool`.
 enum LocalAttn {
-    /// Full `len x len` attention with an additive pad + window mask `[n, 1, len, len]`.
+    /// Full `len x len` attention with a pad + window mask `[n, 1, len, len]`.
     Dense(Array),
     /// Chunked attention: every 64-query chunk attends to the 192 keys that can fall inside
     /// its window (previous, own and next chunk); see [`MlxBackend::windowed_attention`].
@@ -582,14 +628,14 @@ enum LocalAttn {
 struct Windowed {
     /// Flat key gather indices `[n * H * n_chunks * 3S]` into `[n * H * len, hd]` rows.
     key_idx: Array,
-    /// Additive pad + band mask `[n * H, n_chunks, S, 3S]`.
+    /// Pad + band mask `[n * H, n_chunks, S, 3S]`.
     mask: Array,
     n_chunks: i32,
 }
 
 /// Masks shared by every encoder layer of one forward pass.
 struct AttnCtx {
-    /// Additive key-padding mask `[n, 1, 1, len]`.
+    /// Key-padding mask `[n, 1, 1, len]`.
     pad: Array,
     local: LocalAttn,
 }
@@ -806,7 +852,11 @@ impl MlxBackend {
                 scorer_norm: loader.norm("scorer.0.weight", Some("scorer.0.bias"), 1e-5)?,
                 scorer1: loader.linear("scorer.1.weight", Some("scorer.1.bias"))?,
                 scorer3: loader.linear("scorer.3.weight", Some("scorer.3.bias"))?,
-                band: band_mask(enc.local_attention / 2, dtype)?,
+                band: if knobs.bool_mask {
+                    band_mask_bool(enc.local_attention / 2)?
+                } else {
+                    band_mask(enc.local_attention / 2, dtype)?
+                },
                 caches: Mutex::new(Caches::default()),
                 geglu: GeGlu::new(&knobs.geglu, knobs.f16gelu),
                 knobs: knobs.clone(),
@@ -905,74 +955,70 @@ impl MlxBackend {
     }
 
     /// Masks for this batch: dense window masks for short inputs, chunked gather indices and
-    /// masks once the sequence is long enough for windowing to pay off.
+    /// masks once the sequence is long enough for windowing to pay off. With `mask=bool` every
+    /// mask is boolean, whichever path the length takes.
     fn attn_ctx(&self, batch: &Batch) -> Result<AttnCtx> {
         let has_local = self.layers.iter().any(|l| l.local);
-        let s = self.window;
-        let dense_upto = self.knobs.dense_upto.unwrap_or(4 * s);
+        let dense_upto = self.knobs.dense_upto.unwrap_or(4 * self.window);
         let windowed = self.knobs.windowed && batch.len > dense_upto;
-        if self.knobs.bool_mask && !windowed {
-            let (n, len) = (batch.n as i32, batch.len as i32);
-            let valid = Array::from_slice(&batch.attention_mask, &[n, len])
+        let (n, len) = (batch.n as i32, batch.len as i32);
+        let pad = if self.knobs.bool_mask {
+            Array::from_slice(&batch.attention_mask, &[n, 1, 1, len])
                 .as_dtype(Dtype::Bool)
-                .lx()?;
-            let pad = valid.reshape(&[n, 1, 1, len]).lx()?;
-            let local = if has_local {
-                // Padded queries may see every valid key so no softmax row is fully masked
-                // (as Python laya-mlx); they are never used as keys or outputs.
-                let pad_q = ops::logical_not(&valid.reshape(&[n, 1, len, 1]).lx()?).lx()?;
-                let band = self.window_mask_bool(batch.len)?;
-                ops::logical_and(&ops::logical_or(&band, &pad_q).lx()?, &pad).lx()?
-            } else {
-                pad.clone()
-            };
-            return Ok(AttnCtx {
-                pad,
-                local: LocalAttn::Dense(local),
-            });
-        }
-        let pad = self.pad_mask(batch)?;
+                .lx()?
+        } else {
+            self.pad_mask(batch)?
+        };
         let local = if !has_local {
             LocalAttn::Dense(pad.clone())
         } else if windowed {
-            let (n, len) = (batch.n, batch.len);
-            let nc = len.div_ceil(s);
-            let ks = 3 * s;
-            let key_idx = window_key_idx(s, n * self.n_heads, len, nc)?;
-            // Key validity per (row, chunk, key slot): in range and not padding.
-            let mut vals = vec![MASK_NEG; n * nc * ks];
-            for b in 0..n {
-                for c in 0..nc {
-                    for j in 0..ks {
-                        let pos = (c as i64 - 1) * s as i64 + j as i64;
-                        if pos >= 0
-                            && (pos as usize) < len
-                            && batch.attention_mask[b * len + pos as usize] == 1
-                        {
-                            vals[(b * nc + c) * ks + j] = 0.0;
-                        }
-                    }
-                }
-            }
-            let (n, nc, ks, s) = (n as i32, nc as i32, ks as i32, s as i32);
-            let valid = Array::from_slice(&vals, &[n, 1, nc, 1, ks])
-                .as_dtype(self.dtype)
-                .lx()?;
-            let h = self.n_heads as i32;
-            let mask = ops::add(&valid, &self.band).lx()?;
-            let mask = ops::broadcast_to(&mask, &[n, h, nc, s, ks])
-                .lx()?
-                .reshape(&[n * h, nc, s, ks])
-                .lx()?;
-            LocalAttn::Windowed(Windowed {
-                key_idx,
-                mask,
-                n_chunks: nc,
-            })
+            LocalAttn::Windowed(self.windowed_ctx(batch)?)
+        } else if self.knobs.bool_mask {
+            // Padded queries may see every valid key so no softmax row is fully masked
+            // (as Python laya-mlx); they are never used as keys or outputs.
+            let pad_q = ops::logical_not(&pad.reshape(&[n, 1, len, 1]).lx()?).lx()?;
+            let band = self.window_mask_bool(batch.len)?;
+            LocalAttn::Dense(ops::logical_and(&ops::logical_or(&band, &pad_q).lx()?, &pad).lx()?)
         } else {
             LocalAttn::Dense(ops::add(&pad, &self.window_mask(batch.len)?).lx()?)
         };
         Ok(AttnCtx { pad, local })
+    }
+
+    /// The chunked path's constants for this batch: the key gather indices and the pad + band
+    /// mask `[n * H, n_chunks, S, 3S]`, additive or boolean as `mask=` says.
+    fn windowed_ctx(&self, batch: &Batch) -> Result<Windowed> {
+        let (n, len, s) = (batch.n, batch.len, self.window);
+        let nc = len.div_ceil(s);
+        let ks = 3 * s;
+        let key_idx = window_key_idx(s, n * self.n_heads, len, nc)?;
+        let key_ok = window_key_valid(&batch.attention_mask, n, len, s, nc);
+        let (n, nc, ks, s) = (n as i32, nc as i32, ks as i32, s as i32);
+        let mask = if self.knobs.bool_mask {
+            let valid = Array::from_slice(&key_ok, &[n, 1, nc, 1, ks]);
+            // A padded query (padding in its row, or past `len` in the last chunk) may see every
+            // gathered slot: an all-false row is NaN with boolean masks, and the outputs of these
+            // rows are never read. The dense boolean path does the same with `pad_q`.
+            let pad_q = window_query_padded(&batch.attention_mask, batch.n, len, self.window, nc as usize);
+            let pad_q = Array::from_slice(&pad_q, &[n, 1, nc, s, 1]);
+            ops::logical_or(&ops::logical_and(&valid, &self.band).lx()?, &pad_q).lx()?
+        } else {
+            let vals: Vec<f32> = key_ok.iter().map(|&ok| if ok { 0.0 } else { MASK_NEG }).collect();
+            let valid = Array::from_slice(&vals, &[n, 1, nc, 1, ks])
+                .as_dtype(self.dtype)
+                .lx()?;
+            ops::add(&valid, &self.band).lx()?
+        };
+        let h = self.n_heads as i32;
+        let mask = ops::broadcast_to(&mask, &[n, h, nc, s, ks])
+            .lx()?
+            .reshape(&[n * h, nc, s, ks])
+            .lx()?;
+        Ok(Windowed {
+            key_idx,
+            mask,
+            n_chunks: nc,
+        })
     }
 
     fn lock_caches(&self) -> Result<std::sync::MutexGuard<'_, Caches>> {
@@ -1589,6 +1635,81 @@ mod tests {
             assert_eq!(got.shape(), &[(rows * nc * 3 * s) as i32]);
             assert_eq!(got.as_slice::<u32>(), &want[..], "s={s} rows={rows} len={len}");
         }
+    }
+
+    /// Two rows, `S = 2`, `len = 7` (the last chunk has one real slot): row 0 is full, row 1
+    /// has 3 tokens and 4 of padding.
+    fn padded_batch() -> (Vec<u32>, usize, usize, usize, usize) {
+        let mask = vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0];
+        (mask, 2, 7, 2, 4)
+    }
+
+    /// The chunked masks, boolean and additive, are the same rule: key slot `j` of chunk `c` is
+    /// position `(c - 1) * S + j`, and a padded query is one past `len` or masked in its row.
+    #[test]
+    fn chunked_mask_tables_follow_the_position_formula() {
+        let (mask, n, len, s, nc) = padded_batch();
+        let key_ok = window_key_valid(&mask, n, len, s, nc);
+        let padded = window_query_padded(&mask, n, len, s, nc);
+        for b in 0..n {
+            for c in 0..nc {
+                for j in 0..3 * s {
+                    let pos = (c as i64 - 1) * s as i64 + j as i64;
+                    let want = (0..len as i64).contains(&pos) && mask[b * len + pos as usize] == 1;
+                    assert_eq!(key_ok[(b * nc + c) * 3 * s + j], want, "row {b} chunk {c} slot {j}");
+                }
+                for i in 0..s {
+                    let pos = c * s + i;
+                    let want = pos >= len || mask[b * len + pos] != 1;
+                    assert_eq!(padded[(b * nc + c) * s + i], want, "row {b} chunk {c} query {i}");
+                }
+            }
+        }
+        // The band is the same rule the additive mask has always used.
+        let band = band_allows(s);
+        let additive = band_mask(s, Dtype::Float32).unwrap();
+        let additive = additive.as_slice::<f32>();
+        for i in 0..s {
+            for j in 0..3 * s {
+                assert_eq!(band[i * 3 * s + j], i + 2 * s >= j && j >= i, "band {i},{j}");
+                assert_eq!(additive[i * 3 * s + j] == 0.0, band[i * 3 * s + j], "additive band {i},{j}");
+            }
+        }
+        assert_eq!(band_mask_bool(s).unwrap().as_slice::<bool>(), &band[..]);
+    }
+
+    /// `(key valid & band) | padded query` over the tables: a real query sees exactly the valid
+    /// keys within `S` of it, and no query row is all false (which would be a NaN softmax row
+    /// with boolean masks). Row 1's fourth chunk is all padding, so it relies on the `padded`
+    /// term alone.
+    #[test]
+    fn chunked_bool_mask_leaves_no_query_row_all_false() {
+        let (mask, n, len, s, nc) = padded_batch();
+        let key_ok = window_key_valid(&mask, n, len, s, nc);
+        let padded = window_query_padded(&mask, n, len, s, nc);
+        let band = band_allows(s);
+        for b in 0..n {
+            for c in 0..nc {
+                for i in 0..s {
+                    let q = c * s + i;
+                    let row: Vec<bool> = (0..3 * s)
+                        .map(|j| (key_ok[(b * nc + c) * 3 * s + j] && band[i * 3 * s + j]) || padded[(b * nc + c) * s + i])
+                        .collect();
+                    assert!(row.iter().any(|&v| v), "row {b} query {q} attends to nothing");
+                    if q < len && mask[b * len + q] == 1 {
+                        for (j, &v) in row.iter().enumerate() {
+                            let pos = (c as i64 - 1) * s as i64 + j as i64;
+                            let want = (0..len as i64).contains(&pos)
+                                && mask[b * len + pos as usize] == 1
+                                && (pos - q as i64).abs() <= s as i64;
+                            assert_eq!(v, want, "row {b} query {q} key slot {j} (position {pos})");
+                        }
+                    }
+                }
+            }
+        }
+        // The chunk that motivates the padded-query term.
+        assert!(!key_ok[((nc + 3) * 3 * s)..((nc + 4) * 3 * s)].iter().any(|&v| v));
     }
 
     /// `pooled` is position 0 of every row, as a view (same values as a gather would give).

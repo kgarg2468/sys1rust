@@ -1,8 +1,9 @@
 //! Equivalence of the work-reduction settings (`dense_upto=1024`, `headprune`, `unpad`, and the
-//! three together) with the plain path, on the real checkpoints (ignored by default; needs them
-//! in the HF cache, `source bench/env.sh` first). Every checkpoint found is run, a missing one
-//! is skipped with a note. Pass criteria per question: the same chosen answer (argmax choice,
-//! rounded score, noul side) and every reported probability within 1e-3.
+//! three together) and of boolean masks (`mask=bool`) with the plain path, on the real
+//! checkpoints (ignored by default; needs them in the HF cache, `source bench/env.sh` first).
+//! Every checkpoint found is run, a missing one is skipped with a note. Pass criteria per
+//! question: the same chosen answer (argmax choice, rounded score, noul side) and every
+//! reported probability within 1e-3.
 //!
 //! The cases are the `bench/workloads/smoke.jsonl` requests plus built edge cases: one question
 //! with 2 options and with 1 option, 20 options, a state past `max_len` (truncated), two states
@@ -282,6 +283,16 @@ fn unpad_matches_plain() {
 #[ignore]
 fn all_three_match_plain() {
     every_checkpoint("dense_upto=1024,headprune,unpad");
+}
+
+/// Boolean masks on every path: `over_max_len` and `heavy_padding` pad past `4 * window`, so
+/// with the base settings they take the chunked local attention, whose boolean mask must give
+/// the additive path's answers, padded query rows (all false would be NaN) included; the short
+/// cases take the dense boolean mask.
+#[test]
+#[ignore]
+fn bool_masks_match_additive() {
+    every_checkpoint("mask=bool");
 }
 
 /// The smoke set against the fp32 CPU reference, per checkpoint, with the three work
