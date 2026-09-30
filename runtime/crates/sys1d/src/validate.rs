@@ -137,6 +137,15 @@ pub fn nesting_depth(raw: &[u8]) -> usize {
 
 /// `serde_json::from_slice` without its 128-level recursion limit. Callers check
 /// [`nesting_depth`] first and run this on a stack sized for the result.
+///
+/// This parses standard JSON (RFC 8259) in UTF-8, and that is an intentional difference
+/// from upstream. Upstream's `json.loads(raw)` also accepts the tokens `NaN`, `Infinity` and
+/// `-Infinity`, `\u` escapes of unpaired surrogates, and bodies in UTF-16 or UTF-32 or with a
+/// byte order mark. A `serde_json::Value` cannot hold a NaN or an unpaired surrogate, so
+/// matching those would take a different value type through laya-core. sys1d answers all of
+/// them with the 400 it gives malformed JSON, where upstream may serve them. Standard
+/// encoders do not produce them: `JSON.stringify` writes `null` for NaN, and `requests` and
+/// `httpx` refuse to send one.
 fn parse_json(raw: &[u8]) -> serde_json::Result<Value> {
     let mut de = serde_json::Deserializer::from_slice(raw);
     de.disable_recursion_limit();
@@ -435,6 +444,32 @@ mod tests {
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         let e = validate_body(br#"{"state":"s","questions":[],"max_len":1}"#, served).unwrap_err();
         assert_eq!(e.detail, "'questions' must be an object");
+    }
+
+    /// What `json.loads` accepts beyond standard JSON gets the malformed-JSON 400 here, the
+    /// intentional difference [`parse_json`] documents. Standard JSON around it still parses.
+    #[test]
+    fn python_only_json_is_refused_like_malformed_json() {
+        let served = "typed-decisions";
+        let utf16: Vec<u8> =
+            r#"{"state":"s","questions":{}}"#.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut bom = b"\xef\xbb\xbf".to_vec();
+        bom.extend_from_slice(br#"{"state":"s","questions":{}}"#);
+        let bodies: [&[u8]; 6] = [
+            br#"{"state":"s","questions":{},"x":NaN}"#,
+            br#"{"state":"s","questions":{},"x":Infinity}"#,
+            br#"{"state":"s","questions":{},"x":-Infinity}"#,
+            br#"{"state":"\ud800","questions":{}}"#,
+            &bom,
+            &utf16,
+        ];
+        for raw in bodies {
+            let e = validate_body(raw, served).unwrap_err();
+            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{raw:?}");
+            assert_eq!(e.detail, "request body must be valid JSON", "{raw:?}");
+        }
+        let ok = validate_body(br#"{"state":"\ud83d\ude00 NaN","questions":{}}"#, served).unwrap();
+        assert_eq!(ok.state, json!("\u{1F600} NaN"));
     }
 
     fn nested_array(depth: usize) -> String {
