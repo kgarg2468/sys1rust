@@ -25,8 +25,10 @@ fn fixtures(name: &str) -> Value {
         .unwrap_or_else(|e| panic!("fixture {} is not valid JSON: {e}", p.display()))
 }
 
-fn model_dir(subfolder: Option<&str>) -> PathBuf {
-    laya_core::resolve::resolve_model_dir("convaiinnovations/laya", subfolder)
+/// The published checkpoint by variant name (`None` is English, `Some("multilingual")` is
+/// `convaiinnovations/laya-multilingual`), see `laya_core::testing::checkpoint_dir`.
+fn model_dir(variant: Option<&str>) -> PathBuf {
+    laya_core::testing::checkpoint_dir(variant)
         .unwrap_or_else(|e| panic!("checkpoint for the parity fixtures is not available: {e}"))
 }
 
@@ -61,8 +63,8 @@ fn flat_f32(v: &Value) -> Vec<f32> {
         .collect()
 }
 
-fn check_checkpoint(name: &str, subfolder: Option<&str>) {
-    let (fx, dir) = (fixtures(name), model_dir(subfolder));
+fn check_checkpoint(name: &str, variant: Option<&str>) {
+    let (fx, dir) = (fixtures(name), model_dir(variant));
     let weights = Weights::open(&dir).unwrap();
     let act_head = ActHead::load(&weights).unwrap();
     // Agent with a dummy backend just for tokenization/config.

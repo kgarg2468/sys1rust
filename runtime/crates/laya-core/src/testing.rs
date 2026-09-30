@@ -133,6 +133,42 @@ pub fn fixtures_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+/// The English checkpoint's repo, which at its pinned revision also bundles the other two
+/// checkpoints as subfolders (`multilingual/`, `typed-decisions/`) with the same blobs.
+const ENGLISH_REPO: &str = "convaiinnovations/laya";
+
+/// The hub repo of a published checkpoint, by the variant name `bench/models.lock.json` uses:
+/// `None` or `"english"` is `convaiinnovations/laya`, any other variant `v` is
+/// `convaiinnovations/laya-<v>` (`laya-multilingual`, `laya-typed-decisions`).
+pub fn checkpoint_repo(variant: Option<&str>) -> String {
+    match variant {
+        None | Some("english") => ENGLISH_REPO.to_string(),
+        Some(v) => format!("{ENGLISH_REPO}-{v}"),
+    }
+}
+
+/// The directory of a published checkpoint in the local HF cache, by variant name. The
+/// separate repo is looked up first; when only the English bundle is cached, its subfolder of
+/// the same name is the same checkpoint, so that is the fallback. The error is the separate
+/// repo's when neither is there.
+pub fn checkpoint_dir(variant: Option<&str>) -> Result<PathBuf> {
+    checkpoint_dir_in(&crate::resolve::hf_cache_dir(), variant)
+}
+
+fn checkpoint_dir_in(cache: &std::path::Path, variant: Option<&str>) -> Result<PathBuf> {
+    use crate::resolve::resolve_in_cache;
+    let repo = checkpoint_repo(variant);
+    match resolve_in_cache(cache, &repo, None) {
+        Ok(dir) => Ok(dir),
+        Err(primary) => match variant {
+            Some(v) if repo != ENGLISH_REPO => {
+                resolve_in_cache(cache, ENGLISH_REPO, Some(v)).map_err(|_| primary)
+            }
+            _ => Err(primary),
+        },
+    }
+}
+
 fn flat_f32(v: &Value) -> Vec<f32> {
     v.as_array()
         .unwrap()
@@ -269,10 +305,12 @@ fn drop_answer_confidence_if_absent(got: &mut Value, want: &Value) {
 }
 
 /// Run every fixture case through `factory`'s backend and compare with the Python outputs.
-/// Returns `Ok(None)` when the fixture file or the checkpoint is not available locally.
+/// `variant` names the checkpoint as [`checkpoint_dir`] does (`None` for English,
+/// `Some("multilingual")` for `convaiinnovations/laya-multilingual`). Returns `Ok(None)` when
+/// the fixture file or the checkpoint is not available locally.
 pub fn run_parity(
     fixture: &str,
-    subfolder: Option<&str>,
+    variant: Option<&str>,
     factory: Factory,
     opts: &BackendOptions,
 ) -> Result<Option<ParityReport>> {
@@ -280,7 +318,7 @@ pub fn run_parity(
         return Ok(None);
     };
     let fx: Value = serde_json::from_slice(&bytes)?;
-    let Ok(dir) = crate::resolve::resolve_model_dir("convaiinnovations/laya", subfolder) else {
+    let Ok(dir) = checkpoint_dir(variant) else {
         return Ok(None);
     };
     let agent = Agent::load(&dir, opts, factory)?;
@@ -346,6 +384,86 @@ pub fn run_parity(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fake HF cache under the system temp dir, removed on drop. `snapshot` writes the two
+    /// files a checkpoint directory must have and names the snapshot in `refs/main`.
+    struct FakeCache(PathBuf);
+
+    impl FakeCache {
+        fn new() -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "laya-core-testing-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn snapshot(&self, repo: &str, rev: &str, subfolder: Option<&str>) -> PathBuf {
+            let repo_dir = self.0.join(format!("models--{}", repo.replace('/', "--")));
+            let mut dir = repo_dir.join("snapshots").join(rev);
+            if let Some(s) = subfolder {
+                dir = dir.join(s);
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rl_agent_config.json"), "{}").unwrap();
+            std::fs::write(dir.join("model.safetensors"), "").unwrap();
+            std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+            std::fs::write(repo_dir.join("refs").join("main"), rev).unwrap();
+            dir
+        }
+    }
+
+    impl Drop for FakeCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn checkpoint_repos_follow_models_lock() {
+        assert_eq!(checkpoint_repo(None), "convaiinnovations/laya");
+        assert_eq!(checkpoint_repo(Some("english")), "convaiinnovations/laya");
+        assert_eq!(
+            checkpoint_repo(Some("multilingual")),
+            "convaiinnovations/laya-multilingual"
+        );
+        assert_eq!(
+            checkpoint_repo(Some("typed-decisions")),
+            "convaiinnovations/laya-typed-decisions"
+        );
+    }
+
+    /// The published `laya-multilingual` repo is found on its own; the `multilingual/`
+    /// subfolder of the English bundle is only the fallback, and a cache with neither reports
+    /// the published repo.
+    #[test]
+    fn checkpoint_dir_prefers_the_published_repo() {
+        let c = FakeCache::new();
+        let e = checkpoint_dir_in(&c.0, Some("multilingual"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("\"convaiinnovations/laya-multilingual\""), "{e}");
+        let english = c.snapshot("convaiinnovations/laya", "aaa", None);
+        assert_eq!(checkpoint_dir_in(&c.0, None).unwrap(), english);
+        assert_eq!(checkpoint_dir_in(&c.0, Some("english")).unwrap(), english);
+        let e = checkpoint_dir_in(&c.0, Some("multilingual"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("\"convaiinnovations/laya-multilingual\""), "{e}");
+        let bundled = c.snapshot("convaiinnovations/laya", "aaa", Some("multilingual"));
+        assert_eq!(
+            checkpoint_dir_in(&c.0, Some("multilingual")).unwrap(),
+            bundled
+        );
+        let published = c.snapshot("convaiinnovations/laya-multilingual", "bbb", None);
+        assert_eq!(
+            checkpoint_dir_in(&c.0, Some("multilingual")).unwrap(),
+            published
+        );
+    }
 
     #[test]
     fn decisions_follow_compare_py() {

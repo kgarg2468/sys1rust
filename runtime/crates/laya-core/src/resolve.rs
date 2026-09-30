@@ -64,7 +64,11 @@ pub fn resolve_model_dir(id_or_path: &str, subfolder: Option<&str>) -> Result<Pa
 /// Pick the snapshot of a hub repo the way huggingface_hub does: `refs/main` names the revision
 /// of the default branch. Without that ref (a download by commit hash writes none), accept a
 /// single cached snapshot and refuse to guess between several.
-fn resolve_in_cache(cache: &Path, repo_id: &str, subfolder: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve_in_cache(
+    cache: &Path,
+    repo_id: &str,
+    subfolder: Option<&str>,
+) -> Result<PathBuf> {
     let repo_dir = cache.join(format!("models--{}", repo_id.replace('/', "--")));
     let snapshots = repo_dir.join("snapshots");
     let not_found = |detail: String| {
