@@ -6,6 +6,7 @@
 use crate::config::checkpoint_name;
 use axum::http::StatusCode;
 use laya_core::pyjson::{py_str, repr_str};
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const MAX_QUESTIONS: usize = 64;
@@ -14,6 +15,28 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CHOICE_OPTIONS: usize = 100;
 pub const MAX_SCORE_LEVELS: usize = 32;
 pub const MAX_TOTAL_OPTIONS: usize = 512;
+
+/// Deepest container nesting a body may have (`[[]]` is 2). Upstream has no explicit limit:
+/// `json.loads` raises RecursionError at CPython's C recursion limit, which
+/// `_systemone_inner` (laya_serve.py, the `except (ValueError, RecursionError)` around
+/// `json.loads`) answers with 400 "request body must be valid JSON". That limit is 10,000 in
+/// CPython 3.12 less the C frames already in use, so on the bench's 3.12.13 a document 9,997
+/// deep is parsed and 9,998 is refused; `str()` and `json.dumps` in the rest of the handler
+/// have the same limit, so everything `json.loads` accepts is served end to end. The limit
+/// here is a fixed 10,000, so the two or three levels below it that a given CPython build
+/// refuses are served instead. Past it the answer is upstream's 400.
+pub const MAX_JSON_DEPTH: usize = 10_000;
+/// Bodies nested deeper than this are parsed and checked on a thread with [`DEEP_STACK`]
+/// instead of the handler's 2 MiB tokio thread. Measured in a debug build, serde_json needs
+/// about 3.2 KiB of stack per level (192 KiB at 64 levels) and the Python-text walks up to
+/// 2.4 KiB, so 32 levels leave the handler thread most of its stack.
+pub const INLINE_DEPTH: usize = 32;
+/// Stack for the threads that walk a body nested up to [`MAX_JSON_DEPTH`]: the parse and
+/// check thread here and the inference thread, where laya-core renders the state and the
+/// criteria as Python text. Measured at 10,000 levels in a debug build: parse 32 MiB, clone
+/// 24 MiB, repr, dumps and drop 16 MiB; a release build needs a quarter of that. This is a
+/// reservation of address space, only the pages touched are committed.
+pub const DEEP_STACK: usize = 64 * 1024 * 1024;
 
 /// A refused request: the status and the `detail` string of the error body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,17 +70,111 @@ fn too_large(detail: String) -> Rejection {
     Rejection::new(StatusCode::PAYLOAD_TOO_LARGE, detail)
 }
 
-/// The parts of a valid request handed to the inference thread.
+/// The parts of a valid request handed to the inference thread. Dropping one never recurses
+/// into the values: `Value`'s own drop takes 6 MiB of stack at [`MAX_JSON_DEPTH`] levels in
+/// a release build, and a request can die on a 2 MiB tokio thread (the inference thread has
+/// gone, or the client left while the job was queued).
 #[derive(Debug)]
 pub struct Validated {
     pub state: Value,
     pub questions: Value,
 }
 
+impl Drop for Validated {
+    fn drop(&mut self) {
+        drop_flat(std::mem::take(&mut self.state));
+        drop_flat(std::mem::take(&mut self.questions));
+    }
+}
+
+/// Drop `v` with a work list instead of recursion.
+fn drop_flat(v: Value) {
+    let mut pending = vec![v];
+    while let Some(v) = pending.pop() {
+        match v {
+            Value::Array(items) => pending.extend(items),
+            Value::Object(map) => pending.extend(map.into_iter().map(|(_, v)| v)),
+            _ => {}
+        }
+    }
+}
+
+/// Deepest container nesting in `raw`, counted the way the parser recurses: every `[` or `{`
+/// outside a string opens a level. Strings follow JSON's lexical rules (`\` escapes the next
+/// byte), so a bracket inside one does not count. For text that is not JSON the count is
+/// still an upper bound on the parser's recursion: the parser stops at its first error, and
+/// up to that point it agrees with this scan on where strings begin and end.
+pub fn nesting_depth(raw: &[u8]) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in raw {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// `serde_json::from_slice` without its 128-level recursion limit. Callers check
+/// [`nesting_depth`] first and run this on a stack sized for the result.
+fn parse_json(raw: &[u8]) -> serde_json::Result<Value> {
+    let mut de = serde_json::Deserializer::from_slice(raw);
+    de.disable_recursion_limit();
+    let v = Value::deserialize(&mut de)?;
+    de.end()?;
+    Ok(v)
+}
+
 /// Parse and check a complete request body against `served_name`.
 pub fn validate_body(raw: &[u8], served_name: &str) -> Result<Validated, Rejection> {
-    let body: Value =
-        serde_json::from_slice(raw).map_err(|_| bad_request("request body must be valid JSON"))?;
+    let depth = nesting_depth(raw);
+    if depth > MAX_JSON_DEPTH {
+        // Upstream's RecursionError branch: the same 400 as malformed JSON.
+        return Err(bad_request("request body must be valid JSON"));
+    }
+    if depth <= INLINE_DEPTH {
+        return check_parsed(raw, served_name);
+    }
+    // Deep enough to overflow the handler's thread: parse and walk it on a thread with a
+    // stack for MAX_JSON_DEPTH levels. Every value the checks build dies on that thread too.
+    std::thread::scope(|s| {
+        let thread = std::thread::Builder::new()
+            .name("sys1d-deep-body".into())
+            .stack_size(DEEP_STACK)
+            .spawn_scoped(s, || check_parsed(raw, served_name));
+        match thread {
+            Ok(t) => t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            Err(e) => {
+                crate::log(format!("could not start the body thread: {e}"));
+                Err(Rejection::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "inference failed",
+                ))
+            }
+        }
+    })
+}
+
+/// [`validate_body`] after the depth check: upstream's checks in upstream's order.
+fn check_parsed(raw: &[u8], served_name: &str) -> Result<Validated, Rejection> {
+    let body = parse_json(raw).map_err(|_| bad_request("request body must be valid JSON"))?;
     let Value::Object(mut obj) = body else {
         return Err(bad_request(
             "request body must be an object with a 'questions' field",
@@ -151,8 +268,9 @@ pub fn check_limits(state: &Value, questions: &Value) -> Result<(), Rejection> {
 /// scalar values and anything else by the Python repr of the decoded object (`{'a': 1}` is 8,
 /// `True` and `None` are 4). Upstream wraps that in `try/except Exception` with a fallback of
 /// `MAX_STATE_CHARS + 1`; the only way `str()` fails on a decoded JSON value is a
-/// RecursionError on nesting past Python's limit, and serde_json refuses a body nested past
-/// 128 levels before this check runs, so there is no such branch here.
+/// RecursionError, and `json.loads` has the same recursion limit as `str()`, so a state it
+/// decoded is one `str()` renders. The walk here runs on a stack sized for [`MAX_JSON_DEPTH`]
+/// and cannot fail either, so there is no such branch.
 pub fn state_chars(state: &Value) -> usize {
     match state {
         Value::String(s) => s.chars().count(),
@@ -257,5 +375,113 @@ mod tests {
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         let e = validate_body(br#"{"state":"s","questions":[],"max_len":1}"#, served).unwrap_err();
         assert_eq!(e.detail, "'questions' must be an object");
+    }
+
+    fn nested_array(depth: usize) -> String {
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// `{"state": <array>, "questions": {}}`: the state sits one level inside the document.
+    fn body_with_state_depth(depth: usize) -> String {
+        format!(r#"{{"state": {}, "questions": {{}}}}"#, nested_array(depth))
+    }
+
+    #[test]
+    fn nesting_depth_counts_containers_outside_strings() {
+        assert_eq!(nesting_depth(b""), 0);
+        assert_eq!(nesting_depth(b"1"), 0);
+        assert_eq!(nesting_depth(b"[]"), 1);
+        assert_eq!(nesting_depth(br#"{"a": [1, {"b": []}], "c": 2}"#), 4);
+        // Brackets, an escaped quote and an escaped backslash inside strings do not count.
+        assert_eq!(nesting_depth(br#"["[[[[", "{\"}", "\\"]"#), 1);
+        // Text that is not JSON still gets an upper bound on the parser's recursion.
+        assert_eq!(nesting_depth(b"]]]]"), 0);
+        assert_eq!(nesting_depth(b"[[[["), 4);
+        assert_eq!(nesting_depth(b"\"[[["), 0);
+        assert_eq!(nesting_depth(body_with_state_depth(9).as_bytes()), 10);
+    }
+
+    /// The document limit is [`MAX_JSON_DEPTH`]: a state array nested one less fits and is
+    /// served (upstream serves it too: `str()` of `[[...]]` is 2 chars per level, under the
+    /// 50,000 cap), one more is upstream's RecursionError 400. Runs in debug and release.
+    #[test]
+    fn nesting_at_the_limit_is_accepted_and_one_past_is_400() {
+        let served = "typed-decisions";
+        let ok =
+            validate_body(body_with_state_depth(MAX_JSON_DEPTH - 1).as_bytes(), served).unwrap();
+        // Measured with a loop: this thread has 2 MiB and must not walk the value recursively.
+        let (mut depth, mut cur) = (0, &ok.state);
+        while let Value::Array(items) = cur {
+            depth += 1;
+            match items.first() {
+                Some(inner) => cur = inner,
+                None => break,
+            }
+        }
+        assert_eq!(depth, MAX_JSON_DEPTH - 1);
+        assert_eq!(ok.questions, json!({}));
+        let e =
+            validate_body(body_with_state_depth(MAX_JSON_DEPTH).as_bytes(), served).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.detail, "request body must be valid JSON");
+        // The bound holds for text the parser would reject anyway, like 1 MiB of `[`.
+        let e = validate_body(&vec![b'['; 1 << 20], served).unwrap_err();
+        assert_eq!(e.detail, "request body must be valid JSON");
+    }
+
+    /// Nesting inside `questions` is walked by the same code (a criterion value goes through
+    /// laya-core's `dumps` on the inference thread), so it is accepted up to the same limit.
+    #[test]
+    fn deep_nesting_inside_questions_is_accepted() {
+        // Root, questions, the question and criteria are four levels.
+        let body = format!(
+            r#"{{"state": "s", "questions": {{"q": {{"type": "choice", "instructions": "?", "criteria": {{"a": {}}}}}}}}}"#,
+            nested_array(MAX_JSON_DEPTH - 4)
+        );
+        assert_eq!(nesting_depth(body.as_bytes()), MAX_JSON_DEPTH);
+        let ok = validate_body(body.as_bytes(), "typed-decisions").unwrap();
+        assert_eq!(ok.state, json!("s"));
+        let body = format!(
+            r#"{{"state": "s", "questions": {{"q": {{"type": "choice", "instructions": "?", "criteria": {{"a": {}}}}}}}}}"#,
+            nested_array(MAX_JSON_DEPTH - 3)
+        );
+        let e = validate_body(body.as_bytes(), "typed-decisions").unwrap_err();
+        assert_eq!(e.detail, "request body must be valid JSON");
+    }
+
+    /// A deep object state is measured like upstream's `str()`: `{'a': ` per level, the `1`
+    /// and a `}` per level, 7 chars a level plus one. Upstream reports the same count for
+    /// this state (Python 3.12.13: `state too large (69973 > 50000 chars)` at 9,996 levels).
+    #[test]
+    fn deep_object_state_is_measured_like_python() {
+        let depth = MAX_JSON_DEPTH - 1;
+        let body = format!(
+            r#"{{"state": {}1{}, "questions": {{}}}}"#,
+            r#"{"a": "#.repeat(depth),
+            "}".repeat(depth)
+        );
+        let e = validate_body(body.as_bytes(), "typed-decisions").unwrap_err();
+        assert_eq!(e.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            e.detail,
+            format!("state too large ({} > 50000 chars)", 7 * depth + 1)
+        );
+    }
+
+    /// A request at the limit can be dropped on a thread far too small to unwind it
+    /// recursively.
+    #[test]
+    fn deep_request_drops_without_recursion() {
+        let v = validate_body(
+            body_with_state_depth(MAX_JSON_DEPTH - 1).as_bytes(),
+            "typed-decisions",
+        )
+        .unwrap();
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || drop(v))
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

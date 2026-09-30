@@ -1472,6 +1472,7 @@ dependencies = [
  "http-body-util",
  "laya-core",
  "laya-mlx",
+ "serde",
  "serde_json",
  "subtle",
  "tokio",

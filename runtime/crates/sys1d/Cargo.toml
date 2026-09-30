@@ -12,7 +12,10 @@ path = "src/lib.rs"
 [dependencies]
 laya-core = { workspace = true }
 laya-mlx = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true }
+# `unbounded_depth`: request bodies are parsed past serde_json's 128-level default, behind an
+# explicit depth check and on a stack sized for it (see `validate.rs`).
+serde_json = { workspace = true, features = ["unbounded_depth"] }
 anyhow = { workspace = true }
 # Async runtime: the accept loop, the bounded job channel to the inference thread, the reply
 # oneshots, the admission semaphore and SIGINT/SIGTERM handling.
