@@ -23,7 +23,7 @@ Four Fable 5.1 researchers re-checked the earlier research notes (not in this re
 - Closest data: laya-apple's run on a base M4, 32 GB, macOS 26.2 build 25C56 (same build as here). typed-decisions at 128 tokens: ANE 14.5 ms vs MLX GPU 37.1 ms p50, a 2.5x ANE lead (verified). On M5 Pro the lead nearly vanished (3.6 vs 3.9 ms). A small GPU makes the ANE matter more.
 - MLX uses the M5 neural accelerators from MLX 0.30 on macOS 26.2+. On M5, MLX runs fp32 matmul as TF32 by default (`MLX_ENABLE_TF32=0` turns it off), and padded batched attention drifts by about 2^-11 in fp16. Tests demanding identical bits across batch sizes will fail on M5.
 - The fast ANE numbers are for the multilingual checkpoint. The 421M English checkpoint fails FluidInference's ANE parity gate.
-- Precision breaks answers more than anything else: fp16/bf16 and uniform INT8 broke parity in Ollaya, zerodegress and kime. Weight-only per-channel INT8 kept every measured decision.
+- Precision breaks answers more than anything else: fp16/bf16 and uniform INT8 broke parity in Ollaya, zerodegress and kime. Weight-only per-channel INT8 kept every decision in the published English-checkpoint tests. In the bake-off's simulation on typed-decisions it agreed on 99.5% of 1,500 answers, against 99.9% for fp16 (`results/SPEED.md` in PR #5).
 
 ## Models and licenses
 
