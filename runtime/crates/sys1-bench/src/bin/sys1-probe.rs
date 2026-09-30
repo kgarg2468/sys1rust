@@ -179,11 +179,13 @@ fn micro() -> Result<()> {
     let x = f16(&[1, 89, 768])?;
     let w = f16(&[2304, 768])?;
     let wt = ops::transpose(&w)?;
-    transforms::eval([&x, &w, &wt])?;
+    // Every input of the timed closures is generated and evaluated here, so the timings hold
+    // the chained ops alone.
+    let w2 = ops::transpose(&f16(&[768, 768])?)?;
+    transforms::eval([&x, &w, &wt, &w2])?;
     time("x[1,89,768] @ W^T[768,2304]", 50, &|| Ok(ops::matmul(&x, &wt)?))?;
     time("22 x chained small gemm+add", 30, &|| {
         let mut h = x.clone();
-        let w2 = ops::transpose(&f16(&[768, 768])?)?;
         for _ in 0..22 {
             h = ops::add(&ops::matmul(&h, &w2)?, &h)?;
         }
