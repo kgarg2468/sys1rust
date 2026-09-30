@@ -1,13 +1,17 @@
-"""Per-op eval timing of Python laya-mlx encoder layers (same split as the Rust `ops` knob)."""
+"""Per-op eval timing of Python laya-mlx encoder layers (same split as the Rust `ops` knob).
+
+Run with the laya-mlx venv after `source bench/env.sh` (for HF_HOME), from any directory.
+"""
 import json, os, sys, time
 import mlx.core as mx, mlx.nn as nn
-sys.path.insert(0, "contenders/laya-mlx/src")
+BENCH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BENCH, "contenders", "laya-mlx", "src"))
 from laya_mlx.agent import Agent
 from laya_mlx import model as M
-lock = json.load(open("models.lock.json"))["typed-decisions"]
+lock = json.load(open(os.path.join(BENCH, "models.lock.json")))["typed-decisions"]
 d = os.path.join(os.environ["HF_HOME"], "hub", "models--" + lock["repo"].replace("/", "--"), "snapshots", lock["sha"])
 ag = Agent(d, dtype="float16")
-row = json.loads(open("workloads/short.jsonl").readline())
+row = json.loads(open(os.path.join(BENCH, "workloads", "short.jsonl")).readline())
 acc = {}
 t = [0.0]
 def mark(name, *a):

@@ -1,13 +1,16 @@
-"""Python laya-mlx forward timing on the first short-workload row, whole and per layer."""
-import json, sys, time, statistics as st
+"""Python laya-mlx forward timing on the first short-workload row, whole and per layer.
+
+Run with the laya-mlx venv after `source bench/env.sh` (for HF_HOME), from any directory.
+"""
+import json, os, sys, time, statistics as st
 import mlx.core as mx
-sys.path.insert(0, "contenders/laya-mlx/src")
+BENCH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BENCH, "contenders", "laya-mlx", "src"))
 from laya_mlx.agent import Agent
-lock = json.load(open("models.lock.json"))["typed-decisions"]
-import os
+lock = json.load(open(os.path.join(BENCH, "models.lock.json")))["typed-decisions"]
 d = os.path.join(os.environ["HF_HOME"], "hub", "models--" + lock["repo"].replace("/", "--"), "snapshots", lock["sha"])
 ag = Agent(d, dtype="float16")
-row = json.loads(open("workloads/short.jsonl").readline())
+row = json.loads(open(os.path.join(BENCH, "workloads", "short.jsonl")).readline())
 st_, qs = row["body"]["state"], row["body"]["questions"]
 def once():
     t = time.perf_counter(); ag.system_one(st_, qs); return (time.perf_counter() - t) * 1000

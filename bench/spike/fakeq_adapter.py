@@ -19,7 +19,10 @@ import mlx.core as mx  # noqa: E402
 import mlx.nn as nn  # noqa: E402
 import laya_mlx  # noqa: E402
 
+MODES = ("w8", "w8a8", "w8a8mlp")
 MODE = os.environ.get("FAKEQ", "w8a8")
+if MODE not in MODES:
+    sys.exit(f"fakeq: unknown FAKEQ mode {MODE!r}; use one of {', '.join(MODES)}")
 
 
 def q8_rows(x, axis):
