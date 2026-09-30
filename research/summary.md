@@ -13,10 +13,12 @@ Four Fable 5.1 researchers re-checked the earlier research notes (not in this re
 
 ## What does not exist yet
 
+This list is the state of published work on 2026-09-28, before the bake-off. The bake-off in `results/`, which arrives in PR #5, has since covered items 2 and 4 on this laptop. The notes on those items say how.
+
 1. A model plus runtime that encodes the input once and answers later questions against the cached encoding. Upstream closed the proposal (issue #49, 2026-09-25): new checkpoints "not planned for the open-source models" (verified). ikken (Apache-2.0) has the attention mask but no checkpoint. kime has a spec and trainer but no shipped model. Needs training.
-2. A same-machine benchmark across runtimes that only counts runs whose answers match. kime-bench has good rules but only compares kime against Laya.
+2. A same-machine benchmark across runtimes that only counts runs whose answers match. kime-bench has good rules but only compares kime against Laya. Since then the bake-off built one for this project. Its harness is `bench/harness/`, it counts a run's speed only at 99% agreement or better, and its results are in `results/REPORT.md`.
 3. A native (Swift or Rust) Apple engine that routes between ANE and MLX/Metal, batches across requests, and beats PyTorch MPS, MLX and Core ML. kime Metal is level with or behind MPS at batch 1, depending on which of its two reports you read.
-4. Any published Laya number on a base M5.
+4. Any published Laya number on a base M5. Since then the bake-off measured 13 local runtimes on this base M5 (`results/REPORT.md`).
 
 ## Facts that matter for this laptop (base M5, 32 GB, macOS 26.2)
 
