@@ -9,7 +9,8 @@
 //! of very different lengths in one request (heavy padding), the three answer types in one
 //! request (padded marker slots), and a single question (no padding, so `unpad` is skipped).
 //!
-//! Run with: `cargo test -p laya-mlx --release --test settings -- --ignored --nocapture`
+//! Run from the repo root with:
+//! `cargo test --manifest-path runtime/Cargo.toml -p laya-mlx --release --test settings -- --ignored --nocapture`
 
 mod common;
 
