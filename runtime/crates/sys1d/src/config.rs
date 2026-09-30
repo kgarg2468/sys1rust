@@ -90,14 +90,17 @@ impl Config {
     }
 }
 
+/// The most permits a tokio semaphore, and so the job channel, can hold. Upstream hands any
+/// positive `int` to `asyncio.Semaphore`, which has no ceiling, so a larger
+/// `LAYA_MAX_CONCURRENT` is clamped to this instead of refused; the server then admits
+/// every request, as upstream would.
+pub const MAX_CONCURRENT_CAP: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
 /// Upstream `_resolve_max_concurrent`: unset, unparseable or non-positive means the default.
+/// The value is read like Python's `int()` and clamped to [`MAX_CONCURRENT_CAP`].
 pub fn resolve_max_concurrent(raw: Option<&str>) -> usize {
-    match raw
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::parse::<i64>)
-    {
-        Some(Ok(n)) if n > 0 => n as usize,
+    match raw.filter(|s| !s.is_empty()).map(python_int) {
+        Some(Some(n)) if n > 0 => n.min(MAX_CONCURRENT_CAP as i128) as usize,
         None => DEFAULT_MAX_CONCURRENT,
         Some(_) => {
             crate::log(format!(
@@ -107,6 +110,36 @@ pub fn resolve_max_concurrent(raw: Option<&str>) -> usize {
             DEFAULT_MAX_CONCURRENT
         }
     }
+}
+
+/// Python's `int(str)` for a decimal literal: surrounding whitespace, an optional sign, and
+/// ASCII digits with single underscores between them (`1_6`). A value past `i128` saturates,
+/// which the caller clamps anyway. `int()` also takes non-ASCII decimal digits; those are
+/// refused here.
+fn python_int(s: &str) -> Option<i128> {
+    let s = s.trim();
+    let (negative, digits) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let mut n: i128 = 0;
+    let mut after_digit = false;
+    for b in digits.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                n = n.saturating_mul(10).saturating_add(i128::from(b - b'0'));
+                after_digit = true;
+            }
+            b'_' if after_digit => after_digit = false,
+            _ => return None,
+        }
+    }
+    // Empty, or ending in an underscore.
+    if !after_digit {
+        return None;
+    }
+    Some(if negative { -n } else { n })
 }
 
 /// Map a checkpoint name or published id (case-insensitive, trimmed) to the canonical name.
@@ -274,6 +307,36 @@ mod tests {
         assert_eq!(resolve_max_concurrent(Some("0")), 16);
         assert_eq!(resolve_max_concurrent(Some("-3")), 16);
         assert_eq!(resolve_max_concurrent(Some(" 4 ")), 4);
+    }
+
+    /// Everything Python's `int()` takes is taken (`+4`, `1_2`), everything it refuses falls
+    /// back, and a value tokio cannot hold (upstream's `asyncio.Semaphore` can) is clamped
+    /// to the cap instead of panicking in the semaphore or channel constructor.
+    #[test]
+    fn max_concurrent_reads_python_ints_and_clamps_to_tokio() {
+        assert_eq!(resolve_max_concurrent(Some("+4")), 4);
+        assert_eq!(resolve_max_concurrent(Some("1_2")), 12);
+        for bad in ["1__2", "_12", "12_", "-", "+", "0x10", "12.0", "1e3", " "] {
+            assert_eq!(resolve_max_concurrent(Some(bad)), 16, "{bad:?}");
+        }
+        assert_eq!(
+            resolve_max_concurrent(Some("9223372036854775807")),
+            MAX_CONCURRENT_CAP
+        );
+        assert_eq!(
+            resolve_max_concurrent(Some(&"9".repeat(40))),
+            MAX_CONCURRENT_CAP
+        );
+        assert_eq!(
+            resolve_max_concurrent(Some(&(MAX_CONCURRENT_CAP + 1).to_string())),
+            MAX_CONCURRENT_CAP
+        );
+        assert_eq!(
+            resolve_max_concurrent(Some(&(MAX_CONCURRENT_CAP - 1).to_string())),
+            MAX_CONCURRENT_CAP - 1
+        );
+        // The cap is what tokio accepts.
+        let _ = tokio::sync::Semaphore::new(MAX_CONCURRENT_CAP);
     }
 
     #[test]
