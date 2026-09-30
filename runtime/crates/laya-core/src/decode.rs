@@ -236,19 +236,51 @@ pub fn act_features(logits_row: &[f32], marker_count: usize) -> [f32; 4] {
     [top1, top1 - top2, ent, k / 255.0]
 }
 
-/// A choice label as Python's `json.dumps` prints it. With `arbitrary_precision` a Number
-/// keeps its literal text and every serde serializer writes it back verbatim, so a label
-/// typed `1E5`, `1e16` or `-0` would go out as typed where upstream prints `100000.0`,
-/// `1e+16` and `0`. Re-parsing [`pyjson::dumps`] of the label puts Python's text in the
-/// Number instead. A non-finite float (`1e400`) has no JSON text and is returned unchanged;
-/// upstream's `json.dumps(allow_nan=False)` fails the whole response for that label.
-fn python_value(label: &Value) -> Value {
-    match label {
-        Value::Number(_) => {
-            serde_json::from_str(&pyjson::dumps(label)).unwrap_or_else(|_| label.clone())
+/// Upstream's error for a float that is not finite in the result. `laya serve` builds
+/// `JSONResponse(content=result)` inside its `try` block, Starlette renders it with
+/// `json.dumps(allow_nan=False)`, and the `ValueError` that raises (for a value or a dict
+/// key alike) is what the handler turns into a 422 with `detail = str(e)`. sys1d maps
+/// `Error::Question` to the same status and detail, so the client sees upstream's text.
+fn out_of_range(x: f64) -> Error {
+    Error::Question(format!(
+        "Out of range float values are not JSON compliant: {}",
+        pyjson::float_repr(x)
+    ))
+}
+
+/// A request value as Python's `json.dumps` prints it, for the result fields that copy a
+/// value from the request: a choice label and a score legend entry. With
+/// `arbitrary_precision` a Number keeps its literal text and every serde serializer writes it
+/// back verbatim, so a value typed `1E5`, `1.10` or `-0` would go out as typed where upstream
+/// prints `100000.0`, `1.1` and `0`. Re-parsing [`pyjson::dumps`] of the number puts Python's
+/// text in the Number instead; a list or dict is walked for the numbers inside it. A
+/// non-finite float (`1e400`) has no JSON text: upstream fails the whole response when it
+/// serializes it, so this is [`out_of_range`] with the same message.
+fn python_value(v: &Value) -> Result<Value> {
+    match v {
+        Value::Number(n) => {
+            if let Some(x) = pyjson::non_finite(n) {
+                return Err(out_of_range(x));
+            }
+            Ok(serde_json::from_str(&pyjson::dumps(v))?)
         }
-        other => other.clone(),
+        Value::Array(a) => Ok(Value::Array(
+            a.iter().map(python_value).collect::<Result<Vec<_>>>()?,
+        )),
+        Value::Object(o) => Ok(Value::Object(
+            o.iter()
+                .map(|(k, x)| Ok((k.clone(), python_value(x)?)))
+                .collect::<Result<Map<_, _>>>()?,
+        )),
+        other => Ok(other.clone()),
     }
+}
+
+/// The `probabilities` key for a choice label, or [`out_of_range`] for a float label with no
+/// JSON text: Python raises for a non-finite dict key as it does for a value.
+fn label_key(label: &Value) -> Result<String> {
+    python_value(label)?;
+    Ok(dumps_key(label))
 }
 
 /// Decode one state's rows (`rows[0]..rows[n]` of `out`) into the Python result object.
@@ -287,13 +319,16 @@ pub fn decode_answers(
                 // (`"1"` and `1` are distinct Python keys with one JSON spelling; upstream
                 // then emits a duplicate key, which a Map cannot hold, so the last one wins
                 // here as it does in any client that parses upstream's text.)
+                // `choice` is serialized before `probabilities`, so a non-finite label fails
+                // on the winner first, then on the first such label in option order.
+                let choice = python_value(&q.choice_labels[argmax])?;
                 let mut probs = Map::new();
                 for (label, &v) in q.choice_labels.iter().zip(&p) {
-                    probs.insert(dumps_key(label), Value::from(round_dp(v, 4)));
+                    probs.insert(label_key(label)?, Value::from(round_dp(v, 4)));
                 }
                 json!({
                     "type": "choice",
-                    "choice": python_value(&q.choice_labels[argmax]),
+                    "choice": choice,
                     "probabilities": probs,
                     "confidence": conf,
                     "answer_confidence": round_dp(p[argmax], 4),
@@ -304,8 +339,10 @@ pub fn decode_answers(
                 let exp_score: f64 = p.iter().enumerate().map(|(i, &x)| i as f64 * x).sum();
                 let mut legend = Map::new();
                 let mut probs = Map::new();
+                // `{str(i): c for i, c in enumerate(q["crit"])}`: the raw descriptions, with
+                // every number inside printed as Python would.
                 for (i, c) in q.score_legend.iter().enumerate() {
-                    legend.insert(i.to_string(), c.clone());
+                    legend.insert(i.to_string(), python_value(c)?);
                 }
                 for (i, &v) in p.iter().enumerate() {
                     probs.insert(i.to_string(), Value::from(round_dp(v, 4)));
@@ -444,7 +481,9 @@ mod tests {
         head.check_n_act(1).unwrap();
         let e = head.check_n_act(2).unwrap_err().to_string();
         assert!(
-            e.contains("1 output classes") && e.contains("lists 1 act_costs") && e.contains("must have 2"),
+            e.contains("1 output classes")
+                && e.contains("lists 1 act_costs")
+                && e.contains("must have 2"),
             "{e}"
         );
         let dir = act_head_checkpoint(6, 8, 3, 8);
@@ -635,69 +674,146 @@ mod tests {
         assert_eq!(answers["float"]["probabilities"]["1.5"], 0.87);
     }
 
-    /// A numeric label goes out as Python prints it, whatever the caller typed: `1E5` is
-    /// `100000.0`, `1e16` is `1e+16`, `-0` is `0`, and a big int keeps its digits. With
-    /// `arbitrary_precision` a serializer writes the Number's text verbatim, so the text
-    /// has to be Python's already. Expected strings are `json.dumps` output under Python 3.14.
-    #[test]
-    fn choice_label_is_printed_like_python() {
-        let labels: Vec<Value> =
-            serde_json::from_str("[1E5, 1e16, -0, 123456789012345678901234567890]").unwrap();
-        let q = |id: &str| Question {
-            id: id.into(),
-            qtype: QType::Choice,
-            instructions: String::new(),
-            options: labels.iter().map(pyjson::py_str).collect(),
-            choice_labels: labels.clone(),
-            score_legend: vec![],
-        };
-        let qs = [q("exp"), q("e16"), q("negzero"), q("big")];
-        let batch = Batch {
-            n: 4,
-            len: 1,
-            kmax: 4,
-            input_ids: vec![0; 4],
-            attention_mask: vec![1; 4],
-            seq_lens: vec![1; 4],
-            marker_pos: vec![0; 16],
-            marker_count: vec![4; 4],
-            qtype: vec![0; 4],
-        };
-        let mut logits = vec![0.0; 16];
-        for r in 0..4 {
-            logits[r * 4 + r] = 3.0;
+    /// Decode the questions of `text` (a `{qid: definition}` object) with temperatures 1 and
+    /// the zero act head. Row `j` gets logit 3 at option `winners[j]` and 0 at the others.
+    fn decode_with_winners(text: &str, winners: &[usize]) -> Result<Value> {
+        let qs = crate::question::parse_questions(&serde_json::from_str(text).unwrap()).unwrap();
+        let n = qs.len();
+        let kmax = qs.iter().map(|q| q.options.len()).max().unwrap_or(0);
+        let mut logits = vec![-1e4f32; n * kmax];
+        for (r, q) in qs.iter().enumerate() {
+            for k in 0..q.options.len() {
+                logits[r * kmax + k] = if k == winners[r] { 3.0 } else { 0.0 };
+            }
         }
+        let batch = Batch {
+            n,
+            len: 1,
+            kmax,
+            input_ids: vec![0; n],
+            attention_mask: vec![1; n],
+            seq_lens: vec![1; n],
+            marker_pos: vec![0; n * kmax],
+            marker_count: qs.iter().map(|q| q.options.len()).collect(),
+            qtype: qs.iter().map(|q| q.qtype.index() as u32).collect(),
+        };
         let out = BackendOutput {
             logits,
-            pooled: vec![0.0; 4 * 2],
+            pooled: vec![0.0; n * 2],
         };
         let temps = Temperatures {
             by_type: [1.0; 3],
             by_options: Map::new(),
             rejected: vec![],
         };
-        let answers = decode_answers(&out, &batch, &zero_act_head(2), &temps, &qs, 0).unwrap();
-        let printed = |id: &str| serde_json::to_string(&answers[id]["choice"]).unwrap();
-        assert_eq!(printed("exp"), "100000.0");
-        assert_eq!(printed("e16"), "1e+16");
-        assert_eq!(printed("negzero"), "0");
-        assert_eq!(printed("big"), "123456789012345678901234567890");
-        // The probabilities keys are the same text.
-        let keys: Vec<&String> = answers["exp"]["probabilities"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect();
-        assert_eq!(
-            keys,
-            ["100000.0", "1e+16", "0", "123456789012345678901234567890"]
+        decode_answers(&out, &batch, &zero_act_head(2), &temps, &qs, 0)
+    }
+
+    /// A numeric label goes out as Python prints it, whatever the caller typed: `1E5` is
+    /// `100000.0`, `1e16` is `1e+16`, `-0` is `0`, `1.10` is `1.1`, and an int of any size
+    /// keeps its digits, so two labels beyond `u64::MAX` that differ in the last digit stay
+    /// two answers. With `arbitrary_precision` a serializer writes the Number's text verbatim,
+    /// so the text has to be Python's already. Expected strings are `json.dumps` output under
+    /// Python 3.14.
+    #[test]
+    fn choice_label_is_printed_like_python() {
+        let want = [
+            "100000.0",
+            "1e+16",
+            "0",
+            "1.1",
+            "18446744073709551616",
+            "18446744073709551617",
+            "123456789012345678901234567890",
+        ];
+        let labels = "[1E5, 1e16, -0, 1.10, 18446744073709551616, 18446744073709551617, 123456789012345678901234567890]";
+        let ids: Vec<String> = (0..want.len()).map(|i| format!("q{i}")).collect();
+        let text = format!(
+            "{{{}}}",
+            ids.iter()
+                .map(|id| format!(
+                    r#""{id}": {{"type": "choice", "instructions": "x", "criteria": {labels}}}"#
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+        let winners: Vec<usize> = (0..want.len()).collect();
+        let answers = decode_with_winners(&text, &winners).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_string(&answers[id]["choice"]).unwrap(),
+                want[i],
+                "{id}"
+            );
+            // The probabilities keys are the same text, in label order.
+            let keys: Vec<&String> = answers[id]["probabilities"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect();
+            assert_eq!(keys, want, "{id}");
+        }
         // Strings and bools are untouched.
-        assert_eq!(python_value(&json!("1E5")), json!("1E5"));
-        assert_eq!(python_value(&json!(true)), json!(true));
-        // A non-finite float has no JSON text (`pyjson::dumps` writes `Infinity`); the label
-        // Value is returned unchanged.
-        let inf: Value = serde_json::from_str("1e400").unwrap();
-        assert_eq!(python_value(&inf), inf);
+        assert_eq!(python_value(&json!("1E5")).unwrap(), json!("1E5"));
+        assert_eq!(python_value(&json!(true)).unwrap(), json!(true));
+    }
+
+    /// The legend copies the score descriptions from the request, so every number in them,
+    /// nested or not, is printed as Python would. Expected text is `json.dumps` under Python
+    /// 3.14 with compact separators, as serde_json writes it.
+    #[test]
+    fn score_legend_is_printed_like_python() {
+        let answers = decode_with_winners(
+            r#"{"rate": {"type": "score", "instructions": "x",
+                "criteria": [1E5, {"desc": 1.10, "n": -0}, [0.0, -0.0, 18446744073709551617], "1E5", true]}}"#,
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&answers["rate"]["legend"]).unwrap(),
+            r#"{"0":100000.0,"1":{"desc":1.1,"n":0},"2":[0.0,-0.0,18446744073709551617],"3":"1E5","4":true}"#
+        );
+    }
+
+    /// A float label or legend entry with no finite value (`1e400`) passes validation and
+    /// reaches the model as the text `inf`, as upstream, and then fails the response the way
+    /// upstream's serializer does, with its message: the winner first (`choice` comes before
+    /// `probabilities`), then the first such label in option order, then the legend in order.
+    #[test]
+    fn non_finite_request_numbers_fail_like_upstream_serialization() {
+        let msg = |x: &str| format!("Out of range float values are not JSON compliant: {x}");
+        let choice = |crit: &str| {
+            format!(r#"{{"q": {{"type": "choice", "instructions": "x", "criteria": {crit}}}}}"#)
+        };
+        let err = |text: &str, winner: usize| {
+            decode_with_winners(text, &[winner])
+                .unwrap_err()
+                .to_string()
+        };
+        // The winner is finite; the key of another label is not.
+        assert_eq!(err(&choice("[1e400, \"b\"]"), 1), msg("inf"));
+        assert_eq!(err(&choice("[\"a\", -1e400]"), 0), msg("-inf"));
+        // The winner is not finite: it fails before the other label's key.
+        assert_eq!(err(&choice("[1e400, -1e400]"), 1), msg("-inf"));
+        assert_eq!(err(&choice("[1e400, -1e400]"), 0), msg("inf"));
+        assert!(matches!(
+            decode_with_winners(&choice("[1e400, \"b\"]"), &[1]),
+            Err(Error::Question(_))
+        ));
+        let score = |crit: &str| {
+            format!(r#"{{"q": {{"type": "score", "instructions": "x", "criteria": {crit}}}}}"#)
+        };
+        assert_eq!(err(&score("[\"low\", 1e400]"), 0), msg("inf"));
+        assert_eq!(
+            err(&score("[{\"desc\": [1, -1e400]}, 1e400]"), 0),
+            msg("-inf")
+        );
+        // The question before it is decoded; the failing one stops the response.
+        let two = r#"{"ok": {"type": "noul", "instructions": "x"},
+                      "bad": {"type": "choice", "instructions": "x", "criteria": [1e400]}}"#;
+        assert_eq!(
+            decode_with_winners(two, &[0, 0]).unwrap_err().to_string(),
+            msg("inf")
+        );
     }
 }
