@@ -109,6 +109,11 @@ impl EncoderConfig {
         }
         let num_hidden_layers = get_u("num_hidden_layers")?;
         let every = get_u("global_attn_every_n_layers").unwrap_or(3);
+        if every == 0 {
+            return Err(Error::Config(
+                "encoder config: global_attn_every_n_layers must be at least 1".into(),
+            ));
+        }
         let (mut g_theta, mut l_theta) = (
             get_f("global_rope_theta", 160000.0),
             get_f("local_rope_theta", 10000.0),
@@ -182,5 +187,43 @@ impl ModelConfig {
     }
     pub fn n_act(&self) -> usize {
         self.agent.n_act()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn minimal(extra: Value) -> Value {
+        let mut v = json!({
+            "model_type": "modernbert", "vocab_size": 100, "hidden_size": 64,
+            "num_hidden_layers": 6, "num_attention_heads": 2, "intermediate_size": 96,
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v
+    }
+
+    #[test]
+    fn layer_pattern_from_global_attn_interval() {
+        let cfg = EncoderConfig::from_value(&minimal(json!({}))).unwrap();
+        assert_eq!(cfg.global_attn_every_n_layers, 3);
+        assert_eq!(cfg.layer_is_local, [false, true, true, false, true, true]);
+        let cfg =
+            EncoderConfig::from_value(&minimal(json!({"global_attn_every_n_layers": 2}))).unwrap();
+        assert_eq!(cfg.layer_is_local, [false, true, false, true, false, true]);
+    }
+
+    #[test]
+    fn zero_global_attn_interval_is_a_config_error() {
+        let e = EncoderConfig::from_value(&minimal(json!({"global_attn_every_n_layers": 0})))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("global_attn_every_n_layers must be at least 1"),
+            "{e}"
+        );
     }
 }
