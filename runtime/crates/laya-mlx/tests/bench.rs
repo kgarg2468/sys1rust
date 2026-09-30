@@ -3,16 +3,18 @@
 //! Run from the repo root with:
 //! `cargo test --manifest-path runtime/Cargo.toml -p laya-mlx --release --test bench -- --ignored --nocapture`.
 
-use laya_core::testing::fixtures_path;
+use laya_core::testing::{checkpoint_dir, checkpoint_repo, fixtures_path};
 use laya_core::{parse_questions, Agent, BackendOptions};
 use serde_json::Value;
 
-fn bench(fixture: &str, subfolder: Option<&str>, opts: &BackendOptions) {
+/// `variant` names the checkpoint as `laya_core::testing::checkpoint_dir` does: `None` for
+/// English, `Some("multilingual")` for `convaiinnovations/laya-multilingual`.
+fn bench(fixture: &str, variant: Option<&str>, opts: &BackendOptions) {
     let path = fixtures_path(fixture);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
     let fx: Value = serde_json::from_slice(&bytes).unwrap();
-    let dir = laya_core::resolve::resolve_model_dir("convaiinnovations/laya", subfolder)
-        .unwrap_or_else(|e| panic!("checkpoint convaiinnovations/laya {subfolder:?}: {e}"));
+    let dir = checkpoint_dir(variant)
+        .unwrap_or_else(|e| panic!("checkpoint {}: {e}", checkpoint_repo(variant)));
     let agent = Agent::load(&dir, opts, laya_mlx::factory()).unwrap();
     println!("{} [{}]", fixture, agent.backend_name());
     for case in fx["cases"].as_array().unwrap() {
