@@ -10,11 +10,15 @@
 pub mod config;
 pub mod error;
 pub mod pyjson;
+pub mod question;
 pub mod resolve;
+pub mod tokenizer;
 pub mod weights;
 
 pub use config::{AgentConfig, EncoderConfig, ModelConfig};
 pub use error::Error;
+pub use question::{parse_questions, QType, Question};
+pub use tokenizer::LayaTokenizer;
 pub use weights::Weights;
 
 pub type Result<T> = std::result::Result<T, Error>;

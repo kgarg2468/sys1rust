@@ -18,6 +18,17 @@ pub fn dumps(v: &Value) -> String {
     out
 }
 
+/// The key `json.dumps` writes for a dict key holding `v`: a string as it is, anything else
+/// as its JSON text (`1`, `1.5`, `1e+16`, `true`, `null`, an integer's digits). This is how a
+/// non-string choice label comes back as a `probabilities` key: upstream's `_to_internal`
+/// keeps the raw label as the dict key and FastAPI's `json.dumps` stringifies it.
+pub fn dumps_key(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => dumps(other),
+    }
+}
+
 fn write_value(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
@@ -93,6 +104,63 @@ impl Num {
         } else {
             Num::Float(n.as_f64().unwrap_or(0.0))
         }
+    }
+
+    /// Python `==` between two numbers: two ints by their digits, two floats by value, an int
+    /// and a float exactly (`10**16 == 1e16` but `2**53 + 1 != 2.0**53`).
+    fn eq(&self, other: &Num) -> bool {
+        match (self, other) {
+            (Num::Int(a), Num::Int(b)) => a == b,
+            (Num::Float(a), Num::Float(b)) => a == b,
+            (Num::Int(digits), Num::Float(x)) | (Num::Float(x), Num::Int(digits)) => {
+                // An integral finite f64 prints its exact digits with `{:.0}`; `-0.0` is `0`.
+                x.is_finite()
+                    && x.fract() == 0.0
+                    && (*x == 0.0 && digits == "0" || format!("{x:.0}") == *digits)
+            }
+        }
+    }
+}
+
+/// Python's `type(v).__name__` for the value `json.loads` builds for `v`.
+pub fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) => match Num::of(n) {
+            Num::Int(_) => "int",
+            Num::Float(_) => "float",
+        },
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// Python `==` between the values `json.loads` builds for `a` and `b`. `bool` is an `int`
+/// subclass, so `True == 1 == 1.0` and `False == 0 == 0.0`; a string equals only the same
+/// string; lists compare in order and dicts by key set and values.
+pub fn py_eq(a: &Value, b: &Value) -> bool {
+    fn as_num(v: &Value) -> Option<Num> {
+        match v {
+            Value::Bool(b) => Some(Num::Int(if *b { "1".into() } else { "0".into() })),
+            Value::Number(n) => Some(Num::of(n)),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| py_eq(v, w)))
+        }
+        _ => match (as_num(a), as_num(b)) {
+            (Some(x), Some(y)) => x.eq(&y),
+            _ => false,
+        },
     }
 }
 
@@ -517,6 +585,20 @@ mod tests {
         assert_eq!(dumps(&json!(-0.0)), "-0.0");
     }
 
+    /// Expected strings are the keys `json.dumps` writes for a dict keyed by the same values
+    /// under Python 3.14: `{1: 0, "b": 0, 1.5: 0, 1e16: 0, False: 0, None: 0}`.
+    #[test]
+    fn dumps_key_matches_json_dumps_dict_keys() {
+        assert_eq!(dumps_key(&json!(1)), "1");
+        assert_eq!(dumps_key(&json!("b")), "b");
+        assert_eq!(dumps_key(&json!("it's \"q\"\n")), "it's \"q\"\n");
+        assert_eq!(dumps_key(&json!(true)), "true");
+        assert_eq!(dumps_key(&json!(false)), "false");
+        assert_eq!(dumps_key(&json!(1.5)), "1.5");
+        assert_eq!(dumps_key(&json!(1e16)), "1e+16");
+        assert_eq!(dumps_key(&Value::Null), "null");
+    }
+
     #[test]
     fn float_repr_matches_python() {
         for (x, s) in [
@@ -566,6 +648,43 @@ mod tests {
             "{'k': [1, {'n': None}], 'e': {}}"
         );
         assert_eq!(repr(&json!(["B"])), "['B']");
+    }
+
+    #[test]
+    fn type_name_matches_python() {
+        assert_eq!(type_name(&Value::Null), "NoneType");
+        assert_eq!(type_name(&json!(true)), "bool");
+        assert_eq!(type_name(&json!(1)), "int");
+        assert_eq!(type_name(&json!(1.5)), "float");
+        assert_eq!(type_name(&json!("s")), "str");
+        assert_eq!(type_name(&json!([1])), "list");
+        assert_eq!(type_name(&json!({})), "dict");
+    }
+
+    /// Each pair was checked with `==` under Python 3.14 on `json.loads` of the same text.
+    #[test]
+    fn py_eq_follows_python_equality() {
+        let eq = |a: Value, b: Value| py_eq(&a, &b);
+        assert!(eq(json!(1), json!(1.0)));
+        assert!(eq(json!(true), json!(1)));
+        assert!(eq(json!(true), json!(1.0)));
+        assert!(eq(json!(false), json!(0)));
+        assert!(eq(json!(0), json!(-0.0)));
+        assert!(eq(json!(1e16), json!(10000000000000000u64)));
+        assert!(eq(json!("a"), json!("a")));
+        assert!(eq(Value::Null, Value::Null));
+        assert!(eq(json!([1, "a"]), json!([1.0, "a"])));
+        assert!(eq(json!({"k": 1}), json!({"k": true})));
+        assert!(!eq(json!("1"), json!(1)));
+        assert!(!eq(json!(1), json!(2)));
+        assert!(!eq(json!(1.5), json!(1)));
+        assert!(!eq(json!(true), json!("True")));
+        assert!(!eq(Value::Null, json!(0)));
+        assert!(!eq(Value::Null, json!(false)));
+        // 2**53 + 1 is not representable as f64; Python compares exactly, not by rounding.
+        assert!(!eq(json!(9007199254740993u64), json!(9007199254740992.0)));
+        assert!(!eq(json!([1]), json!([1, 1])));
+        assert!(!eq(json!({"k": 1}), json!({"j": 1})));
     }
 
     /// `str()` is `repr()` for everything but a string, which it returns unchanged.
