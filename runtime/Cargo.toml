@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/laya-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+laya-core = { path = "crates/laya-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+safetensors = "0.8"
+memmap2 = "0.9"
+half = "2"
+libm = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = false

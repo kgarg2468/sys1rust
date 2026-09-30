@@ -1,0 +1,374 @@
+//! Checkpoint configuration: `rl_agent_config.json` and `encoder/config.json`.
+
+use crate::{Error, Result};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use std::path::Path;
+
+/// `rl_agent_config.json` as shipped with a Laya checkpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentConfig {
+    pub encoder: String,
+    #[serde(default = "d_head_layers")]
+    pub head_layers: usize,
+    #[serde(default = "d_max_len")]
+    pub max_len: usize,
+    #[serde(default = "d_head_max_len")]
+    pub head_max_len: usize,
+    #[serde(default)]
+    pub act_costs: Map<String, Value>,
+    #[serde(default = "d_temperature")]
+    pub temperature: Vec<Value>,
+    #[serde(default)]
+    pub temperature_by_options: Map<String, Value>,
+    #[serde(default)]
+    pub amp_dtype: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+}
+
+fn d_head_layers() -> usize {
+    2
+}
+fn d_max_len() -> usize {
+    512
+}
+fn d_head_max_len() -> usize {
+    192
+}
+fn d_temperature() -> Vec<Value> {
+    vec![Value::from(1.0), Value::from(1.0), Value::from(1.0)]
+}
+
+impl AgentConfig {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let p = dir.join("rl_agent_config.json");
+        if !p.exists() {
+            return Err(Error::Config(format!(
+                "Incompatible model: {} does not contain 'rl_agent_config.json'. That file ships with the weights of a Laya checkpoint.",
+                dir.display()
+            )));
+        }
+        let cfg: AgentConfig = serde_json::from_slice(&std::fs::read(p)?)?;
+        Ok(cfg)
+    }
+
+    /// Number of action classes: `len(act_costs) + 1`.
+    pub fn n_act(&self) -> usize {
+        self.act_costs.len() + 1
+    }
+}
+
+/// The ModernBERT encoder architecture (`encoder/config.json`), normalized across the
+/// transformers 4.x (`global_rope_theta`) and 5.x (`rope_parameters`) config layouts.
+#[derive(Debug, Clone)]
+pub struct EncoderConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub intermediate_size: usize,
+    pub norm_eps: f64,
+    pub global_attn_every_n_layers: usize,
+    /// Sliding window width in tokens (a query attends keys within `local_attention / 2`).
+    pub local_attention: usize,
+    pub global_rope_theta: f64,
+    pub local_rope_theta: f64,
+    pub pad_token_id: u32,
+    pub max_position_embeddings: usize,
+    /// Per layer: `true` when the layer uses sliding-window attention.
+    pub layer_is_local: Vec<bool>,
+}
+
+impl EncoderConfig {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let p = dir.join("encoder").join("config.json");
+        if !p.exists() {
+            return Err(Error::Config(format!(
+                "missing encoder config {}",
+                p.display()
+            )));
+        }
+        let v: Value = serde_json::from_slice(&std::fs::read(p)?)?;
+        Self::from_value(&v)
+    }
+
+    pub fn from_value(v: &Value) -> Result<Self> {
+        let get_u = |k: &str| -> Result<usize> {
+            v.get(k)
+                .and_then(Value::as_u64)
+                .map(|x| x as usize)
+                .ok_or_else(|| Error::Config(format!("encoder config: missing integer '{k}'")))
+        };
+        let get_f = |k: &str, d: f64| v.get(k).and_then(Value::as_f64).unwrap_or(d);
+        if v.get("model_type").and_then(Value::as_str) != Some("modernbert") {
+            return Err(Error::Config(format!(
+                "unsupported encoder model_type {:?}; only 'modernbert' is implemented",
+                v.get("model_type")
+            )));
+        }
+        let num_hidden_layers = get_u("num_hidden_layers")?;
+        let every = get_u("global_attn_every_n_layers").unwrap_or(3);
+        if every == 0 {
+            return Err(Error::Config(
+                "encoder config: global_attn_every_n_layers must be at least 1".into(),
+            ));
+        }
+        let (mut g_theta, mut l_theta) = (
+            get_f("global_rope_theta", 160000.0),
+            get_f("local_rope_theta", 10000.0),
+        );
+        if let Some(rp) = v.get("rope_parameters") {
+            if let Some(t) = rp
+                .pointer("/full_attention/rope_theta")
+                .and_then(Value::as_f64)
+            {
+                g_theta = t;
+            }
+            if let Some(t) = rp
+                .pointer("/sliding_attention/rope_theta")
+                .and_then(Value::as_f64)
+            {
+                l_theta = t;
+            }
+        }
+        let layer_is_local: Vec<bool> = match v.get("layer_types").and_then(Value::as_array) {
+            Some(types) if types.len() == num_hidden_layers => types
+                .iter()
+                .map(|t| t.as_str() == Some("sliding_attention"))
+                .collect(),
+            _ => (0..num_hidden_layers).map(|i| i % every != 0).collect(),
+        };
+        let cfg = Self {
+            vocab_size: get_u("vocab_size")?,
+            hidden_size: get_u("hidden_size")?,
+            num_hidden_layers,
+            num_attention_heads: get_u("num_attention_heads")?,
+            intermediate_size: get_u("intermediate_size")?,
+            norm_eps: get_f("norm_eps", get_f("layer_norm_eps", 1e-5)),
+            global_attn_every_n_layers: every,
+            local_attention: get_u("local_attention").unwrap_or(128),
+            global_rope_theta: g_theta,
+            local_rope_theta: l_theta,
+            pad_token_id: v.get("pad_token_id").and_then(Value::as_u64).unwrap_or(0) as u32,
+            max_position_embeddings: get_u("max_position_embeddings").unwrap_or(8192),
+            layer_is_local,
+        };
+        cfg.check_shapes()?;
+        Ok(cfg)
+    }
+
+    /// The shapes a backend divides by or reshapes with, checked here so a broken checkpoint
+    /// is a config error naming the field rather than a panic when the backend is built.
+    /// transformers asserts the same divisibility in `ModernBertAttention`, and torch's
+    /// `MultiheadAttention` in the decision head.
+    fn check_shapes(&self) -> Result<()> {
+        let bad = |msg: String| Err(Error::Config(format!("encoder config: {msg}")));
+        if self.num_attention_heads == 0 {
+            return bad("num_attention_heads must be at least 1".into());
+        }
+        if self.hidden_size == 0 {
+            return bad("hidden_size must be at least 1".into());
+        }
+        if self.hidden_size % self.num_attention_heads != 0 {
+            return bad(format!(
+                "hidden_size {} is not a multiple of num_attention_heads {}",
+                self.hidden_size, self.num_attention_heads
+            ));
+        }
+        if self.hidden_size % self.head_nheads() != 0 {
+            return bad(format!(
+                "hidden_size {} is not a multiple of the {} decision-head attention heads (max(1, hidden_size // 64))",
+                self.hidden_size,
+                self.head_nheads()
+            ));
+        }
+        // A query attends keys within `local_attention / 2`; the chunked attention path
+        // divides the sequence by that window, so it must be at least one token.
+        if self.local_attention < 2 {
+            return bad("local_attention must be at least 2".into());
+        }
+        Ok(())
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+
+    /// Heads of the decision-head transformer layers: `max(1, d // 64)`.
+    pub fn head_nheads(&self) -> usize {
+        (self.hidden_size / 64).max(1)
+    }
+}
+
+/// Everything a backend needs to build the full `DecisionModel`.
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    pub agent: AgentConfig,
+    pub encoder: EncoderConfig,
+}
+
+impl ModelConfig {
+    pub fn load(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            agent: AgentConfig::load(dir)?,
+            encoder: EncoderConfig::load(dir)?,
+        })
+    }
+    pub fn hidden_size(&self) -> usize {
+        self.encoder.hidden_size
+    }
+    /// Heads of the decision-head transformer layers: `max(1, d // 64)`.
+    pub fn head_nheads(&self) -> usize {
+        self.encoder.head_nheads()
+    }
+    pub fn head_ffn(&self) -> usize {
+        4 * self.encoder.hidden_size
+    }
+    pub fn n_act(&self) -> usize {
+        self.agent.n_act()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn minimal(extra: Value) -> Value {
+        let mut v = json!({
+            "model_type": "modernbert", "vocab_size": 100, "hidden_size": 64,
+            "num_hidden_layers": 6, "num_attention_heads": 2, "intermediate_size": 96,
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        v
+    }
+
+    #[test]
+    fn layer_pattern_from_global_attn_interval() {
+        let cfg = EncoderConfig::from_value(&minimal(json!({}))).unwrap();
+        assert_eq!(cfg.global_attn_every_n_layers, 3);
+        assert_eq!(cfg.layer_is_local, [false, true, true, false, true, true]);
+        let cfg =
+            EncoderConfig::from_value(&minimal(json!({"global_attn_every_n_layers": 2}))).unwrap();
+        assert_eq!(cfg.layer_is_local, [false, true, false, true, false, true]);
+    }
+
+    /// The attention layout of the three published checkpoints, copied from their
+    /// `encoder/config.json` (convaiinnovations/laya-typed-decisions at transformers 5.17.0,
+    /// laya-multilingual and laya at 5.0.0). Every one ships `global_attn_every_n_layers: 3`
+    /// and a `layer_types` list; the two must agree with the rule transformers' ModernBERT
+    /// applies. `ModernBertConfig.__init__` fills a missing list with `"sliding_attention" if
+    /// bool(i % global_attn_every_n_layers) else "full_attention"` and `ModernBertAttention`
+    /// reads `config.layer_types[layer_idx]`. The full-model answer check for this pattern is
+    /// `crates/laya-mlx/tests/reference.rs`.
+    #[test]
+    fn published_encoders_match_the_transformers_layer_rule() {
+        const S: &str = "sliding_attention";
+        const F: &str = "full_attention";
+        // 28 layers: laya-typed-decisions and laya (ModernBERT-large).
+        let large = [
+            F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F,
+        ];
+        // 22 layers: laya-multilingual (ModernBERT-base).
+        let base = [
+            F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F, S, S, F,
+        ];
+        for (name, hidden, types) in [
+            ("laya-typed-decisions", 1024, &large[..]),
+            ("laya-multilingual", 768, &base[..]),
+            ("laya", 1024, &large[..]),
+        ] {
+            let n = types.len();
+            let published = json!({
+                "model_type": "modernbert", "vocab_size": 50368, "hidden_size": hidden,
+                "num_hidden_layers": n, "num_attention_heads": hidden / 64,
+                "intermediate_size": hidden * 5 / 2, "global_attn_every_n_layers": 3,
+                "local_attention": 128, "layer_types": types,
+            });
+            let cfg = EncoderConfig::from_value(&published).unwrap();
+            let rule: Vec<bool> = (0..n).map(|i| i % 3 != 0).collect();
+            assert_eq!(
+                cfg.layer_is_local, rule,
+                "{name}: layer_types vs the % 3 rule"
+            );
+            assert_eq!(cfg.layer_is_local.len(), n, "{name}");
+            // The transformers 4.x layout of the same file has no `layer_types`; the pattern
+            // must not depend on which layout the checkpoint was saved with.
+            let mut older = published.clone();
+            older.as_object_mut().unwrap().remove("layer_types");
+            let cfg_older = EncoderConfig::from_value(&older).unwrap();
+            assert_eq!(
+                cfg_older.layer_is_local, cfg.layer_is_local,
+                "{name}: 4.x layout"
+            );
+        }
+    }
+
+    /// `layer_types` wins over the interval when a config carries both, since that is what
+    /// transformers reads first.
+    #[test]
+    fn layer_types_override_the_interval() {
+        let cfg = EncoderConfig::from_value(&minimal(json!({
+            "global_attn_every_n_layers": 3,
+            "layer_types": ["sliding_attention", "full_attention", "sliding_attention",
+                            "sliding_attention", "full_attention", "sliding_attention"],
+        })))
+        .unwrap();
+        assert_eq!(cfg.layer_is_local, [true, false, true, true, false, true]);
+    }
+
+    /// The shapes a backend divides by or reshapes with are checked at load, so a broken
+    /// checkpoint is a config error with the field's name instead of a panic in the first
+    /// forward (`head_dim` divides by the head count, the head split needs an even division,
+    /// the windowed attention chunks the sequence by `local_attention / 2`).
+    #[test]
+    fn shapes_a_backend_divides_by_are_checked() {
+        let err = |extra: Value| {
+            EncoderConfig::from_value(&minimal(extra))
+                .unwrap_err()
+                .to_string()
+        };
+        let e = err(json!({"num_attention_heads": 0}));
+        assert!(e.contains("num_attention_heads must be at least 1"), "{e}");
+        let e = err(json!({"hidden_size": 0}));
+        assert!(e.contains("hidden_size must be at least 1"), "{e}");
+        let e = err(json!({"hidden_size": 65}));
+        assert!(
+            e.contains("hidden_size 65 is not a multiple of num_attention_heads 2"),
+            "{e}"
+        );
+        // 200 splits into 2 encoder heads of 100, but the decision head has 200 // 64 = 3
+        // heads and 3 does not divide 200.
+        let e = err(json!({"hidden_size": 200, "num_attention_heads": 2}));
+        assert!(
+            e.contains("hidden_size 200 is not a multiple of the 3 decision-head attention heads"),
+            "{e}"
+        );
+        for w in [0, 1] {
+            let e = err(json!({"local_attention": w}));
+            assert!(e.contains("local_attention must be at least 2"), "{e}");
+        }
+        // The published shapes and a small even one pass.
+        for (hidden, heads) in [(1024, 16), (768, 12), (192, 3), (64, 2), (32, 1)] {
+            let cfg = EncoderConfig::from_value(&minimal(
+                json!({"hidden_size": hidden, "num_attention_heads": heads}),
+            ))
+            .unwrap();
+            assert_eq!(cfg.head_dim(), hidden / heads);
+        }
+    }
+
+    #[test]
+    fn zero_global_attn_interval_is_a_config_error() {
+        let e = EncoderConfig::from_value(&minimal(json!({"global_attn_every_n_layers": 0})))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("global_attn_every_n_layers must be at least 1"),
+            "{e}"
+        );
+    }
+}
