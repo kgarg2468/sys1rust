@@ -56,10 +56,14 @@ Building the server found two bugs in the runtime, fixed in e758bfa.
 
 ## Running it
 
+`sys1d` has to be built first. The `runtime/` workspace arrives later in this PR stack, and the top-level `README.md` has the build steps. The commands below use the bench setup. `bench/env.sh` points the build at the MLX in the laya-mlx contender's venv (`bench/contenders/laya-mlx/NOTES.md`), and puts the Cargo output and the Hugging Face cache under `bench/`. The revision is the typed-decisions pin in `bench/models.lock.json`, which these measurements used.
+
 ```bash
 source bench/env.sh
-hf download convaiinnovations/laya-typed-decisions   # once; sys1d never downloads
-$CARGO_TARGET_DIR/release/sys1d --model typed-decisions --port 8000
+cargo build --release --manifest-path runtime/Cargo.toml -p sys1d
+REV=1a793eb568e6718f15941d08f85432581df534e3
+hf download convaiinnovations/laya-typed-decisions --revision $REV   # once; sys1d never downloads
+$CARGO_TARGET_DIR/release/sys1d --model typed-decisions --revision $REV --port 8000
 ```
 
 `sys1d --help` lists the options. They use upstream's environment variables (`LAYA_PORT`, `LAYA_API_KEY`, `LAYA_MAX_CONCURRENT` and so on). It binds 127.0.0.1 by default where upstream binds 0.0.0.0. When ready, it prints one JSON line on stdout with the address, model, revision, load time and warm-up time. SIGINT or SIGTERM lets requests in flight finish before it exits.

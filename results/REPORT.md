@@ -229,6 +229,6 @@ The best CPU paths are about 6x slower than the best GPU path for one question a
 
 ## Cleanup (done 2026-09-29 08:56 PT)
 
-- `bench/teardown.sh --yes` deleted the 65 GB `bench/` folder, the four Core ML compile caches in `~/Library/Caches` (about 20 GB), the two rustup toolchains and the temp files, and stopped caffeinate. 18 more empty onnxruntime `mat-debug-*.log` files from the benchmark window were deleted by hand.
+- `bench/teardown.sh --yes` deleted the 65 GB `bench/` folder, the four Core ML compile caches in the per-user Caches folder (about 20 GB), the two rustup toolchains and the temp files, and stopped caffeinate. 18 more empty onnxruntime `mat-debug-*.log` files from the benchmark window were deleted by hand.
 - Before deleting, the last small files were copied here: the final STATUS.md, laya-mlx's `tools/`, jevalaya's `run-configs/` and laya-mlx's research docs (`raw/laya-mlx-docs/`). No contender source checkout had local changes.
 - Still to do by you: `sudo rm /etc/sudoers.d/sys1rust-powermetrics` (needs your password). The rule stops working on its own at 11:56 PT today.

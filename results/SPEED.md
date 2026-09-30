@@ -131,6 +131,6 @@ All three published Laya models now run in the Rust runtime. Before this round o
 ## Files
 
 - **Code.** `runtime/crates/laya-mlx/src/lib.rs` has the settings `dense_upto`, `headprune` and `unpad`. The experiments that did not help are at commit 0495800. `crates/laya-mlx/tests/settings.rs` has the equivalence tests. `runtime/crates/sys1-bench/src/bin/sys1-probe.rs` has `--ab SPEC_A SPEC_B` and `--check`.
-- **Stage G.** `raw/speed/review/` holds the multilingual and english runs before the review (stage F) and after it (stage G), the paired speed log `stageG-ab.log`, and `stageF.sh`.
+- **Stage G.** `raw/speed/review/` holds the multilingual and english runs before the review (stage F) and after it (stage G), the paired speed log `stageG-ab.log`, and `stageF.sh`. Stage F ran the `sys1-bench` in the default target directory, not the build passed to it as `BIN_DIR`, because the sys1rust adapter re-sourced `bench/env.sh` and reset `CARGO_TARGET_DIR` (since fixed). Its results record `code_version` 0495800, which names the source tree, not the binary that ran; stage G ran on the reviewed build and is unaffected.
 - **Results.** `raw/speed/bench/results/` holds stage E (timing, correctness and short) and the three alternating short runs. `raw/speed/fakeq/` holds the int8 simulation outputs.
 - **Scripts.** `raw/speed/scripts/` has `stageE.sh` and its log, `gemm_shapes.py` (matmul speed at the model's shapes), `fakeq_adapter.py`, `long.jsonl` (1,024-token rows), and the per-op profile taken on battery (`ops-battery.txt`).

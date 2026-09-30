@@ -7,7 +7,7 @@ Date: 2026-09-29. Inputs: the base-M5 bake-off (`REPORT.md`, 227 runs), the 2026
 | gap (research, 2026-09-28) | status today | what the bench adds |
 |---|---|---|
 | 1. A model and runtime that encode the state once and answer every question against it | Still open. kime-v1 (split state and question towers, state cache) is milestone M3 on kime's roadmap, "weeks 9 to 14", and is not shipped. kime shipped 4 releases in the last 36 hours, all training and eval tooling. ikken has no checkpoint (last push 09-28). Laya upstream: not planned (issue #49). No new repo does it. | This is the biggest lever measured. See "Why the model is the lever" below. |
-| 2. A same-machine benchmark across runtimes with an agreement gate | Built by us, not published. The research found no other. | Our harness and data are in `raw/`. |
+| 2. A same-machine benchmark across runtimes with an agreement gate | Built by us, not published. The research found no other. | The harness is in `bench/harness/`. The run data is in `raw/`, which is not in the repository. |
 | 3. A native Apple engine that routes ANE and GPU, batches across requests, and beats MPS, MLX and Core ML | Still open. No Rust runtime has shown the compiled MLX speed without MLX's tails. The three Rust ports on mlx-rs were not in the bench. | The bench changes the recipe. See "What the bench says about the Rust + MLX/ANE plan" below. |
 | 4. Laya numbers on a base M5 | The research found none. Ours are not published. | `REPORT.md` |
 
@@ -72,7 +72,7 @@ The goal stays the same: one Rust binary, no Python, serving `/v1/systemone`, wi
 - ANE lane through objc2-core-ml, opt-in, for single questions up to 128 tokens when power matters more than speed. laya-apple's converter (Apache-2.0) already builds a typed-decisions ANE model that passed the agreement gate here.
 - One inference thread and a request queue. Cross-request batching gained nothing here, so leave it out.
 - The sequence layout comes from the model config, so a packed model (below) can be added later without a rewrite.
-- Every change is gated on 99% agreement with the saved harness in `raw/bench/harness/`.
+- Every change is gated on 99% agreement with upstream Laya's fp32 answers. `bench/harness/compare.py` checks it against the saved reference answers in `bench/reference/`.
 
 **Risks to check first.**
 
