@@ -1,4 +1,6 @@
 #!/bin/bash
+# Needs a runtime built from PR #17 or later. PR #17 adds the dense_upto, headprune and unpad
+# settings of SYS1_MLX, and earlier builds reject them.
 # Stage E: the exact speed settings (dense local attention, last head layer pruned, unpadding)
 # against Python laya-mlx at its fastest (compiled, cache capped) and against our current default.
 # Two rounds in opposite order, so drift in machine state hits every contender.

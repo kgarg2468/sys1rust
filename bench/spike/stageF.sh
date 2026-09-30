@@ -1,4 +1,6 @@
 #!/bin/bash
+# Needs a runtime built from PR #17 or later. PR #17 adds the dense_upto, headprune and unpad
+# settings of SYS1_MLX, and earlier builds reject them.
 # Stage F: other Laya checkpoints (multilingual, english) through the Rust runtime, old default
 # (mlx-fp16-fast) vs the speed settings (mlx-env). Correctness only; the machine is busy.
 # Usage: stageF.sh STAMP BIN_DIR "model workload warmup repeats" ...
