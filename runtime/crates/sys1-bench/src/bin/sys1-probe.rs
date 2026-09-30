@@ -5,7 +5,9 @@
 //!
 //! Takes the first row of each shape (`shape.state_tokens`, `shape.n_questions`). `grouped` runs
 //! each shape `iters` times in a row after `warmup` runs; `mixed` cycles through the shapes
-//! `iters` times, so every request follows a different shape. Prints min, p50 and max ms.
+//! `iters` times, so every request follows a different shape. Prints a header with the model,
+//! the engine (device and precision) and the settings the timings were taken under, then min,
+//! p50 and max ms.
 //! Backend settings are a laya-mlx `Knobs` spec: `--tuning` (default: none, the upstream
 //! reproduction), or `SYS1_MLX` when `--tuning` is absent. Every spec is checked at startup, so
 //! a bad one is an error and not a run reported under settings that were never applied. The
@@ -67,24 +69,30 @@ fn main() -> Result<()> {
     if iters == 0 {
         anyhow::bail!("--iters must be at least 1 (there is no p50 of no runs)");
     }
-    // The settings the run is reported under; a bad one is an error, not a silent default.
-    match (&ab, &tuning) {
+    // The settings the run is reported under; a bad one is an error, not a silent default. The
+    // single run's spec is resolved here (`--tuning`, else `SYS1_MLX`, else none) so that the
+    // header prints exactly what the backend is given.
+    let spec = match (&ab, tuning) {
         (Some((a, b)), _) => {
             laya_mlx::check_settings(a).with_context(|| format!("--ab A `{a}`"))?;
             laya_mlx::check_settings(b).with_context(|| format!("--ab B `{b}`"))?;
             if let Err(e) = same_process_wide_limits(a, b) {
                 anyhow::bail!("--ab: {e}");
             }
+            String::new()
         }
-        (None, Some(spec)) => laya_mlx::check_settings(spec).with_context(|| format!("--tuning `{spec}`"))?,
+        (None, Some(spec)) => {
+            laya_mlx::check_settings(&spec).with_context(|| format!("--tuning `{spec}`"))?;
+            spec
+        }
         (None, None) => {
-            if let Ok(spec) = std::env::var("SYS1_MLX") {
-                laya_mlx::check_settings(&spec).context("SYS1_MLX")?;
-            }
+            let spec = std::env::var("SYS1_MLX").unwrap_or_default();
+            laya_mlx::check_settings(&spec).context("SYS1_MLX")?;
+            spec
         }
-    }
+    };
     let bench = std::env::var("BENCH_ROOT").context("source bench/env.sh")?;
-    let (dir, _sha) = sys1_bench::pinned_model_dir(Path::new(&bench), &model)?;
+    let (dir, sha) = sys1_bench::pinned_model_dir(Path::new(&bench), &model)?;
 
     let mut picked: Vec<(String, Value)> = Vec::new();
     let file = std::fs::File::open(&workload).with_context(|| format!("open workload {workload}"))?;
@@ -104,11 +112,12 @@ fn main() -> Result<()> {
     }
 
     if let Some((spec_a, spec_b)) = ab {
-        return ab_run(&dir, f32, &picked, &spec_a, &spec_b, warmup, iters, mixed, check);
+        return ab_run(&dir, &format!("{model}\t{sha}"), f32, &picked, &spec_a, &spec_b, warmup, iters, mixed, check);
     }
 
-    let opts = BackendOptions { f32, tuning, ..Default::default() };
+    let opts = BackendOptions { f32, tuning: Some(spec.clone()), ..Default::default() };
     let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend))?;
+    print!("{}", header(&format!("{model}\t{sha}"), &agent.backend_name(), &[("settings", &spec)]));
     let run = |row: &Value| -> Result<(f64, u64)> {
         let (ms, tok, _) = predict(&agent, row)?;
         Ok((ms, tok))
@@ -170,10 +179,24 @@ fn predict(agent: &Agent, row: &Value) -> Result<(f64, u64, Value)> {
     Ok((ms, tokens, out["answers"].take()))
 }
 
+/// The lines above the timings that say what they were taken under: the model (name and
+/// pinned sha), the engine name, which carries the device and the precision (`mlx(gpu,f16)`),
+/// and one line per settings spec as applied (`(none)` for the upstream defaults). Saved runs
+/// with different tuning are told apart by this header alone.
+fn header(model: &str, engine: &str, settings: &[(&str, &str)]) -> String {
+    let mut h = format!("model\t{model}\nengine\t{engine}\n");
+    for (label, spec) in settings {
+        let spec = if spec.is_empty() { "(none)" } else { spec };
+        h.push_str(&format!("{label}\t{spec}\n"));
+    }
+    h
+}
+
 /// `--ab`: A and B on every shape, strictly alternating, plus the answer check.
 #[allow(clippy::too_many_arguments)]
 fn ab_run(
     dir: &std::path::Path,
+    model: &str,
     f32: bool,
     picked: &[(String, Value)],
     spec_a: &str,
@@ -188,7 +211,7 @@ fn ab_run(
         Ok(Agent::load(dir, &opts, Box::new(laya_mlx::make_backend))?)
     };
     let agents = [load(spec_a)?, load(spec_b)?];
-    println!("A\t{spec_a}\nB\t{spec_b}");
+    print!("{}", header(model, &agents[0].backend_name(), &[("A", spec_a), ("B", spec_b)]));
 
     let mut times: [Vec<Vec<f64>>; 2] = [vec![Vec::new(); picked.len()], vec![Vec::new(); picked.len()]];
     let mut tokens = vec![0u64; picked.len()];
@@ -482,6 +505,18 @@ mod tests {
         let mut t = AnswerCheck::default();
         t.merge(&c);
         assert_eq!(t.missing, 1);
+    }
+
+    /// The header names the model, the engine (with its precision) and every settings spec; an
+    /// empty spec is `(none)`.
+    #[test]
+    fn header_says_what_the_timings_were_taken_under() {
+        let h = header("typed-decisions\t1a793eb", "mlx(gpu,f16)", &[("settings", "f16gelu,cache=512")]);
+        assert_eq!(h, "model\ttyped-decisions\t1a793eb\nengine\tmlx(gpu,f16)\nsettings\tf16gelu,cache=512\n");
+        let h = header("multilingual\te4e9ddf", "mlx(gpu,f32)", &[("settings", "")]);
+        assert!(h.contains("engine\tmlx(gpu,f32)\n") && h.ends_with("settings\t(none)\n"), "{h}");
+        let h = header("english\t55cf4c4", "mlx(gpu,f16)", &[("A", "f16gelu"), ("B", "f16gelu,unpad")]);
+        assert!(h.ends_with("A\tf16gelu\nB\tf16gelu,unpad\n"), "{h}");
     }
 
     #[test]
