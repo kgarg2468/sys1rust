@@ -3,13 +3,10 @@
 //! two rules this spec adds: budget overrides are refused, and a `model` naming another
 //! checkpoint is an error rather than a routing hint.
 
-mod py_repr;
-
 use crate::config::checkpoint_name;
 use axum::http::StatusCode;
+use laya_core::pyjson::repr_str;
 use serde_json::Value;
-
-pub use py_repr::py_repr;
 
 pub const MAX_QUESTIONS: usize = 64;
 pub const MAX_STATE_CHARS: usize = 50_000;
@@ -115,7 +112,7 @@ pub fn check_limits(state: &Value, questions: &Value) -> Result<(), Rejection> {
                 if count > MAX_CHOICE_OPTIONS {
                     return Err(too_large(format!(
                         "too many choice options for {} ({count} > {MAX_CHOICE_OPTIONS})",
-                        py_repr(qid)
+                        repr_str(qid)
                     )));
                 }
             }
@@ -127,7 +124,7 @@ pub fn check_limits(state: &Value, questions: &Value) -> Result<(), Rejection> {
                 if a.len() > MAX_SCORE_LEVELS {
                     return Err(too_large(format!(
                         "too many score levels for {} ({} > {MAX_SCORE_LEVELS})",
-                        py_repr(qid),
+                        repr_str(qid),
                         a.len()
                     )));
                 }
@@ -172,7 +169,7 @@ pub fn check_model(model: Option<&Value>, served_name: &str) -> Result<(), Rejec
     match checkpoint_name(s) {
         Some(name) if name != served_name => Err(bad_request(&format!(
             "model {} names checkpoint '{name}', but this server serves only '{served_name}'",
-            py_repr(s.trim())
+            repr_str(s.trim())
         ))),
         _ => Ok(()),
     }
