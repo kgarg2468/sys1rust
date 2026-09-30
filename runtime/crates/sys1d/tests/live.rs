@@ -5,9 +5,9 @@
 //! `bench/workloads/smoke.jsonl`, requires each response body to equal, byte for byte, an
 //! in-process `Agent::predict` of the same revision and engine settings serialized the way
 //! the server serializes (so formatting and key order count, not just values), checks it against
-//! the fp32 CPU reference (key sets and order, every numeric field within a tolerance,
-//! categorical agreement), then stops it with SIGINT. The child is killed if the test fails
-//! or hangs at any point.
+//! the fp32 CPU reference (key sets and order, every number the reference has is a number
+//! within a tolerance, decision agreement by the bench harness's rules), then stops it with
+//! SIGINT. The child is killed if the test fails or hangs at any point.
 //!
 //! Run from the repository root with:
 //! `cargo test --manifest-path runtime/Cargo.toml -p sys1d --release --test live -- --ignored --nocapture`
@@ -94,41 +94,147 @@ fn keys(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Argmax choice / rounded score / noul side of one answer, the categorical part the bench
-/// harness compares.
-fn categorical(answer: &Value) -> Value {
-    match answer["type"].as_str() {
-        Some("choice") => answer["choice"].clone(),
-        Some("noul") => Value::from(answer["noul"].as_f64().unwrap_or(0.0) >= 0.5),
-        Some("score") => Value::from(answer["score"].as_f64().unwrap_or(0.0).round()),
-        _ => Value::Null,
+/// The decision of one answer for a report line: what `laya_core::testing::decision` reads
+/// (the choice label, the noul side, the score level with the largest probability, the same
+/// rules as `bench/harness/compare.py`), or `null` when the answer has none.
+fn shown_decision(answer: &Value) -> Value {
+    laya_core::testing::decision(answer).unwrap_or(Value::Null)
+}
+
+/// Absolute difference of two numbers the reference has as `what`. A served side that is not
+/// a finite number is an error, `null` included: a NaN from the backend serializes as `null`,
+/// and skipping it would pass a broken forward whose decision is unchanged.
+fn number_diff(what: &str, served: &Value, want: f64) -> Result<f64, String> {
+    match served.as_f64().filter(|x| x.is_finite()) {
+        Some(x) => Ok((x - want).abs()),
+        None => Err(format!(
+            "{what} is {served}, the reference has {want}; not a finite number"
+        )),
     }
 }
 
-/// Largest absolute difference over `probabilities` (or `noul` for noul answers).
-fn max_prob_diff(a: &Value, b: &Value) -> f64 {
-    let (Some(pa), Some(pb)) = (
-        a["probabilities"].as_object(),
-        b["probabilities"].as_object(),
-    ) else {
-        return match (a["noul"].as_f64(), b["noul"].as_f64()) {
-            (Some(x), Some(y)) => (x - y).abs(),
-            _ => f64::NAN,
-        };
-    };
-    pa.iter()
-        .map(|(k, v)| {
-            (v.as_f64().unwrap_or(0.0) - pb.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN))
-                .abs()
-        })
-        .fold(0.0, f64::max)
+/// Largest absolute difference over the `probabilities` of the reference (or its `noul` for
+/// noul answers). `Ok(None)` when the reference has neither; an error naming the key when a
+/// number the reference has is missing or not a finite number on the served side.
+fn max_prob_diff(served: &Value, want: &Value) -> Result<Option<f64>, String> {
+    if let Some(pw) = want["probabilities"].as_object() {
+        let mut worst = 0.0f64;
+        for (k, v) in pw {
+            let Some(y) = v.as_f64() else { continue };
+            worst = worst.max(number_diff(
+                &format!("probabilities.{k}"),
+                &served["probabilities"][k],
+                y,
+            )?);
+        }
+        return Ok(Some(worst));
+    }
+    match want["noul"].as_f64() {
+        Some(y) => number_diff("noul", &served["noul"], y).map(Some),
+        None => Ok(None),
+    }
 }
 
-/// Absolute difference of a numeric field, `None` when `a` lacks it. Key sets are compared
-/// before this is called, so a field missing on one side only is caught there.
-fn field_diff(a: &Value, b: &Value, key: &str) -> Option<f64> {
-    let x = a[key].as_f64()?;
-    Some((x - b[key].as_f64().unwrap_or(f64::NAN)).abs())
+/// Absolute difference of the numeric field `key`. `Ok(None)` when the reference lacks it (a
+/// field the served side has and the reference does not is caught by the key-set check);
+/// an error when the reference has a number and the served side does not.
+fn field_diff(served: &Value, want: &Value, key: &str) -> Result<Option<f64>, String> {
+    match want[key].as_f64() {
+        Some(y) => number_diff(key, &served[key], y).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The comparison helpers, checked without a model.
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+    use laya_core::testing::same_decision;
+    use serde_json::json;
+
+    /// Near a tie the level with the largest probability can change while the
+    /// probability-weighted `score` rounds to the same level. The bench harness reads the
+    /// argmax, so this pair disagrees even though the rounded scores match.
+    #[test]
+    fn score_near_tie_disagrees_when_the_argmax_moves() {
+        let served = json!({
+            "type": "score", "score": 2.36,
+            "probabilities": {"1": 0.10, "2": 0.45, "3": 0.44, "4": 0.01}
+        });
+        let want = json!({
+            "type": "score", "score": 2.37,
+            "probabilities": {"1": 0.10, "2": 0.44, "3": 0.45, "4": 0.01}
+        });
+        assert_eq!(
+            served["score"].as_f64().unwrap().round(),
+            want["score"].as_f64().unwrap().round()
+        );
+        assert!(!same_decision(&served, &want));
+        assert_eq!(shown_decision(&served), json!(2));
+        assert_eq!(shown_decision(&want), json!(3));
+        assert!(same_decision(&served, &served));
+        let d = max_prob_diff(&served, &want).unwrap().unwrap();
+        assert!((d - 0.01).abs() < 1e-9, "{d}");
+    }
+
+    /// A served `null` where the reference has a number is an error, in a top-level field,
+    /// inside `action`, in a probability and in `noul`; so is a missing probability key.
+    #[test]
+    fn null_or_missing_number_fails() {
+        let want = json!({
+            "type": "choice", "choice": "a", "probabilities": {"a": 0.6, "b": 0.4},
+            "answer_confidence": 0.6, "action": {"act_probability": 0.9}
+        });
+        let mut served = want.clone();
+        assert_eq!(
+            field_diff(&served, &want, "answer_confidence"),
+            Ok(Some(0.0))
+        );
+        assert_eq!(
+            field_diff(&served["action"], &want["action"], "act_probability"),
+            Ok(Some(0.0))
+        );
+        assert_eq!(max_prob_diff(&served, &want), Ok(Some(0.0)));
+
+        served["answer_confidence"] = Value::Null;
+        let e = field_diff(&served, &want, "answer_confidence").unwrap_err();
+        assert!(e.starts_with("answer_confidence is null"), "{e}");
+        served["action"]["act_probability"] = Value::Null;
+        let e = field_diff(&served["action"], &want["action"], "act_probability").unwrap_err();
+        assert!(e.starts_with("act_probability is null"), "{e}");
+        served["probabilities"]["a"] = Value::Null;
+        let e = max_prob_diff(&served, &want).unwrap_err();
+        assert!(e.starts_with("probabilities.a is null"), "{e}");
+        served["probabilities"].as_object_mut().unwrap().remove("a");
+        let e = max_prob_diff(&served, &want).unwrap_err();
+        assert!(e.starts_with("probabilities.a is null"), "{e}");
+
+        let want = json!({"type": "noul", "noul": 0.7});
+        let d = max_prob_diff(&json!({"noul": 0.69}), &want)
+            .unwrap()
+            .unwrap();
+        assert!((d - 0.01).abs() < 1e-9, "{d}");
+        let e = max_prob_diff(&json!({"noul": null}), &want).unwrap_err();
+        assert!(e.starts_with("noul is null"), "{e}");
+    }
+
+    /// A field the reference does not have is skipped, whatever the served side holds.
+    #[test]
+    fn fields_absent_from_the_reference_are_skipped() {
+        let want = json!({"type": "choice", "choice": "a", "probabilities": {"a": 1.0}});
+        let served = json!({"type": "choice", "choice": "a", "probabilities": {"a": 1.0},
+            "answer_confidence": null, "score": 3.0});
+        assert_eq!(field_diff(&served, &want, "answer_confidence"), Ok(None));
+        assert_eq!(field_diff(&served, &want, "score"), Ok(None));
+        assert_eq!(
+            field_diff(&served["action"], &want["action"], "act_probability"),
+            Ok(None)
+        );
+        assert_eq!(
+            max_prob_diff(&json!({}), &json!({"type": "unknown"})),
+            Ok(None)
+        );
+    }
 }
 
 /// Every environment variable the server's configuration reads, taken from the clap
@@ -374,9 +480,13 @@ async fn smoke_workload_through_the_real_server() {
             for (qid, a) in la {
                 let b = &ha[qid];
                 if a != b {
+                    let gap = match max_prob_diff(b, a) {
+                        Ok(Some(d)) => format!("probability diff {d:.2e}"),
+                        Ok(None) => "no probabilities".to_string(),
+                        Err(e) => e,
+                    };
                     panic!(
-                        "{id}/{qid}: served answer differs from Agent::predict (probability diff {:.2e}): served {b} in-process {a}",
-                        max_prob_diff(a, b)
+                        "{id}/{qid}: served answer differs from Agent::predict ({gap}): served {b} in-process {a}"
                     );
                 }
             }
@@ -411,8 +521,9 @@ async fn smoke_workload_through_the_real_server() {
 
     // Against the fp32 CPU reference: every reference request was served, every answer has
     // the reference's key set in the reference's order, every numeric field is within its
-    // tolerance, and the categorical answer (argmax choice, rounded score, noul side) agrees
-    // on at least 99% of answers.
+    // tolerance, and the decision (the choice label, the noul side, the score level with the
+    // largest probability, read the way the bench harness reads it) agrees on at least 99% of
+    // answers. A number the reference has must be a finite number on the served side.
     let served_ids: BTreeSet<&str> = served.iter().map(|(id, _, _)| id.as_str()).collect();
     let reference_ids: BTreeSet<&str> = reference
         .iter()
@@ -467,13 +578,16 @@ async fn smoke_workload_through_the_real_server() {
                 );
             }
             let diffs = [
-                Some(max_prob_diff(ans, want)),
+                max_prob_diff(ans, want),
                 field_diff(ans, want, "answer_confidence"),
                 field_diff(ans, want, "confidence"),
                 field_diff(&ans["action"], &want["action"], "act_probability"),
                 field_diff(ans, want, "score"),
             ];
             for ((field, tol, worst), d) in spread.iter_mut().zip(diffs) {
+                let d = d.unwrap_or_else(|e| {
+                    panic!("{id}/{qid}: {field}: {e}: served {ans} reference {want}")
+                });
                 let Some(d) = d else { continue };
                 assert!(
                     d <= *tol,
@@ -482,14 +596,14 @@ async fn smoke_workload_through_the_real_server() {
                 *worst = worst.max(d);
             }
             total += 1;
-            if categorical(ans) == categorical(want) {
+            if laya_core::testing::same_decision(ans, want) {
                 agree += 1;
             } else {
                 disagreements.push(format!(
                     "{id}/{qid} ({}): served {} reference {}",
                     ans["type"],
-                    categorical(ans),
-                    categorical(want)
+                    shown_decision(ans),
+                    shown_decision(want)
                 ));
             }
         }
@@ -501,11 +615,11 @@ async fn smoke_workload_through_the_real_server() {
         .map(|(f, _, w)| format!("{f} {w:.4}"))
         .collect();
     eprintln!(
-        "reference agreement: {total} answers with matching key order; largest differences {}; {agree}/{total} categorical answers agree ({pct:.1}%) {disagreements:?}",
+        "reference agreement: {total} answers with matching key order; largest differences {}; {agree}/{total} decisions agree ({pct:.1}%) {disagreements:?}",
         worst.join(", ")
     );
     assert!(
         pct >= 99.0,
-        "categorical agreement {pct:.1}% < 99%: {disagreements:?}"
+        "decision agreement {pct:.1}% < 99%: {disagreements:?}"
     );
 }
