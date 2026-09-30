@@ -64,7 +64,7 @@ Source: docs.typesafe.ai/api.md, docs.typesafe.ai/primitives.md, docs.typesafe.a
 
 | type | criteria | answer fields | limits |
 |---|---|---|---|
-| `noul` (yes/no) | optional `{"true": ..., "false": ...}` clarifying each side | `type`, `noul` (0 = no, 1 = yes) | none stated |
+| `noul` (yes/no) | optional `{"true": ..., "false": ...}` clarifying each side | `type`, `noul` (probability of yes, from 0 to 1) | none stated |
 | `choice` | map `option -> description or null` | `type`, `choice` (argmax option), `probabilities` (sum to 1), `confidence` | up to 255 options |
 | `score` | ordered list of level descriptions | `type`, `score`, `legend` (index to level text), `probabilities`, `confidence` | 2 to 10 levels |
 
