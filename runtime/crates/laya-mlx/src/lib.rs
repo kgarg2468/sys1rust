@@ -19,20 +19,32 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{fast, nn, ops, transforms, Array, Dtype, Stream};
 use safetensors::SafeTensors;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// Finite "minus infinity" for additive attention masks (safe in f16, no NaN rows).
 const MASK_NEG: f32 = -1e4;
 /// Logit value reported for masked marker slots.
 const LOGIT_MASKED: f32 = -1e4;
+/// Distinct input shapes the per-shape GeGLU (`geglu=compiled`) compiles before new shapes take
+/// the shapeless trace instead. MLX keeps every per-shape trace for the life of the process, so
+/// this count bounds that memory; 64 covers a few length buckets times the row counts a server
+/// sees, and the shapeless trace serves everything past it.
+const GEGLU_MAX_SHAPES: usize = 64;
 
 /// Backend settings, read once at load from `BackendOptions::tuning` or else `SYS1_MLX` (comma
 /// list, e.g. `f16gelu,mask=bool`). Defaults reproduce laya-r-mlx 914c9a7.
+///
+/// Parsing is strict: an unknown setting or a value the setting cannot take is an
+/// [`Error::Config`] naming it, so a run cannot be labeled with a setting that was never
+/// applied. Flags take no value (`f16gelu`) or `=0`/`=1`; everything else needs `key=value`.
 #[derive(Debug, Clone)]
 struct Knobs {
     /// `shapeless` (default): split outside, GELU * gate compiled once for all shapes.
-    /// `compiled`: split + GELU + gate compiled per input shape, so one trace per distinct
-    /// `(rows, len)` that MLX never frees; for experiments only. `plain`: no compile.
+    /// `compiled`: split + GELU + gate compiled per input shape, one trace per distinct
+    /// `(rows, len)` that MLX never frees, so at most [`GEGLU_MAX_SHAPES`] shapes are compiled
+    /// this way and every new shape after that runs the shapeless trace; for experiments only.
+    /// `plain`: no compile.
     geglu: String,
     /// Fuse residual adds into the gemm with `addmm` (default) or use matmul + add.
     addmm: bool,
@@ -70,7 +82,17 @@ struct Knobs {
 }
 
 impl Knobs {
-    fn from_spec(tuning: Option<&str>) -> Self {
+    /// The settings of `tuning`, or of `SYS1_MLX` when `tuning` is `None`.
+    fn from_spec(tuning: Option<&str>) -> Result<Self> {
+        let spec = match tuning {
+            Some(t) => t.to_string(),
+            None => std::env::var("SYS1_MLX").unwrap_or_default(),
+        };
+        Self::parse(&spec)
+    }
+
+    /// Parse a comma-separated spec. The last mention of a setting wins.
+    fn parse(spec: &str) -> Result<Self> {
         let mut k = Knobs {
             geglu: "shapeless".into(),
             addmm: true,
@@ -88,38 +110,67 @@ impl Knobs {
             cache_mb: None,
             wired_mb: None,
         };
-        let list = |v: &str| -> Vec<usize> { v.split(':').filter_map(|x| x.parse().ok()).collect() };
-        let spec = match tuning {
-            Some(t) => t.to_string(),
-            None => std::env::var("SYS1_MLX").unwrap_or_default(),
-        };
         for kv in spec.split(',').filter(|s| !s.is_empty()) {
-            let (key, val) = kv.split_once('=').unwrap_or((kv, "1"));
-            let on = val != "0";
+            let (key, val) = match kv.split_once('=') {
+                Some((key, val)) => (key, Some(val)),
+                None => (kv, None),
+            };
+            let bad = |what: String| Error::Config(format!("mlx settings: `{kv}`: {what}"));
+            // A flag is on when bare or `=1`, off when `=0`; nothing else.
+            let flag = || match val {
+                None | Some("1") => Ok(true),
+                Some("0") => Ok(false),
+                Some(v) => Err(bad(format!("`{v}` is not 0 or 1"))),
+            };
+            let value = || val.ok_or_else(|| bad("needs a value (`key=value`)".into()));
+            let one_of = |allowed: &[&str]| -> Result<String> {
+                let v = value()?;
+                if allowed.contains(&v) {
+                    Ok(v.to_string())
+                } else {
+                    Err(bad(format!("`{v}` is not one of {}", allowed.join(", "))))
+                }
+            };
+            let number = |v: &str| -> Result<usize> {
+                v.parse().map_err(|_| bad(format!("`{v}` is not a whole number")))
+            };
+            let list = || -> Result<Vec<usize>> { value()?.split(':').map(number).collect() };
             match key {
-                "geglu" => k.geglu = val.to_string(),
-                "addmm" => k.addmm = on,
-                "mask" => k.bool_mask = val == "bool",
-                "windowed" => k.windowed = on,
-                "clear" => k.clear = on,
-                "trace" => k.trace = on,
-                "layers" => k.layers = on,
-                "ops" => k.ops = on,
-                "wcopy" => k.wcopy = val.to_string(),
-                "f16gelu" => k.f16gelu = on,
+                "geglu" => k.geglu = one_of(&["shapeless", "compiled", "plain"])?,
+                "addmm" => k.addmm = flag()?,
+                "mask" => k.bool_mask = one_of(&["bool", "additive"])? == "bool",
+                "windowed" => k.windowed = flag()?,
+                "clear" => k.clear = flag()?,
+                "trace" => k.trace = flag()?,
+                "layers" => k.layers = flag()?,
+                "ops" => k.ops = flag()?,
+                "wcopy" => k.wcopy = one_of(&["view", "gpu", "t"])?,
+                "f16gelu" => k.f16gelu = flag()?,
                 "buckets" => {
-                    k.buckets = list(val);
+                    k.buckets = list()?;
                     k.buckets.sort_unstable();
                 }
-                "pad" => k.pad = val.parse().unwrap_or(1).max(1),
-                "warm" => k.warm = list(val),
-                "cache" => k.cache_mb = val.parse().ok(),
-                "wired" => k.wired_mb = val.parse().ok(),
-                _ => eprintln!("SYS1_MLX: unknown knob {key}"),
+                "pad" => {
+                    k.pad = number(value()?)?;
+                    if k.pad == 0 {
+                        return Err(bad("pad must be at least 1".into()));
+                    }
+                }
+                "warm" => k.warm = list()?,
+                "cache" => k.cache_mb = Some(number(value()?)?),
+                "wired" => k.wired_mb = Some(number(value()?)?),
+                _ => return Err(Error::Config(format!("mlx settings: unknown setting `{key}` in `{spec}`"))),
             }
         }
-        k
+        Ok(k)
     }
+}
+
+/// Check a settings spec (`BackendOptions::tuning`, `SYS1_MLX`) without loading a model: `Err`
+/// names the first unknown setting or bad value, as loading with it would. Callers that label
+/// a run with its settings (sys1-bench, sys1-probe) call this at startup.
+pub fn check_settings(spec: &str) -> Result<()> {
+    Knobs::parse(spec).map(|_| ())
 }
 
 /// Convert an MLX exception into a `laya_core::Error::Backend`.
@@ -145,42 +196,93 @@ type CompiledFn = Box<dyn for<'a> FnMut(&'a [Array]) -> std::result::Result<Vec<
 /// input shape and the split (which needs concrete shapes) happens outside as two views. Paired
 /// A/B on the timing workload against the per-shape trace, `f16gelu,cache=512,wired=2048`:
 /// 1.002 on typed-decisions, identical answers. The per-shape mode (`geglu=compiled`) stays
-/// for experiments; MLX keeps one trace per distinct input shape for the life of the process.
+/// for experiments; MLX keeps one trace per distinct input shape for the life of the process,
+/// so the mode compiles at most [`GEGLU_MAX_SHAPES`] shapes and hands every new shape after
+/// that to the shapeless trace ([`ShapeBudget`]).
 struct GeGlu {
     mode: String,
     keep: bool,
-    f: Mutex<CompiledFn>,
+    traces: Mutex<GeGluTraces>,
 }
 
-// SAFETY: the compiled closure owns no thread-affine resources; calls are serialised by the
+/// The compiled traces behind [`GeGlu`]'s mutex.
+struct GeGluTraces {
+    /// GELU * gate over the two halves; one trace for every shape.
+    shapeless: CompiledFn,
+    /// Split + GELU * gate, one trace per input shape (`geglu=compiled` only).
+    per_shape: Option<CompiledFn>,
+    /// The shapes `per_shape` has compiled.
+    shapes: ShapeBudget,
+}
+
+/// The distinct shapes a per-shape cache may hold, at most `cap` of them.
+struct ShapeBudget {
+    cap: usize,
+    seen: HashSet<Vec<i32>>,
+}
+
+impl ShapeBudget {
+    fn new(cap: usize) -> Self {
+        Self { cap, seen: HashSet::new() }
+    }
+
+    /// Whether `shape` may take the per-shape path: yes when it is already cached, or when the
+    /// cache has room (the shape is then counted); no once `cap` shapes are cached.
+    fn admit(&mut self, shape: &[i32]) -> bool {
+        if self.seen.contains(shape) {
+            return true;
+        }
+        if self.seen.len() >= self.cap {
+            return false;
+        }
+        self.seen.insert(shape.to_vec());
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+// SAFETY: the compiled closures own no thread-affine resources; calls are serialised by the
 // mutex and MLX's scheduler is thread-safe.
 unsafe impl Send for GeGlu {}
 unsafe impl Sync for GeGlu {}
 
 impl GeGlu {
     fn new(mode: &str, keep: bool) -> Self {
-        let f: CompiledFn = if mode == "shapeless" {
-            Box::new(compile(
-                move |a: &[Array]| -> Vec<Array> {
-                    vec![ops::multiply(gelu_erf_as(&a[0], keep).expect("gelu"), &a[1]).expect("geglu gate")]
-                },
-                true,
-            ))
-        } else {
+        Self::with_cap(mode, keep, GEGLU_MAX_SHAPES)
+    }
+
+    /// `cap` is the number of shapes `geglu=compiled` compiles per shape (tests pass a small one).
+    fn with_cap(mode: &str, keep: bool, cap: usize) -> Self {
+        let shapeless: CompiledFn = Box::new(compile(
+            move |a: &[Array]| -> Vec<Array> {
+                vec![ops::multiply(gelu_erf_as(&a[0], keep).expect("gelu"), &a[1]).expect("geglu gate")]
+            },
+            true,
+        ));
+        let per_shape: Option<CompiledFn> = (mode == "compiled").then(|| -> CompiledFn {
             Box::new(compile(
                 move |a: &[Array]| -> Vec<Array> {
                     let ig = a[0].split_equal(2, -1).expect("geglu split");
                     vec![ops::multiply(gelu_erf_as(&ig[0], keep).expect("gelu"), &ig[1]).expect("geglu gate")]
                 },
                 // Not shapeless: `split` needs concrete shapes; MLX caches one trace per input
-                // shape and never drops one, which is why this is not the default.
+                // shape and never drops one, which is why this is not the default and why
+                // `apply` stops sending new shapes here after `cap` of them.
                 false,
             ))
-        };
+        });
         Self {
             mode: mode.to_string(),
             keep,
-            f: Mutex::new(f),
+            traces: Mutex::new(GeGluTraces {
+                shapeless,
+                per_shape,
+                shapes: ShapeBudget::new(cap),
+            }),
         }
     }
 
@@ -191,14 +293,22 @@ impl GeGlu {
         }
         // A panic inside the compiled closure (mlx-rs re-raises it after MLX returns) would
         // poison the lock; recover the guard so one failed request cannot fail every later one.
-        let mut f = self.f.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut out = if self.mode == "shapeless" {
-            let ig = x.split_equal(2, -1).lx()?;
-            f(ig.as_slice()).lx()?
-        } else {
-            f(std::slice::from_ref(x)).lx()?
+        let mut guard = self.traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let t = &mut *guard;
+        let mut out = match &mut t.per_shape {
+            Some(f) if t.shapes.admit(x.shape()) => f(std::slice::from_ref(x)).lx()?,
+            _ => {
+                let ig = x.split_equal(2, -1).lx()?;
+                (t.shapeless)(ig.as_slice()).lx()?
+            }
         };
         Ok(out.remove(0))
+    }
+
+    /// How many shapes the per-shape trace has compiled (0 unless `geglu=compiled`).
+    #[cfg(test)]
+    fn per_shape_traces(&self) -> usize {
+        self.traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner).shapes.len()
     }
 }
 
@@ -462,7 +572,7 @@ impl MlxBackend {
         };
         let enc = &cfg.encoder;
         let eps = enc.norm_eps as f32;
-        let knobs = Knobs::from_spec(opts.tuning.as_deref());
+        let knobs = Knobs::from_spec(opts.tuning.as_deref())?;
         let loader = Loader {
             st: w.view()?,
             dtype,
@@ -1079,6 +1189,71 @@ impl Backend for MlxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_parse_every_kind_of_value() {
+        let k = Knobs::parse("f16gelu,addmm=0,mask=bool,geglu=compiled,wcopy=t,buckets=512:128:256,pad=8,warm=1:4,cache=512,wired=2048").unwrap();
+        assert!(k.f16gelu && !k.addmm && k.bool_mask);
+        assert_eq!((k.geglu.as_str(), k.wcopy.as_str()), ("compiled", "t"));
+        assert_eq!((k.buckets, k.pad, k.warm), (vec![128, 256, 512], 8, vec![1, 4]));
+        assert_eq!((k.cache_mb, k.wired_mb), (Some(512), Some(2048)));
+        // Empty spec and empty items are the defaults; the last mention wins.
+        let d = Knobs::parse("").unwrap();
+        assert!(!d.f16gelu && d.addmm && d.geglu == "shapeless" && d.cache_mb.is_none());
+        assert!(Knobs::parse(",f16gelu,,").unwrap().f16gelu);
+        assert!(!Knobs::parse("f16gelu,f16gelu=0").unwrap().f16gelu);
+        assert!(!Knobs::parse("mask=bool,mask=additive").unwrap().bool_mask);
+    }
+
+    /// An unknown setting or a bad value is an error that names the item, never a silent default.
+    #[test]
+    fn settings_reject_unknown_keys_and_bad_values() {
+        let err = |spec: &str| Knobs::parse(spec).err().map(|e| e.to_string()).unwrap_or_else(|| panic!("{spec} was accepted"));
+        assert!(err("f16gelu,cache=512x").contains("`cache=512x`"), "{}", err("f16gelu,cache=512x"));
+        assert!(err("f16gelu,chache=512").contains("unknown setting `chache`"), "{}", err("f16gelu,chache=512"));
+        assert!(err("geglu=fast").contains("`fast` is not one of shapeless, compiled, plain"));
+        assert!(err("mask=1").contains("`mask=1`"));
+        assert!(err("wcopy=copy").contains("`wcopy=copy`"));
+        assert!(err("f16gelu=yes").contains("`yes` is not 0 or 1"));
+        assert!(err("buckets=128:abc").contains("`abc` is not a whole number"));
+        assert!(err("buckets=").contains("`buckets=`"));
+        assert!(err("pad=0").contains("pad must be at least 1"));
+        assert!(err("pad=-1").contains("`-1` is not a whole number"));
+        assert!(err("cache").contains("needs a value"));
+        assert!(err("wired=2048,f16gelu,cache=512 ").contains("`cache=512 `"));
+        assert_eq!(check_settings("f16gelu,cache=512,wired=2048").ok(), Some(()));
+        assert!(check_settings("f16gelu,cache=512x").is_err());
+    }
+
+    /// The per-shape cache admits `cap` distinct shapes, then only the shapes it already holds.
+    #[test]
+    fn shape_budget_caps_distinct_shapes() {
+        let mut b = ShapeBudget::new(3);
+        assert!(b.admit(&[1, 4]) && b.admit(&[2, 4]) && b.admit(&[3, 4]));
+        assert_eq!(b.len(), 3);
+        assert!(!b.admit(&[4, 4]), "a fourth shape is refused");
+        assert!(b.admit(&[2, 4]), "a cached shape stays admitted");
+        assert!(!b.admit(&[4, 4]), "the refused shape is not counted");
+        assert_eq!(b.len(), 3);
+        assert!(!ShapeBudget::new(0).admit(&[1]));
+    }
+
+    /// `geglu=compiled` compiles at most `cap` shapes; past the cap new shapes run the shapeless
+    /// trace, and every path computes the same values as the plain (uncompiled) GeGLU.
+    #[test]
+    fn per_shape_geglu_falls_back_past_the_cap() {
+        let g = GeGlu::with_cap("compiled", true, 2);
+        let plain = GeGlu::new("plain", true);
+        for rows in [1i32, 2, 3, 1, 4] {
+            let x = Array::from_iter((0..rows * 8).map(|i| i as f32 * 0.25 - 4.0), &[rows, 8]);
+            let (got, want) = (g.apply(&x).unwrap(), plain.apply(&x).unwrap());
+            assert_eq!(got.shape(), &[rows, 4]);
+            let d = ops::abs(&ops::subtract(&got, &want).unwrap()).unwrap().max(None).unwrap();
+            assert!(d.item_exact::<f32>() < 1e-6, "rows={rows}: max diff {d}");
+        }
+        assert_eq!(g.per_shape_traces(), 2, "shapes [1,8] and [2,8] compiled per shape, [3,8] and [4,8] fell back");
+        assert_eq!(GeGlu::new("shapeless", true).per_shape_traces(), 0);
+    }
 
     /// One window mask serves every shorter length as a view with the same values.
     #[test]
