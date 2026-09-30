@@ -133,40 +133,101 @@ pub fn fixtures_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-/// The English checkpoint's repo, which at its pinned revision also bundles the other two
-/// checkpoints as subfolders (`multilingual/`, `typed-decisions/`) with the same blobs.
-const ENGLISH_REPO: &str = "convaiinnovations/laya";
-
-/// The hub repo of a published checkpoint, by the variant name `bench/models.lock.json` uses:
-/// `None` or `"english"` is `convaiinnovations/laya`, any other variant `v` is
-/// `convaiinnovations/laya-<v>` (`laya-multilingual`, `laya-typed-decisions`).
-pub fn checkpoint_repo(variant: Option<&str>) -> String {
-    match variant {
-        None | Some("english") => ENGLISH_REPO.to_string(),
-        Some(v) => format!("{ENGLISH_REPO}-{v}"),
-    }
+/// `bench/models.lock.json` of this checkout: the published checkpoints with the hub revision
+/// every contender must load.
+pub fn models_lock_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../bench/models.lock.json")
 }
 
-/// The directory of a published checkpoint in the local HF cache, by variant name. The
-/// separate repo is looked up first; when only the English bundle is cached, its subfolder of
-/// the same name is the same checkpoint, so that is the fallback. The error is the separate
-/// repo's when neither is there.
+/// The lock entry of the English checkpoint, whose repo at its pinned revision also bundles
+/// the other two as subfolders (`multilingual/`, `typed-decisions/`) holding the same blobs
+/// as the separate repos at their pins.
+const ENGLISH: &str = "english";
+
+/// One entry of `bench/models.lock.json`: a hub repo and the commit hash it is pinned at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub repo: String,
+    pub sha: String,
+}
+
+/// The lock entry for a checkpoint variant (`None` is `english`; `Some("multilingual")` and
+/// `Some("typed-decisions")` name the other two).
+pub fn checkpoint_pin(lock: &Value, variant: Option<&str>) -> Result<Pin> {
+    let name = variant.unwrap_or(ENGLISH);
+    let entry = lock
+        .get(name)
+        .ok_or_else(|| Error::Config(format!("bench/models.lock.json has no entry {name:?}")))?;
+    let field = |k: &str| {
+        entry.get(k).and_then(Value::as_str).ok_or_else(|| {
+            Error::Config(format!(
+                "bench/models.lock.json entry {name:?} has no string {k:?}"
+            ))
+        })
+    };
+    Ok(Pin {
+        repo: field("repo")?.to_string(),
+        sha: field("sha")?.to_string(),
+    })
+}
+
+/// The directory of a published checkpoint in the local HF cache, at the revision
+/// `bench/models.lock.json` pins for `variant`. The pinned snapshot of the variant's own repo
+/// is taken when it is cached, whatever `refs/main` says; a moved default branch must not
+/// swap the weights under the parity fixtures. Otherwise, for a variant other than English,
+/// the English bundle's subfolder of that name at the bundle's own pin is the same
+/// checkpoint (the same blobs at both pins), so it is the fallback. That match cannot be
+/// checked here without the separate repo's files, which is the case that falls back. The
+/// error names the pin when neither is cached.
 pub fn checkpoint_dir(variant: Option<&str>) -> Result<PathBuf> {
-    checkpoint_dir_in(&crate::resolve::hf_cache_dir(), variant)
+    let path = models_lock_path();
+    let lock: Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?,
+    )?;
+    checkpoint_dir_in(&crate::resolve::hf_cache_dir(), &lock, variant)
 }
 
-fn checkpoint_dir_in(cache: &std::path::Path, variant: Option<&str>) -> Result<PathBuf> {
-    use crate::resolve::resolve_in_cache;
-    let repo = checkpoint_repo(variant);
-    match resolve_in_cache(cache, &repo, None) {
-        Ok(dir) => Ok(dir),
-        Err(primary) => match variant {
-            Some(v) if repo != ENGLISH_REPO => {
-                resolve_in_cache(cache, ENGLISH_REPO, Some(v)).map_err(|_| primary)
-            }
-            _ => Err(primary),
-        },
+fn checkpoint_dir_in(
+    cache: &std::path::Path,
+    lock: &Value,
+    variant: Option<&str>,
+) -> Result<PathBuf> {
+    use crate::resolve::is_checkpoint;
+    let snapshots = |repo: &str| {
+        cache
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+    };
+    let pin = checkpoint_pin(lock, variant)?;
+    let pinned = snapshots(&pin.repo).join(&pin.sha);
+    if is_checkpoint(&pinned) {
+        return Ok(pinned);
     }
+    if let Some(v) = variant.filter(|v| *v != ENGLISH) {
+        let english = checkpoint_pin(lock, None)?;
+        let bundled = snapshots(&english.repo).join(&english.sha).join(v);
+        if is_checkpoint(&bundled) {
+            return Ok(bundled);
+        }
+    }
+    let cached: Vec<String> = std::fs::read_dir(snapshots(&pin.repo))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    Err(Error::Config(format!(
+        "checkpoint {} at pinned revision {} (bench/models.lock.json {:?}) is not in the HF cache at {}; cached snapshots: [{}]; fetch it with snapshot_download({:?}, revision={:?}) as bench/workloads/README.md does",
+        pin.repo,
+        pin.sha,
+        variant.unwrap_or(ENGLISH),
+        snapshots(&pin.repo).display(),
+        cached.join(", "),
+        pin.repo,
+        pin.sha
+    )))
 }
 
 fn flat_f32(v: &Value) -> Vec<f32> {
@@ -323,8 +384,9 @@ fn drop_answer_confidence_if_absent(got: &mut Value, want: &Value) {
 
 /// Run every fixture case through `factory`'s backend and compare with the Python outputs.
 /// `variant` names the checkpoint as [`checkpoint_dir`] does (`None` for English,
-/// `Some("multilingual")` for `convaiinnovations/laya-multilingual`). Returns `Ok(None)` when
-/// the fixture file or the checkpoint is not available locally.
+/// `Some("multilingual")` for `convaiinnovations/laya-multilingual`), at the revision
+/// `bench/models.lock.json` pins. Returns `Ok(None)` when the fixture file or that snapshot
+/// of the checkpoint is not available locally.
 pub fn run_parity(
     fixture: &str,
     variant: Option<&str>,
@@ -447,46 +509,130 @@ mod tests {
         }
     }
 
+    /// The real lock of this checkout: the three checkpoints the fixtures and benchmarks use,
+    /// each a 40-hex commit hash, and an unknown name is an error.
     #[test]
-    fn checkpoint_repos_follow_models_lock() {
-        assert_eq!(checkpoint_repo(None), "convaiinnovations/laya");
-        assert_eq!(checkpoint_repo(Some("english")), "convaiinnovations/laya");
+    fn checkpoint_pins_read_models_lock() {
+        let lock: Value =
+            serde_json::from_slice(&std::fs::read(models_lock_path()).unwrap()).unwrap();
+        for (variant, repo) in [
+            (None, "convaiinnovations/laya"),
+            (Some("english"), "convaiinnovations/laya"),
+            (Some("multilingual"), "convaiinnovations/laya-multilingual"),
+            (
+                Some("typed-decisions"),
+                "convaiinnovations/laya-typed-decisions",
+            ),
+        ] {
+            let pin = checkpoint_pin(&lock, variant).unwrap();
+            assert_eq!(pin.repo, repo);
+            assert!(
+                pin.sha.len() == 40 && pin.sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "{variant:?}: {}",
+                pin.sha
+            );
+        }
+        let e = checkpoint_pin(&lock, Some("klingon"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no entry \"klingon\""), "{e}");
+    }
+
+    /// A lock like `bench/models.lock.json` with short fake revisions.
+    fn fake_lock() -> Value {
+        json!({
+            "english": {"repo": "convaiinnovations/laya", "sha": "aaa"},
+            "multilingual": {"repo": "convaiinnovations/laya-multilingual", "sha": "bbb"},
+        })
+    }
+
+    /// The pinned snapshot of the published repo wins even after `refs/main` moved to a newer
+    /// snapshot, and even when the English bundle is cached too.
+    #[test]
+    fn checkpoint_dir_takes_the_pinned_snapshot_not_refs_main() {
+        let c = FakeCache::new();
+        let lock = fake_lock();
+        let pinned = c.snapshot("convaiinnovations/laya-multilingual", "bbb", None);
         assert_eq!(
-            checkpoint_repo(Some("multilingual")),
-            "convaiinnovations/laya-multilingual"
+            checkpoint_dir_in(&c.0, &lock, Some("multilingual")).unwrap(),
+            pinned
+        );
+        c.snapshot("convaiinnovations/laya-multilingual", "ccc", None);
+        assert_eq!(
+            std::fs::read_to_string(
+                c.0.join("models--convaiinnovations--laya-multilingual/refs/main")
+            )
+            .unwrap(),
+            "ccc"
         );
         assert_eq!(
-            checkpoint_repo(Some("typed-decisions")),
-            "convaiinnovations/laya-typed-decisions"
+            checkpoint_dir_in(&c.0, &lock, Some("multilingual")).unwrap(),
+            pinned
+        );
+        c.snapshot("convaiinnovations/laya", "aaa", Some("multilingual"));
+        assert_eq!(
+            checkpoint_dir_in(&c.0, &lock, Some("multilingual")).unwrap(),
+            pinned
+        );
+        // English has no fallback repo: its pin or nothing, whatever `refs/main` names.
+        let english = c.snapshot("convaiinnovations/laya", "aaa", None);
+        c.snapshot("convaiinnovations/laya", "zzz", None);
+        assert_eq!(checkpoint_dir_in(&c.0, &lock, None).unwrap(), english);
+        assert_eq!(
+            checkpoint_dir_in(&c.0, &lock, Some("english")).unwrap(),
+            english
         );
     }
 
-    /// The published `laya-multilingual` repo is found on its own; the `multilingual/`
-    /// subfolder of the English bundle is only the fallback, and a cache with neither reports
-    /// the published repo.
+    /// Without the published repo's pinned snapshot, the English bundle's subfolder stands
+    /// in, but only at the bundle's own pin: the same subfolder at another revision of the
+    /// bundle is not the pinned checkpoint.
     #[test]
-    fn checkpoint_dir_prefers_the_published_repo() {
+    fn checkpoint_dir_falls_back_to_the_bundle_at_its_own_pin() {
         let c = FakeCache::new();
-        let e = checkpoint_dir_in(&c.0, Some("multilingual"))
+        let lock = fake_lock();
+        c.snapshot("convaiinnovations/laya", "zzz", Some("multilingual"));
+        let e = checkpoint_dir_in(&c.0, &lock, Some("multilingual"))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("\"convaiinnovations/laya-multilingual\""), "{e}");
-        let english = c.snapshot("convaiinnovations/laya", "aaa", None);
-        assert_eq!(checkpoint_dir_in(&c.0, None).unwrap(), english);
-        assert_eq!(checkpoint_dir_in(&c.0, Some("english")).unwrap(), english);
-        let e = checkpoint_dir_in(&c.0, Some("multilingual"))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("\"convaiinnovations/laya-multilingual\""), "{e}");
+        assert!(e.contains("convaiinnovations/laya-multilingual"), "{e}");
         let bundled = c.snapshot("convaiinnovations/laya", "aaa", Some("multilingual"));
         assert_eq!(
-            checkpoint_dir_in(&c.0, Some("multilingual")).unwrap(),
+            checkpoint_dir_in(&c.0, &lock, Some("multilingual")).unwrap(),
             bundled
         );
-        let published = c.snapshot("convaiinnovations/laya-multilingual", "bbb", None);
-        assert_eq!(
-            checkpoint_dir_in(&c.0, Some("multilingual")).unwrap(),
-            published
+    }
+
+    /// Neither the pinned snapshot nor the bundle: the error names the repo, the pinned
+    /// revision, the lock entry and the snapshots that are cached instead.
+    #[test]
+    fn a_missing_pinned_snapshot_names_the_pin() {
+        let c = FakeCache::new();
+        let lock = fake_lock();
+        let e = checkpoint_dir_in(&c.0, &lock, Some("multilingual"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("convaiinnovations/laya-multilingual at pinned revision bbb")
+                && e.contains("\"multilingual\"")
+                && e.contains("cached snapshots: []")
+                && e.contains("revision=\"bbb\""),
+            "{e}"
+        );
+        c.snapshot("convaiinnovations/laya-multilingual", "ccc", None);
+        let e = checkpoint_dir_in(&c.0, &lock, Some("multilingual"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("at pinned revision bbb") && e.contains("cached snapshots: [ccc]"),
+            "{e}"
+        );
+        let e = checkpoint_dir_in(&c.0, &lock, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("convaiinnovations/laya at pinned revision aaa"),
+            "{e}"
         );
     }
 

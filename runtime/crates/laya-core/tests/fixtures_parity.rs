@@ -26,7 +26,8 @@ fn fixtures(name: &str) -> Value {
 }
 
 /// The published checkpoint by variant name (`None` is English, `Some("multilingual")` is
-/// `convaiinnovations/laya-multilingual`), see `laya_core::testing::checkpoint_dir`.
+/// `convaiinnovations/laya-multilingual`) at the revision `bench/models.lock.json` pins, see
+/// `laya_core::testing::checkpoint_dir`.
 fn model_dir(variant: Option<&str>) -> PathBuf {
     laya_core::testing::checkpoint_dir(variant)
         .unwrap_or_else(|e| panic!("checkpoint for the parity fixtures is not available: {e}"))
