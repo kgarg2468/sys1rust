@@ -7,7 +7,7 @@
 
 use crate::backend::{BackendOutput, Batch};
 use crate::config::AgentConfig;
-use crate::pyjson::round_dp;
+use crate::pyjson::{dumps_key, round_dp};
 use crate::question::{QType, Question};
 use crate::weights::Weights;
 use crate::{Error, Result};
@@ -252,13 +252,18 @@ pub fn decode_answers(
                     .iter()
                     .enumerate()
                     .fold(0, |b, (i, &x)| if x > p[b] { i } else { b });
+                // `keys = list(q["crit"].keys())`: the raw labels. The answer is the label
+                // itself; the probabilities map is keyed by what `json.dumps` writes for it.
+                // (`"1"` and `1` are distinct Python keys with one JSON spelling; upstream
+                // then emits a duplicate key, which a Map cannot hold, so the last one wins
+                // here as it does in any client that parses upstream's text.)
                 let mut probs = Map::new();
-                for (key, &v) in q.choice_keys.iter().zip(&p) {
-                    probs.insert(key.clone(), Value::from(round_dp(v, 4)));
+                for (label, &v) in q.choice_labels.iter().zip(&p) {
+                    probs.insert(dumps_key(label), Value::from(round_dp(v, 4)));
                 }
                 json!({
                     "type": "choice",
-                    "choice": q.choice_keys[argmax],
+                    "choice": q.choice_labels[argmax],
                     "probabilities": probs,
                     "confidence": conf,
                     "answer_confidence": round_dp(p[argmax], 4),
@@ -426,8 +431,8 @@ mod tests {
             qtype,
             instructions: String::new(),
             options: names.clone(),
-            choice_keys: if qtype == QType::Choice {
-                names
+            choice_labels: if qtype == QType::Choice {
+                names.iter().map(|n| json!(n)).collect()
             } else {
                 vec![]
             },
@@ -514,5 +519,67 @@ mod tests {
         assert_eq!(yes["noul"], 0.2689);
         assert_eq!(yes["confidence"], 0.7311);
         assert_eq!(yes["answer_confidence"], yes["confidence"]);
+    }
+
+    /// List-form labels: `choice` is the raw label with its JSON type, as upstream's
+    /// `keys[int(p.argmax())]` returns it, and the `probabilities` keys are the strings
+    /// `json.dumps` writes for those labels as dict keys.
+    #[test]
+    fn choice_answer_keeps_the_raw_label() {
+        let labels = vec![json!(2), json!("b"), json!(true), json!(1.5)];
+        let q = |id: &str| Question {
+            id: id.into(),
+            qtype: QType::Choice,
+            instructions: String::new(),
+            options: ["2", "b", "True", "1.5"].map(String::from).to_vec(),
+            choice_labels: labels.clone(),
+            score_legend: vec![],
+        };
+        // One row per winning label: an int, a string, a bool and a float.
+        let qs = [q("int"), q("str"), q("bool"), q("float")];
+        let batch = Batch {
+            n: 4,
+            len: 1,
+            kmax: 4,
+            input_ids: vec![0; 4],
+            attention_mask: vec![1; 4],
+            seq_lens: vec![1; 4],
+            marker_pos: vec![0; 16],
+            marker_count: vec![4; 4],
+            qtype: vec![0; 4],
+        };
+        let mut logits = vec![0.0; 16];
+        for r in 0..4 {
+            logits[r * 4 + r] = 3.0;
+        }
+        let out = BackendOutput {
+            logits,
+            pooled: vec![0.0; 4 * 2],
+        };
+        let temps = Temperatures {
+            by_type: [1.0; 3],
+            by_options: Map::new(),
+            rejected: vec![],
+        };
+        let answers = decode_answers(&out, &batch, &zero_act_head(2), &temps, &qs, 0).unwrap();
+
+        assert_eq!(answers["int"]["choice"], json!(2));
+        assert!(answers["int"]["choice"].is_i64());
+        assert_eq!(answers["str"]["choice"], json!("b"));
+        assert_eq!(answers["bool"]["choice"], json!(true));
+        assert!(answers["bool"]["choice"].is_boolean());
+        assert_eq!(answers["float"]["choice"], json!(1.5));
+        assert!(answers["float"]["choice"].is_f64());
+
+        for a in ["int", "str", "bool", "float"] {
+            let probs = answers[a]["probabilities"].as_object().unwrap();
+            let keys: Vec<&String> = probs.keys().collect();
+            assert_eq!(keys, ["2", "b", "true", "1.5"], "{a}");
+        }
+        // e^3 / (e^3 + 3) = 0.87005: the winning label's probability is the answer confidence.
+        assert_eq!(answers["bool"]["probabilities"]["true"], 0.87);
+        assert_eq!(answers["bool"]["answer_confidence"], 0.87);
+        assert_eq!(answers["int"]["probabilities"]["2"], 0.87);
+        assert_eq!(answers["float"]["probabilities"]["1.5"], 0.87);
     }
 }
