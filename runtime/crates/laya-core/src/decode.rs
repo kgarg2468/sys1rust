@@ -137,15 +137,52 @@ impl ActHead {
                 "act_head shapes {s0:?} / {s2:?} are not a 2-layer MLP"
             )));
         }
+        let (hidden, d_in, n_act) = (s0[0], s0[1], s2[0]);
+        // The forward reads `d_in - 4` pooled values and then the 4 scalar features, so a
+        // width of 4 or less has nothing to read the hidden state into.
+        if d_in <= 4 {
+            return Err(Error::Weights(format!(
+                "act_head.0.weight has input width {d_in}, but the action head reads the pooled hidden state plus 4 scalar features, so it needs at least 5"
+            )));
+        }
+        if hidden == 0 || n_act == 0 {
+            return Err(Error::Weights(format!(
+                "act_head shapes {s0:?} / {s2:?} have an empty layer"
+            )));
+        }
+        if b0.len() != hidden || b2.len() != n_act {
+            return Err(Error::Weights(format!(
+                "act_head biases have {} and {} values; the layers have {hidden} and {n_act} outputs",
+                b0.len(),
+                b2.len()
+            )));
+        }
         Ok(Self {
-            d_in: s0[1],
-            hidden: s0[0],
-            n_act: s2[0],
+            d_in,
+            hidden,
+            n_act,
             w0,
             b0,
             w2,
             b2,
         })
+    }
+
+    /// Width of the pooled hidden state the head reads: its input minus the 4 scalar features.
+    pub fn pooled_width(&self) -> usize {
+        self.d_in - 4
+    }
+
+    /// The pooled width must be the encoder hidden size the backend returns per row, or the
+    /// row slicing in [`decode_answers`] reads the wrong values.
+    pub fn check_pooled_width(&self, hidden_size: usize) -> Result<()> {
+        if self.pooled_width() != hidden_size {
+            return Err(Error::Weights(format!(
+                "act_head.0.weight has input width {}, which is not the encoder hidden size {hidden_size} plus 4 scalar features",
+                self.d_in
+            )));
+        }
+        Ok(())
     }
 
     /// Action-class probabilities for one row.
@@ -193,7 +230,7 @@ pub fn decode_answers(
     questions: &[Question],
     offset: usize,
 ) -> Result<Value> {
-    let d = act_head.d_in - 4;
+    let d = act_head.pooled_width();
     let mut answers = Map::with_capacity(questions.len());
     for (j, q) in questions.iter().enumerate() {
         let r = offset + j;
@@ -270,6 +307,8 @@ pub fn decode_answers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn temperature_clamping() {
@@ -282,6 +321,81 @@ mod tests {
         assert_eq!(Temperatures::temp_bucket(QType::Noul, 2), "noul:2");
         assert_eq!(Temperatures::temp_bucket(QType::Score, 5), "score:3-5");
         assert_eq!(Temperatures::temp_bucket(QType::Choice, 6), "choice:6-10");
+    }
+
+    /// A `model.safetensors` holding only an action head of the given shapes, in a fresh
+    /// directory under the system temp dir.
+    fn act_head_checkpoint(d_in: usize, hidden: usize, n_act: usize, b0_len: usize) -> PathBuf {
+        use safetensors::tensor::TensorView;
+        use safetensors::Dtype;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "laya-core-act-head-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zeros = |n: usize| vec![0u8; 4 * n];
+        let (w0, b0, w2, b2) = (
+            zeros(hidden * d_in),
+            zeros(b0_len),
+            zeros(n_act * hidden),
+            zeros(n_act),
+        );
+        let tensors = [
+            ("act_head.0.weight", vec![hidden, d_in], &w0),
+            ("act_head.0.bias", vec![b0_len], &b0),
+            ("act_head.2.weight", vec![n_act, hidden], &w2),
+            ("act_head.2.bias", vec![n_act], &b2),
+        ]
+        .into_iter()
+        .map(|(name, shape, data)| (name, TensorView::new(Dtype::F32, shape, data).unwrap()));
+        std::fs::write(
+            dir.join("model.safetensors"),
+            safetensors::serialize(tensors, None).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// An input width that leaves no room for the pooled hidden state is a weights error at
+    /// load time, not an underflow in the first prediction.
+    #[test]
+    fn act_head_rejects_an_input_width_without_a_hidden_state() {
+        for d_in in [0, 3, 4] {
+            let dir = act_head_checkpoint(d_in, 8, 2, 8);
+            let e = ActHead::load(&Weights::open(&dir).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(&format!("input width {d_in}")) && e.contains("at least 5"),
+                "d_in {d_in}: {e}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let dir = act_head_checkpoint(6, 8, 2, 7);
+        let e = ActHead::load(&Weights::open(&dir).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("biases have 7 and 2 values"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn act_head_width_must_match_the_encoder_hidden_size() {
+        let dir = act_head_checkpoint(6, 8, 2, 8);
+        let head = ActHead::load(&Weights::open(&dir).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!((head.d_in, head.hidden, head.n_act), (6, 8, 2));
+        assert_eq!(head.pooled_width(), 2);
+        head.check_pooled_width(2).unwrap();
+        let e = head.check_pooled_width(768).unwrap_err().to_string();
+        assert!(
+            e.contains("input width 6") && e.contains("hidden size 768"),
+            "{e}"
+        );
+        // Zero weights: every action class is equally likely.
+        assert_eq!(head.probs(&[1.0, 2.0], [0.5, 0.1, 0.2, 0.01]), [0.5, 0.5]);
     }
 
     #[test]
