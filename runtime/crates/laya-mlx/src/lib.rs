@@ -391,6 +391,14 @@ fn window_query_padded(attention_mask: &[u32], n: usize, len: usize, s: usize, n
     padded
 }
 
+/// Attention scale of the decision-head layers, `1 / sqrt(hidden / heads)`: upstream builds
+/// them as `nn.TransformerEncoderLayer(d, nhead=max(1, d // 64))`, whose `MultiheadAttention`
+/// scales by the square root of its head dim `d // nhead`. That is 64 (a scale of 1/8) for the
+/// published 768- and 1,024-wide checkpoints, but not for a `d` that 64 does not divide.
+fn head_scale(hidden: usize, heads: usize) -> f32 {
+    1.0 / ((hidden / heads) as f32).sqrt()
+}
+
 /// Cast to f32 and force a row-contiguous layout so the result can be read from the host.
 fn to_f32_contiguous(a: &Array) -> Result<Array> {
     a.as_dtype(Dtype::Float32).lx()?.contiguous().lx()
@@ -1129,7 +1137,7 @@ impl MlxBackend {
             .reshape(&[n, 1, self.hidden as i32])
             .lx()?;
         let mut h = ops::add(enc, &te).lx()?;
-        let scale = 1.0 / 8.0; // head_dim 64
+        let scale = head_scale(self.hidden, self.head_nheads);
         for layer in &self.head {
             let x = layer.norm1.apply(&h)?;
             let qkv = layer.in_proj.apply(&x)?;
@@ -1299,6 +1307,17 @@ mod tests {
         }
         assert_eq!(g.per_shape_traces(), 2, "shapes [1,8] and [2,8] compiled per shape, [3,8] and [4,8] fell back");
         assert_eq!(GeGlu::new("shapeless", true).per_shape_traces(), 0);
+    }
+
+    /// The head attention scales by its own head dim, `hidden / max(1, hidden / 64)`: 1/8 for
+    /// the published widths, and `1 / sqrt(hidden)` when a single head takes the whole width.
+    #[test]
+    fn head_scale_follows_the_head_dim() {
+        assert_eq!(head_scale(768, 12), 0.125);
+        assert_eq!(head_scale(1024, 16), 0.125);
+        assert_eq!(head_scale(512, 8), 0.125);
+        assert_eq!(head_scale(96, 1), 1.0 / 96f32.sqrt());
+        assert_eq!(head_scale(160, 2), 1.0 / 80f32.sqrt());
     }
 
     /// One window mask serves every shorter length as a view with the same values.
