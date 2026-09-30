@@ -9,8 +9,9 @@ use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use sys1d::validate::{MAX_BODY_BYTES, MAX_STATE_CHARS};
-use sys1d::worker::Predictor;
+use sys1d::config::MAX_CONCURRENT_CAP;
+use sys1d::validate::{validate_body, MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_STATE_CHARS};
+use sys1d::worker::{Predictor, Worker};
 use tokio::io::AsyncWriteExt;
 
 /// Answers every question with choice `a`; `usage.input_tokens` is the state's char count.
@@ -762,5 +763,73 @@ async fn client_that_disconnects_while_queued_is_skipped() {
         2,
         "the disconnected client's job was skipped"
     );
+    srv.stop().await;
+}
+
+// --- nesting depth --------------------------------------------------------------------------
+
+/// `{"state": [[...]], "questions": {...}}` with the state array `depth` levels deep.
+fn deep_body(depth: usize, questions: &Value) -> Vec<u8> {
+    format!(
+        r#"{{"state": {}{}, "questions": {questions}}}"#,
+        "[".repeat(depth),
+        "]".repeat(depth)
+    )
+    .into_bytes()
+}
+
+/// A document nested exactly `MAX_JSON_DEPTH` deep is served end to end (the fake predictor
+/// serializes the state on the inference thread, the way laya-core does), one level deeper
+/// is upstream's 400, and the server is still fine afterwards. Debug builds need about
+/// 3 KiB of stack per level for this, so the test also proves the threads are sized for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nesting_at_the_limit_is_served_and_one_past_is_400() {
+    let srv = echo_server().await;
+    let questions = json!({"q": choice(2)});
+    let r = srv
+        .post_bytes(&deep_body(MAX_JSON_DEPTH - 1, &questions), &[])
+        .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // Echo's usage is the state's serialized length: 2 chars per level.
+    assert_eq!(
+        r.json()["usage"]["input_tokens"],
+        json!(2 * (MAX_JSON_DEPTH - 1))
+    );
+    let r = srv
+        .post_bytes(&deep_body(MAX_JSON_DEPTH, &questions), &[])
+        .await;
+    assert_eq!(
+        (r.status, r.detail()),
+        (400, "request body must be valid JSON".to_string())
+    );
+    let r = srv.post_json(&valid_body()).await;
+    assert_eq!(r.status, 200);
+    srv.stop().await;
+}
+
+/// A request at the limit whose inference thread is already gone dies on the tokio side with
+/// the 503, not a stack overflow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_request_to_a_dead_worker_is_503() {
+    let (worker, ready) = Worker::spawn(Box::new(|| Err(anyhow::anyhow!("no checkpoint"))), 4);
+    assert!(ready.recv().unwrap().is_err());
+    let handle = worker.handle.clone();
+    assert!(worker.join(std::time::Duration::from_secs(5)));
+    let req = validate_body(&deep_body(MAX_JSON_DEPTH - 1, &json!({})), SERVED_NAME).unwrap();
+    assert!(matches!(
+        handle.predict(req).await,
+        Err(sys1d::worker::PredictError::Dead)
+    ));
+}
+
+// --- capacity -------------------------------------------------------------------------------
+
+/// The largest `LAYA_MAX_CONCURRENT` the configuration produces builds the channel and the
+/// semaphore without panicking, and the server admits requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_concurrent_at_the_cap_starts_and_serves() {
+    let srv = TestServer::start(Arc::new(Echo), MAX_CONCURRENT_CAP, None).await;
+    let r = srv.post_json(&valid_body()).await;
+    assert_eq!(r.status, 200);
     srv.stop().await;
 }

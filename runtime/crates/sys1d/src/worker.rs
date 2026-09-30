@@ -3,6 +3,8 @@
 //! a oneshot for the answer. One forward at a time, in arrival order, no cross-request
 //! batching (measured to gain nothing on this laptop).
 
+use crate::config::MAX_CONCURRENT_CAP;
+use crate::validate::{Validated, DEEP_STACK};
 use serde_json::Value;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc as std_mpsc;
@@ -65,9 +67,11 @@ pub enum PredictError {
     Dead,
 }
 
+/// A queued request. `req` keeps its non-recursive drop, so a job that dies on a tokio thread
+/// (the inference thread is gone, or the client left while the send was pending) is safe at
+/// any nesting depth.
 struct Job {
-    state: Value,
-    questions: Value,
+    req: Validated,
     reply: oneshot::Sender<Result<Prediction, PredictError>>,
 }
 
@@ -84,18 +88,10 @@ impl WorkerHandle {
     }
 
     /// Queue one prediction and wait for its answer.
-    pub async fn predict(
-        &self,
-        state: Value,
-        questions: Value,
-    ) -> Result<Prediction, PredictError> {
+    pub async fn predict(&self, req: Validated) -> Result<Prediction, PredictError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job {
-                state,
-                questions,
-                reply,
-            })
+            .send(Job { req, reply })
             .await
             .map_err(|_| PredictError::Dead)?;
         // The worker drops a job without answering only when it skips it because this
@@ -113,15 +109,19 @@ pub struct Worker {
 impl Worker {
     /// Start the thread: it runs `factory`, warms up, reports on the returned receiver, then
     /// serves jobs until every [`WorkerHandle`] is dropped. `capacity` bounds the queue; the
-    /// admission semaphore already caps in-flight requests, so it is sized to match.
+    /// admission semaphore already caps in-flight requests, so it is sized to match, within
+    /// what a tokio channel can hold.
     pub fn spawn(
         factory: Factory,
         capacity: usize,
     ) -> (Worker, std_mpsc::Receiver<anyhow::Result<Ready>>) {
-        let (tx, rx) = mpsc::channel::<Job>(capacity.max(1));
+        let (tx, rx) = mpsc::channel::<Job>(capacity.clamp(1, MAX_CONCURRENT_CAP));
         let (ready_tx, ready_rx) = std_mpsc::channel();
+        // The thread renders the state and the criteria as Python text (laya-core's dumps
+        // and repr recurse once per level), so its stack is sized for MAX_JSON_DEPTH.
         let thread = std::thread::Builder::new()
             .name("sys1d-infer".into())
+            .stack_size(DEEP_STACK)
             .spawn(move || run(factory, rx, ready_tx))
             .expect("spawn inference thread");
         (
@@ -184,7 +184,7 @@ fn run(
         }
         let t = Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            predictor.predict(&job.state, &job.questions)
+            predictor.predict(&job.req.state, &job.req.questions)
         }));
         let infer_ms = t.elapsed().as_secs_f64() * 1000.0;
         let out = match outcome {

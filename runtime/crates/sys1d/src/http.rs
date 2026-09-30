@@ -9,7 +9,7 @@
 //! request gets 408. Upstream (uvicorn) waits for a stalled body forever, and here that would
 //! hold an admission slot and block graceful shutdown.
 
-use crate::config::ServedModel;
+use crate::config::{ServedModel, MAX_CONCURRENT_CAP};
 use crate::validate::{validate_body, Rejection, MAX_BODY_BYTES};
 use crate::worker::{PredictError, WorkerHandle};
 use crate::{log, sanitize};
@@ -64,7 +64,7 @@ impl AppState {
             expected_auth: api_key
                 .filter(|k| !k.is_empty())
                 .map(|k| format!("Bearer {k}").into_bytes()),
-            admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            admission: Arc::new(Semaphore::new(max_concurrent.clamp(1, MAX_CONCURRENT_CAP))),
             body_timeout: BODY_READ_TIMEOUT,
         })
     }
@@ -185,7 +185,7 @@ async fn systemone(
             Rejection::new(StatusCode::REQUEST_TIMEOUT, "request body read timed out")
         })??;
     let v = validate_body(&raw, &st.served.name)?;
-    let pred = match st.worker.predict(v.state, v.questions).await {
+    let pred = match st.worker.predict(v).await {
         Ok(p) => p,
         Err(PredictError::Question(m)) => {
             return Err(Rejection::new(StatusCode::UNPROCESSABLE_ENTITY, m))
