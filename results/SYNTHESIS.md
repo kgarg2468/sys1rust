@@ -66,8 +66,9 @@ The goal stays the same: one Rust binary, no Python, serving `/v1/systemone`, wi
 **Design the bench points to.**
 
 - MLX lane, used for every request by default:
-  - fp16 weights and compiled graphs
-  - a fixed set of length buckets and batch sizes, all compiled and warmed at startup, to remove the spikes
+  - fp16 weights
+  - MLX's buffer cache capped at 512 MiB, which removes the spikes and the throughput drop (`SPIKE.md`)
+  - superseded: this plan first called for compiled graphs and a fixed set of length buckets and batch sizes, all warmed at startup. With the cache capped, the spike found that 12 warmed buckets added nothing and made the model load take 7.1 s instead of about 0.2 s, and that compile gained 1 to 3% in Python (`SPIKE.md`, finding 3)
   - a per-shape choice between one pass per question and one padded batch
 - ANE lane through objc2-core-ml, opt-in, for single questions up to 128 tokens when power matters more than speed. laya-apple's converter (Apache-2.0) already builds a typed-decisions ANE model that passed the agreement gate here.
 - One inference thread and a request queue. Cross-request batching gained nothing here, so leave it out.
@@ -82,7 +83,7 @@ The goal stays the same: one Rust binary, no Python, serving `/v1/systemone`, wi
 
 **Steps.**
 
-1. **Spike (1 to 2 days).** Run the typed-decisions forward pass on mlx-rs in fp16 with compile and warmed buckets. Confirm the Neural Accelerator kernels are in the build, pass the agreement gate, then run the short, timing, tail and 5-minute stages. Decision point: does it reach the bar, p50 and p95?
+1. **Spike (1 to 2 days).** Run the typed-decisions forward pass on mlx-rs in fp16 with compile and warmed buckets. Confirm the Neural Accelerator kernels are in the build, pass the agreement gate, then run the short, timing, tail and 5-minute stages. Decision point: does it reach the bar, p50 and p95? (Done, see `SPIKE.md`. With an fp16 bug fix and the capped buffer cache, and no compile or warmed buckets, the Rust runtime beat the bar for one question and came within 5% of it for ten questions at 512 tokens.)
 2. **Server and ANE lane (days).** `/v1/systemone`, the queue, the ANE lane through objc2-core-ml, and a router rule based on this bench (ANE only for short single questions in low-power mode).
 3. **Later, the model (weeks).** A packed or encode-once checkpoint (see "Why the model is the lever") multiplies what the runtime can do for multi-question requests. Start from OpenDecider-nano or laya-typed-decisions with ikken's block mask. The typed-decisions train split (1,200 states, Apache-2.0) is public, and kime's data converters list 2.2M questions with a license manifest. A small proof fits on this laptop. A full fine-tune needs a rented GPU.
 4. **Optional: publish the benchmark.** Your call, because it is public.
