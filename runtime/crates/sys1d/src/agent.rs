@@ -27,16 +27,37 @@ impl Predictor for AgentPredictor {
     }
 
     fn warmup(&self) -> laya_core::Result<()> {
-        let state = warmup_state();
-        for questions in [warmup_questions_1(), warmup_questions_4()] {
-            self.agent.predict(&state, &questions)?;
-        }
-        Ok(())
+        run_warmup(|state, questions| self.agent.predict(state, questions)).map(|_| ())
     }
 
     fn engine(&self) -> String {
         self.agent.backend_name()
     }
+}
+
+/// Run the warm-up sets through `predict` and return how many ran. A set the checkpoint
+/// cannot fit is skipped with a log line: a local checkpoint with a short `head_max_len`
+/// answers it with a question error (`options exceed head_max_len`), and a checkpoint that
+/// serves smaller client questions must still start (upstream has no warm-up at all). Any
+/// other error is a real load or backend failure and stops startup.
+pub fn run_warmup(
+    mut predict: impl FnMut(&Value, &Value) -> laya_core::Result<Value>,
+) -> laya_core::Result<usize> {
+    let state = warmup_state();
+    let mut ran = 0;
+    for (name, questions) in [
+        ("one question", warmup_questions_1()),
+        ("four questions", warmup_questions_4()),
+    ] {
+        match predict(&state, &questions) {
+            Ok(_) => ran += 1,
+            Err(laya_core::Error::Question(m)) => crate::log(format!(
+                "warm-up set ({name}) skipped, it does not fit this checkpoint: {m}"
+            )),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(ran)
 }
 
 /// A short customer-service state in the shape of the bench workloads.
@@ -77,4 +98,46 @@ pub fn warmup_questions_4() -> Value {
         },
         "action": warmup_questions_1()["action"]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use laya_core::Error;
+
+    /// A checkpoint whose budget fits one question but not four starts with one set run; one
+    /// that fits neither starts with none.
+    #[test]
+    fn warmup_skips_sets_the_checkpoint_cannot_fit() {
+        let ran = run_warmup(|_, questions| {
+            if questions.as_object().unwrap().len() > 1 {
+                Err(Error::Question(
+                    "question 'urgency' options exceed head_max_len=24".into(),
+                ))
+            } else {
+                Ok(json!({"answers": {}}))
+            }
+        })
+        .unwrap();
+        assert_eq!(ran, 1);
+        let ran =
+            run_warmup(|_, _| Err(Error::Question("question 'action': too big".into()))).unwrap();
+        assert_eq!(ran, 0);
+    }
+
+    /// Anything but a question error is a load or backend failure and still stops startup.
+    #[test]
+    fn warmup_backend_failure_stops_startup() {
+        let e = run_warmup(|_, _| Err(Error::Backend("metal: out of memory".into()))).unwrap_err();
+        assert!(matches!(e, Error::Backend(_)), "{e}");
+    }
+
+    /// The warm-up sets are valid requests: both pass the server's own checks.
+    #[test]
+    fn warmup_requests_pass_validation() {
+        for questions in [warmup_questions_1(), warmup_questions_4()] {
+            let body = json!({"state": warmup_state(), "questions": questions});
+            crate::validate::validate_body(body.to_string().as_bytes(), "typed-decisions").unwrap();
+        }
+    }
 }
