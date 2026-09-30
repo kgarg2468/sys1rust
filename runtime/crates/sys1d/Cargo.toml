@@ -1,0 +1,34 @@
+[package]
+name = "sys1d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local HTTP server for the sys1rust runtime, speaking Laya's /v1/systemone protocol."
+
+[lib]
+path = "src/lib.rs"
+
+
+[dependencies]
+laya-core = { workspace = true }
+laya-mlx = { workspace = true }
+serde = { workspace = true }
+# `unbounded_depth`: request bodies are parsed past serde_json's 128-level default, behind an
+# explicit depth check and on a stack sized for it (see `validate.rs`).
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+anyhow = { workspace = true }
+# Async runtime: the accept loop, the bounded job channel to the inference thread, the reply
+# oneshots, the admission semaphore and SIGINT/SIGTERM handling.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "signal", "macros", "time"] }
+# Router, HTTP/1.1 server (hyper underneath), graceful shutdown and the per-socket hook used
+# for TCP_NODELAY. Only the features the two routes need.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# `BodyExt::frame`, to stream the request body and stop at the 2 MiB cap.
+http-body-util = "0.1"
+# CLI flags with env-var fallbacks.
+clap = { version = "4", features = ["derive", "env"] }
+# Constant-time bearer token comparison.
+subtle = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }
