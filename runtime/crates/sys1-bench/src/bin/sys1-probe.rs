@@ -4,7 +4,8 @@
 //!
 //! Takes the first row of each shape (`shape.state_tokens`, `shape.n_questions`). `grouped` runs
 //! each shape `iters` times in a row after `warmup` runs; `mixed` cycles through the shapes
-//! `iters` times, so every request follows a different shape. Prints min, p50 and max ms.
+//! `iters` times, so every request follows a different shape. Prints a header with the model,
+//! the settings and the precision the timings were taken under, then min, p50 and max ms.
 //! Backend settings come from `SYS1_MLX` (see laya-mlx `Knobs`) and are checked at startup;
 //! `--variant` only picks the precision (`mlx-fp16`, `mlx-fp32`), any other name is an error.
 
@@ -38,15 +39,14 @@ fn main() -> Result<()> {
     if iters == 0 {
         anyhow::bail!("--iters must be at least 1 (there is no p50 of no runs)");
     }
-    if let Ok(spec) = std::env::var("SYS1_MLX") {
-        // The settings the run is reported under; a bad one is an error, not a silent default.
-        laya_mlx::check_settings(&spec).context("SYS1_MLX")?;
-    }
+    // The settings the run is reported under; a bad one is an error, not a silent default.
+    let spec = std::env::var("SYS1_MLX").unwrap_or_default();
+    laya_mlx::check_settings(&spec).context("SYS1_MLX")?;
     if std::env::var_os("SYS1_MICRO").is_some() {
         return micro();
     }
     let bench = std::env::var("BENCH_ROOT").context("source bench/env.sh")?;
-    let (dir, _sha) = sys1_bench::pinned_model_dir(Path::new(&bench), &model)?;
+    let (dir, sha) = sys1_bench::pinned_model_dir(Path::new(&bench), &model)?;
 
     let mut picked: Vec<(String, Value)> = Vec::new();
     let file = std::fs::File::open(&workload).with_context(|| format!("open workload {workload}"))?;
@@ -65,8 +65,9 @@ fn main() -> Result<()> {
         anyhow::bail!("{workload}: no requests, nothing to time");
     }
 
-    let opts = BackendOptions { f32, ..Default::default() };
+    let opts = BackendOptions { f32, tuning: Some(spec.clone()), ..Default::default() };
     let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend))?;
+    print!("{}", header(&model, &sha, &spec, &agent.backend_name()));
     let run = |row: &Value| -> Result<(f64, u64)> {
         let t0 = Instant::now();
         let (out, _) = agent.predict_batch_timed(std::slice::from_ref(&row["body"]["state"]), &row["body"]["questions"], None)?;
@@ -118,6 +119,15 @@ fn main() -> Result<()> {
         mb(mlx_rs::memory::peak_memory())
     );
     Ok(())
+}
+
+/// The lines above the timings that say what they were taken under: the model and its pinned
+/// sha, the settings spec as applied (`(none)` for the upstream defaults) and the engine name,
+/// which carries the device and the precision (`mlx(gpu,f16)`). Saved runs with different
+/// tuning are told apart by this header alone.
+fn header(model: &str, sha: &str, spec: &str, engine: &str) -> String {
+    let spec = if spec.is_empty() { "(none)" } else { spec };
+    format!("model\t{model}\t{sha}\nsettings\t{spec}\nengine\t{engine}\n")
 }
 
 /// `--variant`: the probe knows the two precisions of the sys1-bench variants, `mlx-fp16` (the
@@ -185,6 +195,15 @@ fn micro() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header names the model, the settings and the precision; an empty spec is `(none)`.
+    #[test]
+    fn header_says_what_the_timings_were_taken_under() {
+        let h = header("typed-decisions", "1a793eb", "f16gelu,cache=512", "mlx(gpu,f16)");
+        assert_eq!(h, "model\ttyped-decisions\t1a793eb\nsettings\tf16gelu,cache=512\nengine\tmlx(gpu,f16)\n");
+        let h = header("multilingual", "e4e9ddf", "", "mlx(gpu,f32)");
+        assert!(h.contains("settings\t(none)\n") && h.contains("engine\tmlx(gpu,f32)\n"), "{h}");
+    }
 
     #[test]
     fn order_is_mixed_or_grouped() {
