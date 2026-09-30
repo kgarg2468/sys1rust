@@ -1,12 +1,14 @@
 //! Steady-state latency per request shape, for comparing backend settings quickly.
 //!
-//! sys1-probe --workload FILE [--model M] [--variant V] [--warmup N] [--iters N] [--order grouped|mixed]
-//!            [--ab SPEC_A SPEC_B [--check]]
+//! sys1-probe --workload FILE [--model M] [--tuning SPEC] [--f32] [--warmup N] [--iters N]
+//!            [--order grouped|mixed] [--ab SPEC_A SPEC_B [--check]]
 //!
 //! Takes the first row of each shape (`shape.state_tokens`, `shape.n_questions`). `grouped` runs
 //! each shape `iters` times in a row after `warmup` runs; `mixed` cycles through the shapes
 //! `iters` times, so every request follows a different shape. Prints min, p50 and max ms.
-//! Backend settings come from `SYS1_MLX` (see laya-mlx `Knobs`).
+//! Backend settings are a laya-mlx `Knobs` spec: `--tuning` (default: none, the upstream
+//! reproduction), or `SYS1_MLX` when `--tuning` is absent. The probe takes specs, not
+//! sys1-bench variant names; `sys1-bench --list-variants` shows each variant's spec.
 //!
 //! `--ab` loads two agents from the same checkpoint, one per settings spec, warms both and runs
 //! them alternately (A, B, A, B, ...) on every shape so clock and thermal drift hit both the
@@ -14,7 +16,9 @@
 //! compares A's and B's answers on every picked row: the largest absolute difference over the
 //! reported probabilities and whether every choice, score and noul answer is the same.
 //! Separate process runs on this machine differ by about 5%, which hides 3% effects; the
-//! in-process alternation is what makes the comparison usable.
+//! in-process alternation is what makes the comparison usable. The two specs must agree on
+//! the process-wide MLX limits (`cache`, `wired`): both agents share one allocator, so the
+//! probe refuses a pair that differs there instead of timing both under the second one's.
 
 use anyhow::{Context, Result};
 use laya_core::{Agent, BackendOptions};
@@ -26,6 +30,7 @@ use std::time::Instant;
 fn main() -> Result<()> {
     let mut workload = String::new();
     let mut model = "typed-decisions".to_string();
+    let mut tuning: Option<String> = None;
     let mut f32 = false;
     let mut warmup = 3usize;
     let mut iters = 10usize;
@@ -38,7 +43,13 @@ fn main() -> Result<()> {
         match flag.as_str() {
             "--workload" => workload = val()?,
             "--model" => model = val()?,
-            "--variant" => f32 = val()? == "mlx-fp32",
+            "--tuning" => tuning = Some(val()?),
+            "--f32" => f32 = true,
+            "--variant" => anyhow::bail!(
+                "--variant {}: the probe takes a settings spec (--tuning SPEC, --f32), not a \
+                 sys1-bench variant name; `sys1-bench --list-variants` shows each variant's spec",
+                val()?
+            ),
             "--warmup" => warmup = val()?.parse()?,
             "--iters" => iters = val()?.parse()?,
             "--order" => mixed = val()? == "mixed",
@@ -49,6 +60,14 @@ fn main() -> Result<()> {
     }
     if check && ab.is_none() {
         anyhow::bail!("--check needs --ab");
+    }
+    if iters == 0 {
+        anyhow::bail!("--iters must be at least 1 (there is no p50 of no runs)");
+    }
+    if let Some((a, b)) = &ab {
+        if let Err(e) = same_process_wide_limits(a, b) {
+            anyhow::bail!("--ab: {e}");
+        }
     }
     let bench = std::env::var("BENCH_ROOT").context("source bench/env.sh")?;
     let lock: Value = serde_json::from_str(&std::fs::read_to_string(format!("{bench}/models.lock.json"))?)?;
@@ -71,12 +90,15 @@ fn main() -> Result<()> {
             picked.push((shape, row));
         }
     }
+    if picked.is_empty() {
+        anyhow::bail!("{workload}: no requests, nothing to time");
+    }
 
     if let Some((spec_a, spec_b)) = ab {
         return ab_run(&dir, f32, &picked, &spec_a, &spec_b, warmup, iters, mixed, check);
     }
 
-    let opts = BackendOptions { f32, ..Default::default() };
+    let opts = BackendOptions { f32, tuning, ..Default::default() };
     let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend))?;
     let run = |row: &Value| -> Result<(f64, u64)> {
         let (ms, tok, _) = predict(&agent, row)?;
@@ -208,7 +230,7 @@ fn ab_run(
         }
         println!(
             "check\trows {}\tanswers {}\tmax_prob_diff {:.6}\tmax_score_diff {:.6}\tmismatch {}\t\
-             (choice {} score {} noul {})",
+             (choice {} score {} noul {})\tmissing_values {}",
             picked.len(),
             total.answers,
             total.max_prob_diff,
@@ -216,10 +238,36 @@ fn ab_run(
             total.mismatches(),
             total.choice_mismatch,
             total.score_mismatch,
-            total.noul_mismatch
+            total.noul_mismatch,
+            total.missing
         );
     }
     print_mlx_mb();
+    Ok(())
+}
+
+/// The value of a knob in a spec (the last one wins, as laya-mlx `Knobs` parses it), `None`
+/// when the spec does not set it.
+fn knob_value(spec: &str, knob: &str) -> Option<String> {
+    spec.split(',')
+        .map(|kv| kv.split_once('=').unwrap_or((kv, "1")))
+        .filter(|(k, _)| *k == knob)
+        .next_back()
+        .map(|(_, v)| v.to_string())
+}
+
+/// `Err` naming the knob when two `--ab` specs would run under different process-wide MLX
+/// limits. `cache` and `wired` are applied to the allocator at load, so with two agents in one
+/// process both would run under the second load's values.
+fn same_process_wide_limits(a: &str, b: &str) -> std::result::Result<(), String> {
+    for knob in ["cache", "wired"] {
+        if knob_value(a, knob) != knob_value(b, knob) {
+            return Err(format!(
+                "A and B set different `{knob}` limits; these are process-wide, so B's would \
+                 apply to both. Give both specs the same cache and wired values."
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -257,6 +305,9 @@ struct AnswerCheck {
     choice_mismatch: usize,
     score_mismatch: usize,
     noul_mismatch: usize,
+    /// Values (`probabilities.*`, `noul`, `score`) that one side reports as a number and the
+    /// other side not at all or not as a number. These never count as a difference of zero.
+    missing: usize,
 }
 
 impl AnswerCheck {
@@ -270,11 +321,13 @@ impl AnswerCheck {
         self.choice_mismatch += other.choice_mismatch;
         self.score_mismatch += other.score_mismatch;
         self.noul_mismatch += other.noul_mismatch;
+        self.missing += other.missing;
     }
 }
 
 /// Compare the `answers` objects of two results for the same request, question by question.
-/// A question missing or of another type on the B side counts as a mismatch of A's type.
+/// A question missing or of another type on the B side counts as a mismatch of A's type; a
+/// probability key on one side only, or a non-numeric value, counts in `missing`.
 fn compare_answers(a: &Value, b: &Value) -> AnswerCheck {
     let mut c = AnswerCheck::default();
     let Some(qa) = a.as_object() else {
@@ -290,19 +343,32 @@ fn compare_answers(a: &Value, b: &Value) -> AnswerCheck {
             Some("noul") => c.noul_mismatch += usize::from(!same("noul")),
             _ => {}
         }
-        let diff = |x: &Value, y: &Value| -> f64 {
+        // `None` when neither side has the value (a key the type does not report); `Some(None)`
+        // when only one side has a number.
+        let diff = |x: &Value, y: &Value| -> Option<Option<f64>> {
             match (x.as_f64(), y.as_f64()) {
-                (Some(x), Some(y)) => (x - y).abs(),
-                _ => 0.0,
+                (Some(x), Some(y)) => Some(Some((x - y).abs())),
+                (None, None) if x.is_null() && y.is_null() => None,
+                _ => Some(None),
             }
         };
-        if let Some(pa) = ans_a["probabilities"].as_object() {
+        let mut missing = 0usize;
+        let mut note = |d: Option<Option<f64>>, worst: &mut f64| match d {
+            Some(Some(d)) => *worst = worst.max(d),
+            Some(None) => missing += 1,
+            None => {}
+        };
+        let (pa, pb) = (ans_a["probabilities"].as_object(), ans_b["probabilities"].as_object());
+        if let Some(pa) = pa {
             for (k, pv) in pa {
-                c.max_prob_diff = c.max_prob_diff.max(diff(pv, &ans_b["probabilities"][k]));
+                note(diff(pv, &ans_b["probabilities"][k]), &mut c.max_prob_diff);
             }
         }
-        c.max_prob_diff = c.max_prob_diff.max(diff(&ans_a["noul"], &ans_b["noul"]));
-        c.max_score_diff = c.max_score_diff.max(diff(&ans_a["score"], &ans_b["score"]));
+        note(diff(&ans_a["noul"], &ans_b["noul"]), &mut c.max_prob_diff);
+        note(diff(&ans_a["score"], &ans_b["score"]), &mut c.max_score_diff);
+        // Keys B reports that A does not.
+        let extra = pb.map_or(0, |pb| pb.keys().filter(|k| !pa.is_some_and(|pa| pa.contains_key(*k))).count());
+        c.missing += missing + extra;
     }
     c
 }
@@ -351,10 +417,43 @@ mod tests {
         assert_eq!((c.choice_mismatch, c.score_mismatch, c.noul_mismatch), (1, 1, 1));
         assert_eq!(c.mismatches(), 3);
 
-        // A question B does not have counts as a mismatch of its type.
+        // A question B does not have counts as a mismatch of its type, and every number A
+        // reported for it as missing (5 probabilities, 1 noul, 1 score).
         let c = compare_answers(&a, &json!({}));
         assert_eq!((c.choice_mismatch, c.score_mismatch, c.noul_mismatch), (1, 1, 1));
         assert_eq!((c.max_prob_diff, c.max_score_diff), (0.0, 0.0));
+        assert_eq!(c.missing, 7);
+    }
+
+    /// A probability B leaves out, reports as something other than a number, or adds is not a
+    /// difference of zero: it shows up in `missing` even when the choice is the same.
+    #[test]
+    fn compare_answers_counts_missing_and_non_numeric_probabilities() {
+        let a = json!({"pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7, "y": 0.3}}});
+        let dropped = json!({"pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7}}});
+        let c = compare_answers(&a, &dropped);
+        assert_eq!((c.mismatches(), c.missing, c.max_prob_diff), (0, 1, 0.0));
+        let text = json!({"pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7, "y": "0.3"}}});
+        assert_eq!(compare_answers(&a, &text).missing, 1);
+        let extra = json!({"pick": {"type": "choice", "choice": "x", "probabilities": {"x": 0.7, "y": 0.3, "z": 0.0}}});
+        assert_eq!(compare_answers(&a, &extra).missing, 1);
+        // Keys the answer type does not report (no `score` on a choice) are not missing.
+        assert_eq!(compare_answers(&a, &a).missing, 0);
+        let mut t = AnswerCheck::default();
+        t.merge(&c);
+        assert_eq!(t.missing, 1);
+    }
+
+    #[test]
+    fn ab_specs_must_share_the_process_wide_limits() {
+        assert!(same_process_wide_limits("f16gelu,cache=512,wired=2048", "f16gelu,cache=512,wired=2048,unpad").is_ok());
+        assert!(same_process_wide_limits("wired=2048,cache=512", "cache=512,wired=2048").is_ok());
+        assert!(same_process_wide_limits("", "f16gelu").is_ok());
+        let e = same_process_wide_limits("cache=512", "cache=1024").unwrap_err();
+        assert!(e.contains("`cache`"), "{e}");
+        let e = same_process_wide_limits("cache=512,wired=2048", "cache=512").unwrap_err();
+        assert!(e.contains("`wired`"), "{e}");
+        assert!(same_process_wide_limits("", "wired=1024").is_err());
     }
 
     #[test]

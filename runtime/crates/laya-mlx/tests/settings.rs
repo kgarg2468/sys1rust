@@ -11,14 +11,17 @@
 //!
 //! Run with: `cargo test -p laya-mlx --release --test settings -- --ignored --nocapture`
 
+mod common;
+
+use common::{bench_root, categorical, prob_diff, read_jsonl, CHECKPOINTS};
 use laya_core::resolve::resolve_model_dir;
 use laya_core::{parse_questions, Agent, BackendOptions};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
-/// The settings the work reductions are measured against (`results/SPEED.md`).
+/// The settings the work reductions are measured against (`results/SPEED.md`). Their answers
+/// against the upstream fp32 reference are checked in `tests/reference.rs`.
 const BASE: &str = "f16gelu,cache=512,wired=2048";
 const TOL: f64 = 1e-3;
 /// Against the fp32 CPU reference of `bench/reference/<name>/smoke.jsonl`: the f16 GPU
@@ -26,30 +29,8 @@ const TOL: f64 = 1e-3;
 /// one answer, with or without the work reductions.
 const REFERENCE_TOL: f64 = 0.02;
 
-const CHECKPOINTS: [(&str, &str); 3] = [
-    ("typed-decisions", "convaiinnovations/laya-typed-decisions"),
-    ("multilingual", "convaiinnovations/laya-multilingual"),
-    ("english", "convaiinnovations/laya"),
-];
-
 /// Two agents at a time is the budget; the tests take turns so `cargo test` cannot load six.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn bench_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../bench")
-        .canonicalize()
-        .unwrap()
-}
-
-fn read_jsonl(path: &PathBuf) -> Vec<Value> {
-    BufReader::new(std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
-        .lines()
-        .map(|l| l.unwrap())
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(&l).unwrap())
-        .collect()
-}
 
 /// One request: the states (each against every question) and the questions object.
 struct Case {
@@ -128,29 +109,6 @@ fn cases(smoke: &[Value]) -> Vec<Case> {
         });
     }
     v
-}
-
-/// Argmax choice / rounded score / noul side of one answer.
-fn categorical(answer: &Value) -> Value {
-    match answer["type"].as_str() {
-        Some("choice") => answer["choice"].clone(),
-        Some("noul") => Value::from(answer["noul"].as_f64().unwrap_or(0.0) >= 0.5),
-        Some("score") => Value::from(answer["score"].as_f64().unwrap_or(0.0).round()),
-        _ => Value::Null,
-    }
-}
-
-/// Largest absolute difference over `probabilities` (or `noul` for noul answers).
-fn max_prob_diff(a: &Value, b: &Value) -> f64 {
-    let (Some(pa), Some(pb)) = (a["probabilities"].as_object(), b["probabilities"].as_object()) else {
-        return match (a["noul"].as_f64(), b["noul"].as_f64()) {
-            (Some(x), Some(y)) => (x - y).abs(),
-            _ => f64::NAN,
-        };
-    };
-    pa.iter()
-        .map(|(k, v)| (v.as_f64().unwrap_or(0.0) - pb.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN)).abs())
-        .fold(0.0, f64::max)
 }
 
 /// Everything one agent produces for the cases: the answers per state, and the raw backend
@@ -254,7 +212,8 @@ fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str) -> f64 {
             for (qid, ans) in qa {
                 let other = &qb[qid];
                 assert_eq!(categorical(ans), categorical(other), "{name}/{}/{qid}/{extra}: {ans} vs {other}", c.name);
-                let d = max_prob_diff(ans, other);
+                // Same probability keys, all finite, or `prob_diff` says which one is not.
+                let d = prob_diff(ans, other).unwrap_or_else(|e| panic!("{name}/{}/{qid}/{extra}: {e}: {ans} vs {other}", c.name));
                 assert!(d <= TOL, "{name}/{}/{qid}/{extra}: probability diff {d}: {ans} vs {other}", c.name);
                 // `answer_confidence` comes from the logits, `act_probability` from pooled.
                 for key in [&["answer_confidence"][..], &["action", "act_probability"]] {
@@ -262,7 +221,10 @@ fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str) -> f64 {
                     for k in key {
                         (x, y) = (&x[k], &y[k]);
                     }
-                    let dc = (x.as_f64().unwrap() - y.as_f64().unwrap()).abs();
+                    let (Some(x), Some(y)) = (x.as_f64().filter(|v| v.is_finite()), y.as_f64().filter(|v| v.is_finite())) else {
+                        panic!("{name}/{}/{qid}/{extra}: {} is not a finite number on both sides: {x} vs {y}", c.name, key.join("."));
+                    };
+                    let dc = (x - y).abs();
                     assert!(dc <= TOL, "{name}/{}/{qid}/{extra}: {} diff {dc}", c.name, key.join("."));
                     worst = worst.max(dc);
                 }
@@ -321,16 +283,17 @@ fn all_three_match_plain() {
     every_checkpoint("dense_upto=1024,headprune,unpad");
 }
 
-/// The smoke set against the fp32 CPU reference, per checkpoint, with the base settings and
-/// with the three work reductions: probabilities within `REFERENCE_TOL` and the same choice on
-/// at least 99% of the choice questions. This is the check that a checkpoint is served
-/// correctly at all; the base run is there to tell a precision regression from the f16 gap.
+/// The smoke set against the fp32 CPU reference, per checkpoint, with the three work
+/// reductions on top of the base settings: probabilities within `REFERENCE_TOL` and the same
+/// decision on at least 99% of the answers. `tests/reference.rs` runs the same check with the
+/// base settings; its numbers tell a precision regression here from the f16 gap.
 #[test]
 #[ignore]
 fn smoke_matches_reference_with_all_three() {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let bench = bench_root();
     let smoke = read_jsonl(&bench.join("workloads/smoke.jsonl"));
+    let extra = "dense_upto=1024,headprune,unpad";
     let mut ran = 0;
     for (name, repo) in CHECKPOINTS {
         let Ok(dir) = resolve_model_dir(repo, None) else {
@@ -338,33 +301,27 @@ fn smoke_matches_reference_with_all_three() {
             continue;
         };
         let reference = read_jsonl(&bench.join(format!("reference/{name}/smoke.jsonl")));
-        for extra in ["", ",dense_upto=1024,headprune,unpad"] {
-            let agent = load(&dir, &format!("{BASE}{extra}"));
-            let (mut worst, mut worst_at, mut agree, mut total, mut checked) = (0.0f64, String::new(), 0usize, 0usize, 0usize);
-            for row in &smoke {
-                let id = row["id"].as_str().unwrap();
-                let want = &reference.iter().find(|r| r["id"] == *id).unwrap_or_else(|| panic!("{id} not in reference"))["answers"];
-                let got = agent.predict(&row["body"]["state"], &row["body"]["questions"]).unwrap();
-                for (qid, ans) in got["answers"].as_object().unwrap() {
-                    let d = max_prob_diff(ans, &want[qid]);
-                    assert!(d <= REFERENCE_TOL, "{name}/{id}/{qid}/{extra:?}: probability diff {d} vs reference");
-                    if d > worst {
-                        (worst, worst_at) = (d, format!("{id}/{qid}"));
-                    }
-                    checked += 1;
-                    if ans["type"] == "choice" {
-                        total += 1;
-                        agree += usize::from(ans["choice"] == want[qid]["choice"]);
-                    }
+        let agent = load(&dir, &format!("{BASE},{extra}"));
+        let (mut worst, mut worst_at, mut agree, mut total) = (0.0f64, String::new(), 0usize, 0usize);
+        for row in &smoke {
+            let id = row["id"].as_str().unwrap();
+            let want = &reference.iter().find(|r| r["id"] == *id).unwrap_or_else(|| panic!("{id} not in reference"))["answers"];
+            let got = agent.predict(&row["body"]["state"], &row["body"]["questions"]).unwrap();
+            let got = got["answers"].as_object().unwrap();
+            assert_eq!(got.len(), want.as_object().unwrap().len(), "{name}/{id}: answered questions differ from the reference");
+            for (qid, ans) in got {
+                let d = prob_diff(ans, &want[qid]).unwrap_or_else(|e| panic!("{name}/{id}/{qid}: {e}"));
+                assert!(d <= REFERENCE_TOL, "{name}/{id}/{qid}: probability diff {d} vs reference");
+                if d > worst {
+                    (worst, worst_at) = (d, format!("{id}/{qid}"));
                 }
+                total += 1;
+                agree += usize::from(categorical(ans) == categorical(&want[qid]));
             }
-            let pct = 100.0 * agree as f64 / total as f64;
-            eprintln!(
-                "{name:<16} reference, {:<12} {checked} answers, max prob diff {worst:.4} at {worst_at}, choice agreement {agree}/{total} ({pct:.1}%)",
-                if extra.is_empty() { "base:" } else { "all three:" }
-            );
-            assert!(pct >= 99.0, "{name}/{extra:?}: choice agreement {pct:.1}% < 99%");
         }
+        let pct = 100.0 * agree as f64 / total as f64;
+        eprintln!("{name:<16} reference, all three: {total} answers, max prob diff {worst:.4} at {worst_at}, agreement {agree}/{total} ({pct:.1}%)");
+        assert!(pct >= 99.0, "{name}/{extra}: agreement {pct:.1}% < 99%");
         ran += 1;
     }
     assert!(ran > 0, "no checkpoint in the HF cache");
