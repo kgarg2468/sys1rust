@@ -109,8 +109,9 @@ pub fn encode_state(
         let (ids, markers) = build_sequence(tok, &st, q, max_len, head_max_len)?;
         if markers.len() != q.options.len() {
             return Err(Error::Question(format!(
-                "question '{}' options exceed head_max_len={}",
-                q.id, head_max_len
+                "question {} options exceed head_max_len={}",
+                pyjson::repr_str(&q.id),
+                head_max_len
             )));
         }
         items.push(EncodedItem {
@@ -130,7 +131,12 @@ pub fn collate(items: &[EncodedItem], pad_id: u32) -> Batch {
 /// [`collate`] with rows padded to at least `min_len` tokens (for fixed-size shape buckets).
 pub fn collate_to(items: &[EncodedItem], pad_id: u32, min_len: usize) -> Batch {
     let n = items.len();
-    let len = items.iter().map(|it| it.ids.len()).max().unwrap_or(0).max(min_len);
+    let len = items
+        .iter()
+        .map(|it| it.ids.len())
+        .max()
+        .unwrap_or(0)
+        .max(min_len);
     let kmax = items.iter().map(|it| it.markers.len()).max().unwrap_or(0);
     let mut input_ids = vec![pad_id; n * len];
     let mut attention_mask = vec![0u32; n * len];
