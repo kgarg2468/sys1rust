@@ -8,6 +8,9 @@ description = "Local HTTP server for the sys1rust runtime, speaking Laya's /v1/s
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "sys1d"
+path = "src/main.rs"
 
 [dependencies]
 laya-core = { workspace = true }

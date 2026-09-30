@@ -1,0 +1,208 @@
+//! The inference thread. MLX objects must stay on one OS thread, so the predictor is built
+//! and used only here; HTTP handlers send validated jobs over a bounded channel and wait on
+//! a oneshot for the answer. One forward at a time, in arrival order, no cross-request
+//! batching (measured to gain nothing on this laptop).
+
+use serde_json::Value;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc as std_mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
+
+/// The inference call behind the HTTP layer; the real one wraps `laya_core::Agent`.
+pub trait Predictor {
+    /// `Agent::predict`: one state, a `{qid: definition}` object.
+    fn predict(&self, state: &Value, questions: &Value) -> laya_core::Result<Value>;
+    /// Runs once before the server binds, so the first client request is not the slow first
+    /// forward.
+    fn warmup(&self) -> laya_core::Result<()> {
+        Ok(())
+    }
+    /// Backend description for `/health` and the ready line, e.g. `mlx(gpu,f16)`.
+    fn engine(&self) -> String;
+}
+
+impl<P: Predictor + ?Sized> Predictor for std::sync::Arc<P> {
+    fn predict(&self, state: &Value, questions: &Value) -> laya_core::Result<Value> {
+        (**self).predict(state, questions)
+    }
+    fn warmup(&self) -> laya_core::Result<()> {
+        (**self).warmup()
+    }
+    fn engine(&self) -> String {
+        (**self).engine()
+    }
+}
+
+/// Builds the predictor on the inference thread (the model load happens there).
+pub type Factory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Predictor>> + Send + 'static>;
+
+/// What the thread reports once the model is loaded and warm.
+#[derive(Debug, Clone)]
+pub struct Ready {
+    pub engine: String,
+    pub load_ms: f64,
+    pub warmup_ms: f64,
+}
+
+/// One answered prediction; `infer_ms` is the time inside `predict`, not the queue wait.
+#[derive(Debug, Clone)]
+pub struct Prediction {
+    pub result: Value,
+    pub infer_ms: f64,
+}
+
+#[derive(Debug)]
+pub enum PredictError {
+    /// `laya_core::Error::Question`: the client's question is invalid (422).
+    Question(String),
+    /// Any other `laya_core::Error` (500; the message is for the log only).
+    Failed(String),
+    /// `predict` panicked (500); the worker keeps running.
+    Panicked(String),
+    /// The inference thread is gone (503).
+    Dead,
+}
+
+struct Job {
+    state: Value,
+    questions: Value,
+    reply: oneshot::Sender<Result<Prediction, PredictError>>,
+}
+
+/// The HTTP side of the channel. Cloned into the app state.
+#[derive(Clone)]
+pub struct WorkerHandle {
+    tx: mpsc::Sender<Job>,
+}
+
+impl WorkerHandle {
+    /// False once the inference thread has exited (all it holds is the receiver).
+    pub fn is_alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// Queue one prediction and wait for its answer.
+    pub async fn predict(
+        &self,
+        state: Value,
+        questions: Value,
+    ) -> Result<Prediction, PredictError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Job {
+                state,
+                questions,
+                reply,
+            })
+            .await
+            .map_err(|_| PredictError::Dead)?;
+        // The worker drops a job without answering only when it skips it because this
+        // receiver is already gone, so a closed channel here means the thread died.
+        rx.await.unwrap_or(Err(PredictError::Dead))
+    }
+}
+
+/// The inference thread plus a handle to it.
+pub struct Worker {
+    pub handle: WorkerHandle,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    /// Start the thread: it runs `factory`, warms up, reports on the returned receiver, then
+    /// serves jobs until every [`WorkerHandle`] is dropped. `capacity` bounds the queue; the
+    /// admission semaphore already caps in-flight requests, so it is sized to match.
+    pub fn spawn(
+        factory: Factory,
+        capacity: usize,
+    ) -> (Worker, std_mpsc::Receiver<anyhow::Result<Ready>>) {
+        let (tx, rx) = mpsc::channel::<Job>(capacity.max(1));
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("sys1d-infer".into())
+            .spawn(move || run(factory, rx, ready_tx))
+            .expect("spawn inference thread");
+        (
+            Worker {
+                handle: WorkerHandle { tx },
+                thread: Some(thread),
+            },
+            ready_rx,
+        )
+    }
+
+    /// Drop this handle and wait for the thread to exit (it does once the last handle is
+    /// gone). Returns false if it is still running after `timeout`.
+    pub fn join(mut self, timeout: Duration) -> bool {
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        drop(self.handle);
+        let deadline = Instant::now() + timeout;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        thread.join().is_ok()
+    }
+}
+
+fn run(
+    factory: Factory,
+    mut rx: mpsc::Receiver<Job>,
+    ready_tx: std_mpsc::Sender<anyhow::Result<Ready>>,
+) {
+    let t0 = Instant::now();
+    let predictor = match factory() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = Instant::now();
+    if let Err(e) = predictor.warmup() {
+        let _ = ready_tx.send(Err(anyhow::anyhow!("warm-up failed: {e}")));
+        return;
+    }
+    let warmup_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let _ = ready_tx.send(Ok(Ready {
+        engine: predictor.engine(),
+        load_ms,
+        warmup_ms,
+    }));
+
+    while let Some(job) = rx.blocking_recv() {
+        if job.reply.is_closed() {
+            // The client hung up while queued; its forward would be wasted.
+            continue;
+        }
+        let t = Instant::now();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            predictor.predict(&job.state, &job.questions)
+        }));
+        let infer_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let out = match outcome {
+            Ok(Ok(result)) => Ok(Prediction { result, infer_ms }),
+            Ok(Err(laya_core::Error::Question(m))) => Err(PredictError::Question(m)),
+            Ok(Err(e)) => Err(PredictError::Failed(e.to_string())),
+            Err(payload) => Err(PredictError::Panicked(panic_message(payload.as_ref()))),
+        };
+        let _ = job.reply.send(out);
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".into()
+    }
+}
