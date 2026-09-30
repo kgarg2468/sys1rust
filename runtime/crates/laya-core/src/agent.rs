@@ -14,6 +14,16 @@ use crate::{Result, MODEL_NAME};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+/// Rows (state and question pairs) per forward pass when `predict_batch` gets no batch size.
+/// 128 rows at `max_len` 512 keep the fp16 attention scores of a 12-head encoder under 1 GiB.
+/// sys1d never reaches this: it passes one state per request, bounded by its request limits.
+pub const DEFAULT_MAX_ROWS: usize = 128;
+
+/// States per forward pass for `n_questions` questions each, staying under [`DEFAULT_MAX_ROWS`].
+pub fn default_chunk(n_questions: usize) -> usize {
+    (DEFAULT_MAX_ROWS / n_questions.max(1)).max(1)
+}
+
 /// Builds a backend for a checkpoint. Implemented by each backend crate.
 pub type BackendFactory<'a> =
     dyn FnOnce(&Weights, &ModelConfig, &BackendOptions) -> Result<Box<dyn Backend>> + 'a;
@@ -103,7 +113,8 @@ impl Agent {
             .remove(0))
     }
 
-    /// `Agent.predict_batch`: the same questions over many states, packed into shared forward passes.
+    /// `Agent.predict_batch`: the same questions over many states, packed into shared forward
+    /// passes of `batch_size` states each, or [`default_chunk`] states when it is `None` or 0.
     pub fn predict_batch(
         &self,
         states: &[Value],
@@ -128,9 +139,11 @@ impl Agent {
             let empty = json!({ "model": MODEL_NAME, "answers": {}, "usage": { "input_tokens": 0, "output_tokens": 0 } });
             return Ok((vec![empty; states.len()], timing));
         }
+        // Without an explicit batch size, cap the rows per forward pass so a large call does not
+        // allocate ids, masks and activations for every state at once. One state is never split.
         let chunk = match batch_size {
             Some(b) if b > 0 => b,
-            _ => states.len(),
+            _ => default_chunk(qs.len()),
         };
         let mut results = Vec::with_capacity(states.len());
         for part in states.chunks(chunk) {
@@ -177,5 +190,20 @@ impl Agent {
         let state: Value = serde_json::from_str(state_json)?;
         let questions: Value = serde_json::from_str(questions_json)?;
         Ok(serde_json::to_string(&self.predict(&state, &questions)?)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_chunk_bounds_rows_and_keeps_whole_states() {
+        assert_eq!(default_chunk(1), DEFAULT_MAX_ROWS);
+        assert_eq!(default_chunk(3), DEFAULT_MAX_ROWS / 3);
+        assert!(default_chunk(3) * 3 <= DEFAULT_MAX_ROWS);
+        // More questions than the row cap still runs one state per pass.
+        assert_eq!(default_chunk(DEFAULT_MAX_ROWS + 1), 1);
+        assert_eq!(default_chunk(0), DEFAULT_MAX_ROWS);
     }
 }

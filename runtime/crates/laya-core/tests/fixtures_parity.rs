@@ -1,5 +1,8 @@
-//! Parity against the Python package, using fixtures dumped by `scripts/ref_dump.py`.
-//! The fixtures need the checkpoints in the HF cache; tests skip when they are absent.
+//! Parity against the Python package, using fixtures dumped by the fork's `scripts/ref_dump.py`
+//! into `runtime/tests/fixtures/<name>.json`. The fixtures are not in the repository and the
+//! checks need the checkpoints in the HF cache, so the tests are ignored by default. Run them
+//! with `cargo test -p laya-core --test fixtures_parity -- --ignored`; a missing fixture or
+//! checkpoint then fails instead of passing silently.
 
 use laya_core::backend::{Backend, BackendOptions, BackendOutput, Batch};
 use laya_core::decode::{act_features, ActHead, Temperatures};
@@ -7,16 +10,23 @@ use laya_core::{parse_questions, Agent, Weights};
 use serde_json::Value;
 use std::path::PathBuf;
 
-fn fixtures(name: &str) -> Option<Value> {
+fn fixtures(name: &str) -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
         .join(format!("{name}.json"));
-    let bytes = std::fs::read(p).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = std::fs::read(&p).unwrap_or_else(|e| {
+        panic!(
+            "fixture {} is missing ({e}); generate it with scripts/ref_dump.py from the laya-r-mlx fork",
+            p.display()
+        )
+    });
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("fixture {} is not valid JSON: {e}", p.display()))
 }
 
-fn model_dir(subfolder: Option<&str>) -> Option<PathBuf> {
-    laya_core::resolve::resolve_model_dir("convaiinnovations/laya", subfolder).ok()
+fn model_dir(subfolder: Option<&str>) -> PathBuf {
+    laya_core::resolve::resolve_model_dir("convaiinnovations/laya", subfolder)
+        .unwrap_or_else(|e| panic!("checkpoint for the parity fixtures is not available: {e}"))
 }
 
 /// A backend that replays the Python head outputs stored in the fixture.
@@ -51,10 +61,7 @@ fn flat_f32(v: &Value) -> Vec<f32> {
 }
 
 fn check_checkpoint(name: &str, subfolder: Option<&str>) {
-    let (Some(fx), Some(dir)) = (fixtures(name), model_dir(subfolder)) else {
-        eprintln!("skipping {name}: fixtures or checkpoint missing");
-        return;
-    };
+    let (fx, dir) = (fixtures(name), model_dir(subfolder));
     let weights = Weights::open(&dir).unwrap();
     let act_head = ActHead::load(&weights).unwrap();
     // Agent with a dummy backend just for tokenization/config.
@@ -161,11 +168,13 @@ fn check_checkpoint(name: &str, subfolder: Option<&str>) {
 }
 
 #[test]
+#[ignore = "needs runtime/tests/fixtures/laya.json from scripts/ref_dump.py and the checkpoint in the HF cache"]
 fn english_checkpoint_parity() {
     check_checkpoint("laya", None);
 }
 
 #[test]
+#[ignore = "needs runtime/tests/fixtures/multilingual.json from scripts/ref_dump.py and the checkpoint in the HF cache"]
 fn multilingual_checkpoint_parity() {
     check_checkpoint("multilingual", Some("multilingual"));
 }

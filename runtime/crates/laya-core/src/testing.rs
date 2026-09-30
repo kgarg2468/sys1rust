@@ -82,6 +82,23 @@ fn flat_f32(v: &Value) -> Vec<f32> {
         .collect()
 }
 
+/// Largest element-wise difference. A backend output of the wrong length is an error rather
+/// than a comparison over the shorter prefix, which would report zero for a truncated output.
+fn max_abs_diff(case: &str, what: &str, got: &[f32], want: &[f32]) -> Result<f32> {
+    if got.len() != want.len() {
+        return Err(crate::Error::Backend(format!(
+            "{case}: {what} has {} values, the fixture has {}",
+            got.len(),
+            want.len()
+        )));
+    }
+    Ok(got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max))
+}
+
 /// Walk two answer objects collecting the max abs difference over numeric leaves and the
 /// number of differing `choice` strings.
 fn compare_answers(got: &Value, want: &Value, prob_max: &mut f64, choice_mismatch: &mut usize) {
@@ -153,27 +170,13 @@ pub fn run_parity(
                 logits_max = logits_max.max((out.logits[i] - want_logits[i]).abs());
             }
         }
-        let pooled_max = out
-            .pooled
-            .iter()
-            .zip(&want_pooled)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+        let pooled_max = max_abs_diff(&name, "pooled", &out.pooled, &want_pooled)?;
         let encoder_hidden_max_abs = match case.get("encoder_hidden_item0") {
             Some(h) if !h.is_null() => {
                 let want = flat_f32(h);
                 let row0 = crate::sequence::collate(&items[..1], agent.tokenizer.pad_id);
                 match agent.backend().encoder_hidden(&row0)? {
-                    Some(got) => {
-                        let n = want.len().min(got.len());
-                        Some(
-                            got[..n]
-                                .iter()
-                                .zip(&want[..n])
-                                .map(|(a, b)| (a - b).abs())
-                                .fold(0f32, f32::max),
-                        )
-                    }
+                    Some(got) => Some(max_abs_diff(&name, "encoder hidden state", &got, &want)?),
                     None => None,
                 }
             }
