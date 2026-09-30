@@ -31,11 +31,14 @@ pub const MAX_JSON_DEPTH: usize = 10_000;
 /// about 3.2 KiB of stack per level (192 KiB at 64 levels) and the Python-text walks up to
 /// 2.4 KiB, so 32 levels leave the handler thread most of its stack.
 pub const INLINE_DEPTH: usize = 32;
-/// Stack for the threads that walk a body nested up to [`MAX_JSON_DEPTH`]: the parse and
+/// Stack for the threads that walk a value nested up to [`MAX_JSON_DEPTH`]: the parse and
 /// check thread here and the inference thread, where laya-core renders the state and the
-/// criteria as Python text. Measured at 10,000 levels in a debug build: parse 32 MiB, clone
-/// 24 MiB, repr, dumps and drop 16 MiB; a release build needs a quarter of that. This is a
-/// reservation of address space, only the pages touched are committed.
+/// criteria as Python text, copies a score criterion into the answer's `legend`, and the
+/// response is serialized to bytes. Those are the only threads a request-derived value is
+/// ever parsed, cloned, serialized or recursively dropped on; a tokio thread sees at most a
+/// [`Validated`] (flat drop) and response bytes. Measured at 10,000 levels in a debug build:
+/// parse 32 MiB, clone 24 MiB, repr, dumps and drop 16 MiB; a release build needs a quarter
+/// of that. This is a reservation of address space, only the pages touched are committed.
 pub const DEEP_STACK: usize = 64 * 1024 * 1024;
 
 /// A refused request: the status and the `detail` string of the error body.
@@ -142,34 +145,75 @@ fn parse_json(raw: &[u8]) -> serde_json::Result<Value> {
     Ok(v)
 }
 
-/// Parse and check a complete request body against `served_name`.
-pub fn validate_body(raw: &[u8], served_name: &str) -> Result<Validated, Rejection> {
+/// The depth gate both entry points share: past [`MAX_JSON_DEPTH`] is upstream's
+/// RecursionError branch (the same 400 as malformed JSON); otherwise, whether the body is deep
+/// enough to need a thread with [`DEEP_STACK`].
+fn needs_deep_stack(raw: &[u8]) -> Result<bool, Rejection> {
     let depth = nesting_depth(raw);
     if depth > MAX_JSON_DEPTH {
-        // Upstream's RecursionError branch: the same 400 as malformed JSON.
         return Err(bad_request("request body must be valid JSON"));
     }
-    if depth <= INLINE_DEPTH {
+    Ok(depth > INLINE_DEPTH)
+}
+
+/// The thread a deep body is parsed and checked on: a stack for [`MAX_JSON_DEPTH`] levels.
+/// Every value the checks build dies on that thread too.
+fn deep_thread() -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name("sys1d-deep-body".into())
+        .stack_size(DEEP_STACK)
+}
+
+/// The OS refused the thread or it panicked before answering: the operator gets the cause,
+/// the client upstream's opaque 500.
+fn deep_thread_failed(cause: impl std::fmt::Display) -> Rejection {
+    crate::log(format!("deep body thread: {cause}"));
+    Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, "inference failed")
+}
+
+/// Parse and check a complete request body against `served_name`, blocking the caller while
+/// a deep body is parsed on its own thread. For the HTTP handler use [`validate_body_async`].
+pub fn validate_body(raw: &[u8], served_name: &str) -> Result<Validated, Rejection> {
+    if !needs_deep_stack(raw)? {
         return check_parsed(raw, served_name);
     }
-    // Deep enough to overflow the handler's thread: parse and walk it on a thread with a
-    // stack for MAX_JSON_DEPTH levels. Every value the checks build dies on that thread too.
     std::thread::scope(|s| {
-        let thread = std::thread::Builder::new()
-            .name("sys1d-deep-body".into())
-            .stack_size(DEEP_STACK)
-            .spawn_scoped(s, || check_parsed(raw, served_name));
-        match thread {
-            Ok(t) => t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
-            Err(e) => {
-                crate::log(format!("could not start the body thread: {e}"));
-                Err(Rejection::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "inference failed",
-                ))
-            }
-        }
+        let thread = deep_thread()
+            .spawn_scoped(s, || check_parsed(raw, served_name))
+            .map_err(deep_thread_failed)?;
+        thread
+            .join()
+            .unwrap_or_else(|_| Err(deep_thread_failed("panicked")))
     })
+}
+
+/// [`validate_body`] for an async caller: a deep body is parsed on its own thread while the
+/// caller's task yields, so a tokio worker is never held for the parse and `/health` and the
+/// other connections keep moving. The thread owns `raw` and, if the caller is gone by the
+/// time it finishes (the client disconnected), the result dies on its stack. When the result
+/// does cross to the caller it is a [`Validated`], whose drop is flat, so the tokio side may
+/// drop it but must not walk it.
+pub async fn validate_body_async(raw: Vec<u8>, served_name: &str) -> Result<Validated, Rejection> {
+    if !needs_deep_stack(&raw)? {
+        return check_parsed(&raw, served_name);
+    }
+    let served_name = served_name.to_string();
+    on_deep_stack(move || check_parsed(&raw, &served_name)).await?
+}
+
+/// Run `work` on a [`deep_thread`] and await its result without blocking the runtime.
+async fn on_deep_stack<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Rejection> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    deep_thread()
+        .spawn(move || {
+            // A closed receiver means the caller is gone; the result is dropped right here.
+            let _ = tx.send(work());
+        })
+        .map_err(deep_thread_failed)?;
+    // The sender is dropped without a value only when `work` panicked.
+    rx.await.map_err(|_| deep_thread_failed("panicked"))
 }
 
 /// [`validate_body`] after the depth check: upstream's checks in upstream's order.
@@ -466,6 +510,96 @@ mod tests {
             e.detail,
             format!("state too large ({} > 50000 chars)", 7 * depth + 1)
         );
+    }
+
+    /// The async entry point gives the same answers as the sync one at the limit, one past
+    /// it and for a shallow body, and runs on a plain tokio runtime.
+    #[tokio::test]
+    async fn validate_body_async_matches_the_sync_path() {
+        let served = "typed-decisions";
+        let ok = validate_body_async(
+            body_with_state_depth(MAX_JSON_DEPTH - 1).into_bytes(),
+            served,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.questions, json!({}));
+        assert!(matches!(ok.state, Value::Array(_)));
+        let e = validate_body_async(body_with_state_depth(MAX_JSON_DEPTH).into_bytes(), served)
+            .await
+            .unwrap_err();
+        assert_eq!(e.detail, "request body must be valid JSON");
+        let ok = validate_body_async(br#"{"state":"s","questions":{}}"#.to_vec(), served)
+            .await
+            .unwrap();
+        assert_eq!(ok.state, json!("s"));
+        let e = validate_body_async(b"nope".to_vec(), served)
+            .await
+            .unwrap_err();
+        assert_eq!(e.detail, "request body must be valid JSON");
+    }
+
+    /// While the deep thread works, the runtime keeps running other tasks. On this
+    /// single-threaded runtime the thread is released by a task that can only run if the
+    /// await yielded; a blocking join would deadlock, which the timeout turns into a failure.
+    #[tokio::test]
+    async fn deep_thread_does_not_block_the_runtime() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = on_deep_stack(move || {
+            release_rx.recv().unwrap();
+            7
+        });
+        let releaser = async {
+            tokio::task::yield_now().await;
+            release_tx.send(()).unwrap();
+        };
+        let (got, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(work, releaser)
+        })
+        .await
+        .expect("the runtime was blocked while the deep thread waited");
+        assert_eq!(got.unwrap(), 7);
+    }
+
+    /// A caller that is gone before the thread finishes (the client disconnected) leaves the
+    /// result to die on the deep thread; a panic on that thread is upstream's opaque 500.
+    #[tokio::test]
+    async fn deep_thread_caller_gone_or_panicked() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let work = on_deep_stack(move || {
+            release_rx.recv().unwrap();
+            let _ = done_tx.send(());
+            validate_body(
+                body_with_state_depth(MAX_JSON_DEPTH - 1).as_bytes(),
+                "typed-decisions",
+            )
+        });
+        // Poll once so the thread starts, then drop the future.
+        let mut work = Box::pin(work);
+        assert!(futures_poll_once(&mut work).is_none());
+        drop(work);
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the thread ran to completion on its own");
+        let e = on_deep_stack(|| -> usize { panic!("boom") })
+            .await
+            .unwrap_err();
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.detail, "inference failed");
+    }
+
+    /// Poll `fut` once with a no-op waker.
+    fn futures_poll_once<T>(
+        fut: &mut std::pin::Pin<Box<impl std::future::Future<Output = T>>>,
+    ) -> Option<T> {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => Some(v),
+            std::task::Poll::Pending => None,
+        }
     }
 
     /// A request at the limit can be dropped on a thread far too small to unwind it
