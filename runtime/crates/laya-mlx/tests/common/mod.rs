@@ -88,7 +88,10 @@ pub fn agree(a: &Value, r: &Value) -> bool {
 }
 
 /// Largest absolute difference between two answers' reported probabilities: the values of
-/// `probabilities` for choice and score answers, `noul` for noul answers.
+/// `probabilities` for choice and score answers, `noul` for noul answers, and
+/// `action.act_probability` when either answer reports it. The action probability comes from
+/// the pooled `[CLS]` output rather than the marker logits, so it can move when no other
+/// probability does; the upstream references report it on every answer.
 ///
 /// Both answers must report the same keys with finite numbers, or this is an `Err` naming the
 /// first offending key. A missing or non-numeric value is never a difference of zero.
@@ -99,7 +102,7 @@ pub fn prob_diff(a: &Value, b: &Value) -> Result<f64, String> {
             _ => Err(format!("{what} is {v}, not a finite number")),
         }
     };
-    match (a["probabilities"].as_object(), b["probabilities"].as_object()) {
+    let mut worst = match (a["probabilities"].as_object(), b["probabilities"].as_object()) {
         (Some(pa), Some(pb)) => {
             if let Some(k) = pb.keys().find(|k| !pa.contains_key(*k)) {
                 return Err(format!("probabilities.{k} only on one side"));
@@ -110,9 +113,15 @@ pub fn prob_diff(a: &Value, b: &Value) -> Result<f64, String> {
                 let d = (finite(va, &format!("probabilities.{k}"))? - finite(vb, &format!("probabilities.{k}"))?).abs();
                 worst = worst.max(d);
             }
-            Ok(worst)
+            worst
         }
-        (None, None) => Ok((finite(&a["noul"], "noul")? - finite(&b["noul"], "noul")?).abs()),
-        _ => Err("probabilities only on one side".into()),
+        (None, None) => (finite(&a["noul"], "noul")? - finite(&b["noul"], "noul")?).abs(),
+        _ => return Err("probabilities only on one side".into()),
+    };
+    let (act_a, act_b) = (&a["action"]["act_probability"], &b["action"]["act_probability"]);
+    if !act_a.is_null() || !act_b.is_null() {
+        let d = (finite(act_a, "action.act_probability")? - finite(act_b, "action.act_probability")?).abs();
+        worst = worst.max(d);
     }
+    Ok(worst)
 }

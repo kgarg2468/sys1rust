@@ -1,7 +1,8 @@
 //! The smoke workload (`bench/workloads/smoke.jsonl`) through the engine with the production
 //! settings, against the upstream fp32 CPU reference `bench/reference/<name>/smoke.jsonl`, for
 //! every checkpoint in the HF cache. This is the check that the f16 GPU path serves upstream's
-//! answers: the same decision on every answer and every reported probability within `TOL`.
+//! answers: the same decision on every answer and every reported probability within `TOL`,
+//! `action.act_probability` included.
 //!
 //! Ignored by default: it needs the downloaded checkpoints (`source bench/env.sh` first). A
 //! checkpoint that is not in the cache is skipped with a note; at least one must run.
@@ -30,6 +31,20 @@ const MIN_AGREEMENT: f64 = 0.99;
 #[test]
 #[ignore = "needs the checkpoints in the HF cache; source bench/env.sh first"]
 fn smoke_matches_upstream_reference() {
+    smoke_against_reference(PRODUCTION);
+}
+
+/// The same check with boolean masks. The smoke set's 512-token states pad past four window
+/// widths, so they take the chunked local-attention path: this covers `mask=bool` on both the
+/// dense and the chunked masks, padded query rows (all-false rows would be NaN) included.
+#[test]
+#[ignore = "needs the checkpoints in the HF cache; source bench/env.sh first"]
+fn smoke_matches_upstream_reference_with_bool_masks() {
+    smoke_against_reference(&format!("{PRODUCTION},mask=bool"));
+}
+
+/// The smoke set with `tuning` against the reference, for every checkpoint in the cache.
+fn smoke_against_reference(tuning: &str) {
     let bench = bench_root();
     let smoke = read_jsonl(&bench.join("workloads/smoke.jsonl"));
     let mut ran = 0;
@@ -39,7 +54,7 @@ fn smoke_matches_upstream_reference() {
             continue;
         };
         let reference = read_jsonl(&bench.join(format!("reference/{name}/smoke.jsonl")));
-        let opts = BackendOptions { tuning: Some(PRODUCTION.into()), ..Default::default() };
+        let opts = BackendOptions { tuning: Some(tuning.into()), ..Default::default() };
         let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend)).unwrap();
         let (mut worst, mut worst_at, mut agreed, mut total) = (0.0f64, String::new(), 0usize, 0usize);
         for row in &smoke {
@@ -67,7 +82,7 @@ fn smoke_matches_upstream_reference() {
         }
         let agreement = agreed as f64 / total as f64;
         eprintln!(
-            "{name:<16} {total} answers over {} requests: agreement {agreed}/{total} ({:.1}%), max probability diff {worst:.4} at {worst_at}",
+            "{name:<16} [{tuning}] {total} answers over {} requests: agreement {agreed}/{total} ({:.1}%), max probability diff {worst:.4} at {worst_at}",
             smoke.len(),
             100.0 * agreement
         );
@@ -100,6 +115,36 @@ fn prob_diff_rejects_missing_or_non_numeric_values() {
     assert!(prob_diff(&a, &json!({"type": "noul", "noul": 0.5})).is_err());
     assert!(prob_diff(&json!({"noul": 0.5}), &json!({})).is_err());
     assert!(prob_diff(&json!({"noul": f64::NAN}), &json!({"noul": 0.5})).is_err());
+}
+
+/// `action.act_probability` counts like any other probability once either side reports it: it
+/// comes from the pooled output, so it can move while every marker probability stays put.
+#[test]
+fn prob_diff_includes_the_action_probability() {
+    let a = json!({"type": "choice", "probabilities": {"x": 0.7, "y": 0.3}, "action": {"act_probability": 0.9}});
+    let mut b = a.clone();
+    b["action"]["act_probability"] = json!(0.85);
+    assert!((prob_diff(&a, &b).unwrap() - 0.05).abs() < 1e-12);
+    assert_eq!(prob_diff(&a, &a).unwrap(), 0.0);
+    // The larger of the two differences is reported.
+    b["probabilities"]["x"] = json!(0.6);
+    b["probabilities"]["y"] = json!(0.4);
+    assert!((prob_diff(&a, &b).unwrap() - 0.1).abs() < 1e-12);
+    let n = json!({"type": "noul", "noul": 0.6, "action": {"act_probability": 0.2}});
+    let mut m = n.clone();
+    m["action"]["act_probability"] = json!(0.25);
+    assert!((prob_diff(&n, &m).unwrap() - 0.05).abs() < 1e-12);
+    // On one side only, not a number, or not finite: an error, never a difference of zero.
+    let mut without = a.clone();
+    without.as_object_mut().unwrap().remove("action");
+    assert!(prob_diff(&a, &without).unwrap_err().contains("act_probability"));
+    assert!(prob_diff(&without, &a).unwrap_err().contains("act_probability"));
+    b["action"]["act_probability"] = json!("0.9");
+    assert!(prob_diff(&a, &b).is_err());
+    b["action"]["act_probability"] = json!(f64::NAN);
+    assert!(prob_diff(&a, &b).is_err());
+    b["action"] = json!({});
+    assert!(prob_diff(&a, &b).is_err());
 }
 
 /// The decision of each answer type is the one `bench/harness/compare.py` counts: the choice
