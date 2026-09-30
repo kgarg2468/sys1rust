@@ -16,6 +16,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const CONTENDER: &str = "sys1rust";
 const MODELS: [&str; 3] = ["typed-decisions", "multilingual", "english"];
+/// Limits of a model that every variant inherits, printed with `--list-variants` as
+/// `model_notes`. English has upstream references for the smoke, short and cold workloads only:
+/// its correctness runs report gold accuracy but cannot report the choice agreement with
+/// upstream that qualifies a speed result (`bench/harness/compare.py` prints "gold only").
+const MODEL_NOTES: [(&str, &str); 1] = [(
+    "english",
+    "no upstream correctness reference (bench/reference/english has smoke, short and cold only); \
+     correctness runs are gold-only and do not qualify speed results",
+)];
 
 struct Variant {
     name: &'static str,
@@ -149,7 +158,10 @@ fn main() -> Result<()> {
     if args.list {
         let v: Vec<Value> = VARIANTS
             .iter()
-            .map(|v| json!({"variant": v.name, "models": MODELS, "mode": "inproc", "max_state_tokens": null, "notes": v.notes}))
+            .map(|v| json!({
+                "variant": v.name, "models": MODELS, "mode": "inproc", "max_state_tokens": null, "notes": v.notes,
+                "model_notes": MODEL_NOTES.iter().map(|(m, n)| (m.to_string(), Value::from(*n))).collect::<serde_json::Map<_, _>>(),
+            }))
             .collect();
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
