@@ -99,12 +99,23 @@ fn parse_args() -> Result<Args> {
             "--out" => a.out = val()?,
             "--warmup" => a.warmup = val()?.parse()?,
             "--repeats" => a.repeats = val()?.parse()?,
-            "--duration" => a.duration = Some(val()?.parse()?),
+            "--duration" => a.duration = Some(parse_duration(&val()?)?),
             "--concurrency" => a.concurrency = val()?.parse()?,
             other => bail!("unknown argument {other}"),
         }
     }
     Ok(a)
+}
+
+/// `--duration` in seconds: a finite, positive number. Zero or a negative one would write only
+/// the meta line and exit 0, so the harness would skip a run that measured nothing; NaN or
+/// infinity would never end the run.
+fn parse_duration(s: &str) -> Result<f64> {
+    let d: f64 = s.parse().with_context(|| format!("--duration {s}: not a number"))?;
+    if !d.is_finite() || d <= 0.0 {
+        bail!("--duration {s}: must be a finite, positive number of seconds");
+    }
+    Ok(d)
 }
 
 /// `$HF_HOME/hub/models--org--name/snapshots/<sha>` for the model's pin in `models.lock.json`.
@@ -164,13 +175,18 @@ fn main() -> Result<()> {
         .iter()
         .find(|v| v.name == args.variant)
         .with_context(|| format!("unknown variant {}", args.variant))?;
+    let opts = (variant.opts)();
+    if let Some(spec) = &opts.tuning {
+        // The meta line labels the run with these settings, so one the backend would not apply
+        // is an error here, before anything is loaded or written.
+        laya_mlx::check_settings(spec).with_context(|| format!("variant {}: settings `{spec}`", variant.name))?;
+    }
     let bench = std::env::var("BENCH_ROOT").context("BENCH_ROOT is not set (source bench/env.sh)")?;
     let (dir, sha) = model_dir(&bench, &args.model)?;
 
     let rows = read_workload(&args.workload)?;
 
     let t_load = Instant::now();
-    let opts = (variant.opts)();
     let agent = Agent::load(&dir, &opts, Box::new(laya_mlx::make_backend))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
@@ -233,4 +249,31 @@ fn main() -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_must_be_finite_and_positive() {
+        assert_eq!(parse_duration("1.5").unwrap(), 1.5);
+        assert_eq!(parse_duration("30").unwrap(), 30.0);
+        for bad in ["0", "-1", "nan", "inf", "-inf", "abc", ""] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// Every named variant's settings parse, so the spec printed in the meta line is the one
+    /// the backend applies.
+    #[test]
+    fn every_variant_spec_is_valid() {
+        for v in &VARIANTS {
+            if v.name == "mlx-env" {
+                continue;
+            }
+            let opts = (v.opts)();
+            laya_mlx::check_settings(opts.tuning.as_deref().unwrap_or("")).unwrap_or_else(|e| panic!("{}: {e}", v.name));
+        }
+    }
 }

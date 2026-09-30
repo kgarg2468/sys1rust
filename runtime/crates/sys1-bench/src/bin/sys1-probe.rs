@@ -5,7 +5,8 @@
 //! Takes the first row of each shape (`shape.state_tokens`, `shape.n_questions`). `grouped` runs
 //! each shape `iters` times in a row after `warmup` runs; `mixed` cycles through the shapes
 //! `iters` times, so every request follows a different shape. Prints min, p50 and max ms.
-//! Backend settings come from `SYS1_MLX` (see laya-mlx `Knobs`).
+//! Backend settings come from `SYS1_MLX` (see laya-mlx `Knobs`) and are checked at startup;
+//! `--variant` only picks the precision (`mlx-fp16`, `mlx-fp32`), any other name is an error.
 
 use anyhow::{Context, Result};
 use laya_core::{Agent, BackendOptions};
@@ -27,12 +28,19 @@ fn main() -> Result<()> {
         match flag.as_str() {
             "--workload" => workload = val()?,
             "--model" => model = val()?,
-            "--variant" => f32 = val()? == "mlx-fp32",
+            "--variant" => f32 = parse_variant(&val()?)?,
             "--warmup" => warmup = val()?.parse()?,
             "--iters" => iters = val()?.parse()?,
-            "--order" => mixed = val()? == "mixed",
+            "--order" => mixed = parse_order(&val()?)?,
             other => anyhow::bail!("unknown argument {other}"),
         }
+    }
+    if iters == 0 {
+        anyhow::bail!("--iters must be at least 1 (there is no p50 of no runs)");
+    }
+    if let Ok(spec) = std::env::var("SYS1_MLX") {
+        // The settings the run is reported under; a bad one is an error, not a silent default.
+        laya_mlx::check_settings(&spec).context("SYS1_MLX")?;
     }
     if std::env::var_os("SYS1_MICRO").is_some() {
         return micro();
@@ -57,6 +65,9 @@ fn main() -> Result<()> {
         if !picked.iter().any(|(s, _)| *s == shape) {
             picked.push((shape, row));
         }
+    }
+    if picked.is_empty() {
+        anyhow::bail!("{workload}: no requests, nothing to time");
     }
 
     let opts = BackendOptions { f32, ..Default::default() };
@@ -114,6 +125,28 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `--variant`: the probe knows the two precisions of the sys1-bench variants, `mlx-fp16` (the
+/// default) and `mlx-fp32`. Backend settings come from `SYS1_MLX`, so a tuned variant name such
+/// as `mlx-fp16-fast` is an error here rather than a run under other settings than its label.
+fn parse_variant(name: &str) -> Result<bool> {
+    match name {
+        "mlx-fp16" => Ok(false),
+        "mlx-fp32" => Ok(true),
+        other => anyhow::bail!(
+            "unknown variant {other}: the probe takes mlx-fp16 or mlx-fp32 and reads backend settings from SYS1_MLX"
+        ),
+    }
+}
+
+/// `--order`: `mixed` cycles through the shapes, `grouped` runs each shape's iterations in a row.
+fn parse_order(order: &str) -> Result<bool> {
+    match order {
+        "mixed" => Ok(true),
+        "grouped" => Ok(false),
+        other => anyhow::bail!("unknown order {other}: use mixed or grouped"),
+    }
+}
+
 /// Raw MLX timings to compare with the same ops from Python (`SYS1_MICRO=1`).
 fn micro() -> Result<()> {
     use mlx_rs::{ops, random, transforms, Array, Dtype};
@@ -152,4 +185,27 @@ fn micro() -> Result<()> {
         Ok(h)
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_is_mixed_or_grouped() {
+        assert!(parse_order("mixed").unwrap());
+        assert!(!parse_order("grouped").unwrap());
+        for bad in ["Mixed", "mixd", "random", ""] {
+            assert!(parse_order(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn variant_is_one_of_the_two_precisions() {
+        assert!(!parse_variant("mlx-fp16").unwrap());
+        assert!(parse_variant("mlx-fp32").unwrap());
+        for bad in ["mlx-fp16-fast", "mlx-env", "fp32", ""] {
+            assert!(parse_variant(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
 }
