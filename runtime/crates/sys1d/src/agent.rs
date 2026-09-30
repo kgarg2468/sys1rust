@@ -35,24 +35,30 @@ impl Predictor for AgentPredictor {
     }
 }
 
-/// Run the warm-up sets through `predict` and return how many ran. A set the checkpoint
-/// cannot fit is skipped with a log line: a local checkpoint with a short `head_max_len`
-/// answers it with a question error (`options exceed head_max_len`), and a checkpoint that
-/// serves smaller client questions must still start (upstream has no warm-up at all). Any
-/// other error is a real load or backend failure and stops startup.
+/// Run the warm-up sets through `predict` and return how many ran. Upstream `laya serve`
+/// has no warm-up at all, so a set must not keep a checkpoint that can serve client
+/// requests from starting. The one-question set is about as small as a real request: a
+/// question error skips it with a log line (a local checkpoint with a short `head_max_len`
+/// answers `options exceed head_max_len`), any other error is a load or backend failure
+/// and stops startup. The four-question set is optional: any error, out of memory
+/// included, is logged and skipped, since a machine that cannot fit four questions can
+/// still serve one. A skip line quotes the error and does not guess at its cause.
 pub fn run_warmup(
     mut predict: impl FnMut(&Value, &Value) -> laya_core::Result<Value>,
 ) -> laya_core::Result<usize> {
     let state = warmup_state();
     let mut ran = 0;
-    for (name, questions) in [
-        ("one question", warmup_questions_1()),
-        ("four questions", warmup_questions_4()),
+    for (name, questions, optional) in [
+        ("one question", warmup_questions_1(), false),
+        ("four questions", warmup_questions_4(), true),
     ] {
         match predict(&state, &questions) {
             Ok(_) => ran += 1,
-            Err(laya_core::Error::Question(m)) => crate::log(format!(
-                "warm-up set ({name}) skipped, it does not fit this checkpoint: {m}"
+            Err(e @ laya_core::Error::Question(_)) => {
+                crate::log(format!("warm-up set ({name}) skipped: {e}"))
+            }
+            Err(e) if optional => crate::log(format!(
+                "warm-up set ({name}) skipped, startup continues: {e}"
             )),
             Err(e) => return Err(e),
         }
@@ -125,11 +131,29 @@ mod tests {
         assert_eq!(ran, 0);
     }
 
-    /// Anything but a question error is a load or backend failure and still stops startup.
+    /// A backend failure on the four-question set is skipped, so a machine that runs out of
+    /// memory on four questions still starts and serves smaller requests.
     #[test]
-    fn warmup_backend_failure_stops_startup() {
+    fn warmup_skips_a_backend_failure_on_the_optional_set() {
+        let ran = run_warmup(|_, questions| {
+            if questions.as_object().unwrap().len() > 1 {
+                Err(Error::Backend("metal: out of memory".into()))
+            } else {
+                Ok(json!({"answers": {}}))
+            }
+        })
+        .unwrap();
+        assert_eq!(ran, 1);
+    }
+
+    /// Anything but a question error on the one-question set is a load or backend failure
+    /// and still stops startup, whatever the four-question set would have done.
+    #[test]
+    fn warmup_backend_failure_on_the_first_set_stops_startup() {
         let e = run_warmup(|_, _| Err(Error::Backend("metal: out of memory".into()))).unwrap_err();
         assert!(matches!(e, Error::Backend(_)), "{e}");
+        let e = run_warmup(|_, _| Err(Error::Weights("missing tensor".into()))).unwrap_err();
+        assert!(matches!(e, Error::Weights(_)), "{e}");
     }
 
     /// The warm-up sets are valid requests: both pass the server's own checks.
