@@ -6,7 +6,7 @@ Python MLX port of Laya by mizorewww, running on the GPU. It is not an official 
 
 - Source: github.com/mizorewww/laya-mlx at `0a859518634112655cb97c745dbf04f5191aaf13` (main, 2026-09-22, "Sync with upstream v0.3.5"), cloned into `src/`. Package version 0.2.0.
 - Venv: `.venv/` (uv 0.11.7, managed CPython 3.12.13 from `bench/.cache/uv-python`), made with
-  `UV_PROJECT_ENVIRONMENT=$PWD/.venv uv sync --frozen --python 3.12 --managed-python` inside `src/` (the lockfile's base dependencies only, no extras).
+  `UV_PROJECT_ENVIRONMENT=../.venv uv sync --frozen --python 3.12 --managed-python` inside `src/`, so the venv sits beside `src/` where `bench/env.sh` looks for it (the lockfile's base dependencies only, no extras).
 - Versions: mlx 0.32.2 (+ mlx-metal 0.32.2), numpy 2.5.3, tokenizers 0.23.2, huggingface-hub 1.32.0.
 - Weights: loaded straight from the pinned upstream repos in `bench/models.lock.json` (`convaiinnovations/laya-typed-decisions@1a793eb5…`, `convaiinnovations/laya-multilingual@e4e9ddf2…`) with `revision=<sha>`. laya-mlx converts the original `model.safetensors` to MLX in memory at load (parameter renaming plus a dtype cast). No export step ran, and the pre-converted `aac6fef/*-mlx` Hub repos are not used, so there is no third-party provenance question.
 - `run` sets `HF_HUB_OFFLINE=1` by default, so the checkpoints must already be in the shared `HF_HOME`. They are, as of this setup.
