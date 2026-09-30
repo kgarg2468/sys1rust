@@ -1,8 +1,9 @@
 //! Live end-to-end test (ignored by default; needs the typed-decisions checkpoint in the HF
 //! cache, `source bench/env.sh` first). Starts the real `sys1d` binary on port 0, posts every
 //! request in `bench/workloads/smoke.jsonl`, checks the answers against an in-process
-//! `Agent::predict` and against the fp32 CPU reference (key sets and order, probabilities and
-//! `answer_confidence` within a tolerance, argmax agreement), then stops it with SIGINT.
+//! `Agent::predict` and against the fp32 CPU reference (key sets and order, every numeric
+//! field within a tolerance, categorical agreement), then stops it with SIGINT. The child is
+//! killed if the test fails or hangs at any point.
 //!
 //! Run with: `cargo test -p sys1d --release --test live -- --ignored --nocapture`
 
@@ -13,15 +14,24 @@ use laya_core::{Agent, BackendOptions};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 /// Served (f16 on the GPU) against in-process with the same engine: the same numbers.
 const SAME_ENGINE_TOL: f64 = 1e-3;
-/// Served (f16 GPU) against the fp32 CPU reference. The smoke set measures 0.0008 at most;
-/// this leaves room for kernel changes without hiding a real precision regression.
-const REFERENCE_TOL: f64 = 0.01;
+/// Served (f16 GPU) against the fp32 CPU reference, for `probabilities`, `noul`,
+/// `confidence`, `answer_confidence` and `action.act_probability`. Measured over the 120
+/// smoke answers: 0.0008, 0.0008, 0.0009 and 0.0000 (`results/SERVER.md`). 2.5x the largest
+/// catches a regression of a few thousandths while leaving room for kernel-level noise.
+const REFERENCE_TOL: f64 = 0.002;
+/// `score` is the probability-weighted level, so its spread grows with the level count
+/// (up to 32); the smoke set's score questions have 4 levels and measure 0.0013 at most.
+const SCORE_TOL: f64 = 0.005;
+/// Model load is about 3 s, warm-up under 1 s; a ready line later than this means a hang.
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn bench_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,10 +85,83 @@ fn max_prob_diff(a: &Value, b: &Value) -> f64 {
         .fold(0.0, f64::max)
 }
 
-fn field_diff(a: &Value, b: &Value, key: &str) -> f64 {
-    match (a[key].as_f64(), b[key].as_f64()) {
-        (Some(x), Some(y)) => (x - y).abs(),
-        _ => f64::NAN,
+/// Absolute difference of a numeric field, `None` when `a` lacks it. Key sets are compared
+/// before this is called, so a field missing on one side only is caught there.
+fn field_diff(a: &Value, b: &Value, key: &str) -> Option<f64> {
+    let x = a[key].as_f64()?;
+    Some((x - b[key].as_f64().unwrap_or(f64::NAN)).abs())
+}
+
+/// The `sys1d` child. Dropping it kills the process if it is still running, so a failed
+/// assertion or a timeout never leaves a server holding the model and GPU memory.
+struct Server(Child);
+
+impl Server {
+    fn spawn() -> Server {
+        Server(
+            Command::new(env!("CARGO_BIN_EXE_sys1d"))
+                .args(["--port", "0", "--model", "typed-decisions"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn sys1d"),
+        )
+    }
+
+    /// The first stdout line, within `READY_TIMEOUT`. A reader thread keeps draining stdout
+    /// afterwards so the child never blocks on a full pipe.
+    fn ready_line(&mut self) -> String {
+        let stdout = self.0.stdout.take().expect("piped stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lines = BufReader::new(stdout).lines();
+            if let Some(Ok(first)) = lines.next() {
+                let _ = tx.send(first);
+            }
+            for _ in lines.by_ref() {}
+        });
+        match rx.recv_timeout(READY_TIMEOUT) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("no ready line within {READY_TIMEOUT:?}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "sys1d exited before printing a ready line: {:?}",
+                    self.0.wait()
+                )
+            }
+        }
+    }
+
+    /// SIGINT, then the exit status within `SHUTDOWN_TIMEOUT`.
+    fn stop(&mut self) -> ExitStatus {
+        let status = Command::new("kill")
+            .args(["-INT", &self.0.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -INT");
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        loop {
+            if let Some(st) = self.0.try_wait().unwrap() {
+                return st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sys1d did not exit within {SHUTDOWN_TIMEOUT:?} of SIGINT"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            eprintln!("killing sys1d (pid {}) that is still running", self.0.id());
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
@@ -92,15 +175,8 @@ async fn smoke_workload_through_the_real_server() {
 
     // Start the binary on a free port and parse its ready line.
     let t0 = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sys1d"))
-        .args(["--port", "0", "--model", "typed-decisions"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn sys1d");
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    stdout.read_line(&mut line).unwrap();
+    let mut server = Server::spawn();
+    let line = server.ready_line();
     let ready: Value =
         serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("ready line {line:?}: {e}"));
     eprintln!(
@@ -164,22 +240,7 @@ async fn smoke_workload_through_the_real_server() {
 
     // Stop the server with SIGINT and check for a clean exit before loading a second copy
     // of the weights in this process.
-    let status = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let exit = loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            break st;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "sys1d did not exit within 15 s of SIGINT"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let exit = server.stop();
     assert_eq!(exit.code(), Some(0), "clean shutdown exit code");
 
     // In-process answers with the same engine settings must match the served ones.
@@ -224,14 +285,19 @@ async fn smoke_workload_through_the_real_server() {
     );
 
     // Against the fp32 CPU reference: every answer has the reference's key set in the
-    // reference's order, probabilities and `answer_confidence` are within REFERENCE_TOL, and
-    // argmax agreement on choice questions is at least 99%.
+    // reference's order, every numeric field is within its tolerance, and the categorical
+    // answer (argmax choice, rounded score, noul side) agrees on at least 99% of answers.
     let mut agree = 0usize;
     let mut total = 0usize;
-    let mut answers_checked = 0usize;
-    let mut worst_prob = 0.0f64;
-    let mut worst_conf = 0.0f64;
     let mut disagreements = Vec::new();
+    // (field, tolerance, largest difference seen)
+    let mut spread = [
+        ("probabilities", REFERENCE_TOL, 0.0f64),
+        ("answer_confidence", REFERENCE_TOL, 0.0),
+        ("confidence", REFERENCE_TOL, 0.0),
+        ("action.act_probability", REFERENCE_TOL, 0.0),
+        ("score", SCORE_TOL, 0.0),
+    ];
     for (id, over_http) in &served {
         let reference = reference
             .iter()
@@ -264,44 +330,46 @@ async fn smoke_workload_through_the_real_server() {
                     "{id}/{qid}: probability keys"
                 );
             }
-            let dp = max_prob_diff(ans, want);
-            assert!(
-                dp <= REFERENCE_TOL,
-                "{id}/{qid}: probability diff {dp} vs reference"
-            );
-            let dc = field_diff(ans, want, "answer_confidence");
-            assert!(
-                dc <= REFERENCE_TOL,
-                "{id}/{qid}: answer_confidence {} vs reference {}",
-                ans["answer_confidence"],
-                want["answer_confidence"]
-            );
-            worst_prob = worst_prob.max(dp);
-            worst_conf = worst_conf.max(dc);
-            answers_checked += 1;
-            if ans["type"] == "choice" {
-                total += 1;
-                if ans["choice"] == want["choice"] {
-                    agree += 1;
-                } else {
-                    disagreements.push(format!(
-                        "{id}/{qid}: served {} reference {}",
-                        ans["choice"], want["choice"]
-                    ));
-                }
+            let diffs = [
+                Some(max_prob_diff(ans, want)),
+                field_diff(ans, want, "answer_confidence"),
+                field_diff(ans, want, "confidence"),
+                field_diff(&ans["action"], &want["action"], "act_probability"),
+                field_diff(ans, want, "score"),
+            ];
+            for ((field, tol, worst), d) in spread.iter_mut().zip(diffs) {
+                let Some(d) = d else { continue };
+                assert!(
+                    d <= *tol,
+                    "{id}/{qid}: {field} differs by {d} from the reference (tolerance {tol}): served {ans} reference {want}"
+                );
+                *worst = worst.max(d);
+            }
+            total += 1;
+            if categorical(ans) == categorical(want) {
+                agree += 1;
+            } else {
+                disagreements.push(format!(
+                    "{id}/{qid} ({}): served {} reference {}",
+                    ans["type"],
+                    categorical(ans),
+                    categorical(want)
+                ));
             }
         }
     }
-    assert!(
-        total > 0,
-        "reference has no choice questions for the smoke ids"
-    );
+    assert!(total > 0, "reference has no answers for the smoke ids");
     let pct = 100.0 * agree as f64 / total as f64;
+    let worst: Vec<String> = spread
+        .iter()
+        .map(|(f, _, w)| format!("{f} {w:.4}"))
+        .collect();
     eprintln!(
-        "reference agreement: {answers_checked} answers with matching key order; max probability diff {worst_prob:.4}, max answer_confidence diff {worst_conf:.4}; {agree}/{total} choice answers ({pct:.1}%) {disagreements:?}"
+        "reference agreement: {total} answers with matching key order; largest differences {}; {agree}/{total} categorical answers agree ({pct:.1}%) {disagreements:?}",
+        worst.join(", ")
     );
     assert!(
         pct >= 99.0,
-        "argmax agreement {pct:.1}% < 99%: {disagreements:?}"
+        "categorical agreement {pct:.1}% < 99%: {disagreements:?}"
     );
 }
