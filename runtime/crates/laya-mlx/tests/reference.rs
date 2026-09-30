@@ -6,7 +6,8 @@
 //! Ignored by default: it needs the downloaded checkpoints (`source bench/env.sh` first). A
 //! checkpoint that is not in the cache is skipped with a note; at least one must run.
 //!
-//! Run with: `cargo test -p laya-mlx --release --test reference -- --ignored --nocapture`
+//! Run from the repo root with:
+//! `cargo test --manifest-path runtime/Cargo.toml -p laya-mlx --release --test reference -- --ignored --nocapture`
 
 mod common;
 

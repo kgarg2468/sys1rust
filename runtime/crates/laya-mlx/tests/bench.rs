@@ -1,6 +1,7 @@
 //! Repeated-forward timing of the MLX backend on the fixture cases (ignored by default; a
 //! missing fixture or checkpoint fails loudly when run with `--ignored`).
-//! Run with: `cargo test -p laya-mlx --release --test bench -- --ignored --nocapture`.
+//! Run from the repo root with:
+//! `cargo test --manifest-path runtime/Cargo.toml -p laya-mlx --release --test bench -- --ignored --nocapture`.
 
 use laya_core::testing::fixtures_path;
 use laya_core::{parse_questions, Agent, BackendOptions};
