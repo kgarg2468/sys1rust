@@ -128,6 +128,15 @@ impl Num {
     }
 }
 
+/// The float `json.loads` builds for `n` when it is not finite (`1e400` is `inf`), which
+/// `json.dumps(allow_nan=False)` refuses. `None` for an int of any size or a finite float.
+pub fn non_finite(n: &Number) -> Option<f64> {
+    match Num::of(n) {
+        Num::Float(x) if !x.is_finite() => Some(x),
+        _ => None,
+    }
+}
+
 /// Python's `type(v).__name__` for the value `json.loads` builds for `v`.
 pub fn type_name(v: &Value) -> &'static str {
     match v {
@@ -625,6 +634,13 @@ mod tests {
         assert_eq!(repr(&v[5]), "-inf");
         assert_eq!(type_name(&v[0]), "int");
         assert_eq!(type_name(&v[4]), "float");
+        // Only a float literal can be non-finite; an int of any size never is.
+        let num = |i: usize| v[i].as_number().unwrap();
+        assert_eq!(non_finite(num(3)), Some(f64::INFINITY));
+        assert_eq!(non_finite(num(5)), Some(f64::NEG_INFINITY));
+        for i in [0, 1, 2, 4, 6, 7, 8, 9, 10] {
+            assert_eq!(non_finite(num(i)), None, "{}", v[i]);
+        }
         // Python `==` on the same values: `-0 == 0.0`, `1E5 == 100000`, and a big int equals
         // the float with the same value but not its neighbour.
         assert!(py_eq(&v[1], &json!(0.0)));

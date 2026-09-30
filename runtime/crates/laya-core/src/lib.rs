@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod decode;
 pub mod error;
 pub mod pyjson;
 pub mod question;
