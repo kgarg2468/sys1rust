@@ -144,8 +144,10 @@ pub fn nesting_depth(raw: &[u8]) -> usize {
 /// byte order mark. A `serde_json::Value` cannot hold a NaN or an unpaired surrogate, so
 /// matching those would take a different value type through laya-core. sys1d answers all of
 /// them with the 400 it gives malformed JSON, where upstream may serve them. Standard
-/// encoders do not produce them: `JSON.stringify` writes `null` for NaN, and `requests` and
-/// `httpx` refuse to send one.
+/// encoders do not write the three tokens: `JSON.stringify` writes `null` for NaN and the
+/// infinities, and `requests` and `httpx` refuse to send them. An unpaired surrogate is
+/// different: `JSON.stringify` escapes one as `\ud800`, so a JavaScript client whose string
+/// holds one gets this 400 anywhere in the body, even in a field upstream ignores.
 fn parse_json(raw: &[u8]) -> serde_json::Result<Value> {
     let mut de = serde_json::Deserializer::from_slice(raw);
     de.disable_recursion_limit();
