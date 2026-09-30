@@ -411,14 +411,15 @@ async fn request_limits_are_413() {
         (r.status, r.detail()),
         (413, "state too large (50001 > 50000 chars)".to_string())
     );
-    // A non-string state is measured on its compact JSON text.
-    let arr: Vec<Value> = (0..30000).map(|_| json!(1)).collect(); // "[1,1,...,1]" = 60,001 chars
+    // A non-string state is measured as upstream's `len(str(state))`, the Python repr with
+    // its ", " separators: `[1, 1, ..., 1]` over 30,000 items is 90,000 chars.
+    let arr: Vec<Value> = (0..30000).map(|_| json!(1)).collect();
     let r = srv
         .post_json(&json!({"state": arr, "questions": {"q": choice(2)}}))
         .await;
     assert_eq!(
         (r.status, r.detail()),
-        (413, "state too large (60001 > 50000 chars)".to_string())
+        (413, "state too large (90000 > 50000 chars)".to_string())
     );
     srv.stop().await;
 }
