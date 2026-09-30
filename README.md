@@ -1,6 +1,6 @@
 # sys1rust
 
-Run Laya System 1 decision models locally on Apple silicon. sys1rust is a Rust runtime on Apple's MLX with no Python at run time. Its server, `sys1d`, speaks the same `/v1/systemone` API as upstream `laya serve`, so Jev and Laya clients can point at it without changes.
+Run Laya System 1 decision models locally on Apple silicon. sys1rust is a Rust runtime on Apple's MLX with no Python at run time. Its server, `sys1d`, speaks the same `/v1/systemone` API as upstream `laya serve`, so Jev and Laya clients can point at it without changes. Unlike `laya serve`, which listens on 0.0.0.0, `sys1d` listens on 127.0.0.1 by default. Clients on other machines need the `--host` setting in [Run](#run).
 
 ## Status
 
@@ -67,6 +67,13 @@ The reply (usage and routing fields cut):
 ```
 
 Flags take the same environment variables as `laya serve`: `LAYA_HOST`, `LAYA_PORT`, `LAYA_API_KEY` and `LAYA_MAX_CONCURRENT`. `--model` (`SYS1_MODEL`) picks the checkpoint. `sys1d --help` lists the rest.
+
+`sys1d` listens on 127.0.0.1 by default, so only programs on the same Mac can reach it. To serve clients on other machines, listen on all interfaces with `--host 0.0.0.0` or `LAYA_HOST=0.0.0.0`. The server then accepts connections from anyone who can reach this Mac on the network, so set an API key too. With `LAYA_API_KEY` set, `/v1/systemone` answers only requests that send `Authorization: Bearer <key>`.
+
+```sh
+export LAYA_API_KEY=replace-with-a-secret
+runtime/target/release/sys1d --model typed-decisions --host 0.0.0.0 --port 8000
+```
 
 ## Build and run inside the benchmark setup
 
