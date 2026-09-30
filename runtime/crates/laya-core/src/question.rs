@@ -386,6 +386,46 @@ mod tests {
         );
     }
 
+    /// Two integer labels beyond `u64::MAX` that differ in the last digit are two Python dict
+    /// keys, so they are accepted, and each renders with its exact digits: as option text
+    /// (`str(label)`), as the raw label and as the `probabilities` key. Both would round to
+    /// one f64; `arbitrary_precision` keeps the literals apart.
+    #[test]
+    fn adjacent_big_integer_labels_are_distinct() {
+        let qs = parse_questions(
+            &serde_json::from_str(
+                r#"{"q": {"type": "choice", "instructions": "x",
+                         "criteria": [18446744073709551616, 18446744073709551617]}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            qs[0].options,
+            ["18446744073709551616", "18446744073709551617"]
+        );
+        let printed: Vec<String> = qs[0]
+            .choice_labels
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap())
+            .collect();
+        assert_eq!(printed, ["18446744073709551616", "18446744073709551617"]);
+        let keys: Vec<String> = qs[0].choice_labels.iter().map(pyjson::dumps_key).collect();
+        assert_eq!(keys, ["18446744073709551616", "18446744073709551617"]);
+        // The same digits twice is still a repeat.
+        assert_eq!(
+            err(
+                "q",
+                serde_json::from_str(
+                    r#"{"type": "choice", "instructions": "x",
+                        "criteria": [18446744073709551617, "b", 18446744073709551617]}"#
+                )
+                .unwrap()
+            ),
+            "question 'q': choice label 2 (18446744073709551617) repeats label 0; the labels are the answer keys, so every option needs its own (1, 1.0 and True are one key)"
+        );
+    }
+
     fn err(qid: &str, qdef: Value) -> String {
         parse_questions(&json!({ qid: qdef }))
             .unwrap_err()
