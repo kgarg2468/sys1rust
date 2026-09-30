@@ -23,7 +23,9 @@ export PATH=$BENCH_ROOT/bin:$CARGO_HOME/bin:$HOME/.cargo/bin:$PATH
 export SWIFTPM_FLAGS="--cache-path $BENCH_ROOT/.cache/swiftpm --config-path $BENCH_ROOT/.cache/swiftpm-config --security-path $BENCH_ROOT/.cache/swiftpm-security"
 # xcodebuild: always pass -derivedDataPath $XCODE_DERIVED
 export XCODE_DERIVED=$BENCH_ROOT/.cache/DerivedData
-export CARGO_TARGET_DIR=$BENCH_ROOT/.cache/cargo-target
+# Keep a target dir set by the caller, so a stage script can point the adapters at another build.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/.cache/cargo-target}"
+mkdir -p "$BENCH_ROOT/tmp"
 export TMPDIR=$BENCH_ROOT/tmp
 export MLX_RS_METAL_PATH=$BENCH_ROOT/.cache/mlx-metal
 # Prebuilt MLX from the mlx Python wheel (same MLX 0.32.2 as the laya-mlx control); see runtime/vendor/mlx-sys.
