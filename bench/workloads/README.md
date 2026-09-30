@@ -4,11 +4,12 @@
 (deterministic, seed 20260928). No script builds `cold.jsonl` or `long.jsonl`; see "Cold and long
 workloads" below.
 
-The builders need Python with `transformers`, `pandas` and `huggingface_hub`. `build_short.py` also
-imports upstream `laya` 0.3.21. The spike ran them in the venv of a `laya-upstream` contender that is
-not in this repository. They download the pinned datasets themselves, but they load the tokenizers
-and `rl_agent_config.json` of the pinned checkpoints from `$HF_HOME/hub` and fail if those
-snapshots are missing. Rebuild with:
+The builders need Python with `transformers`, `pandas` and `huggingface_hub`. `build_workloads.py`
+also needs `pyarrow`, because it reads the typed-decisions dataset with `pd.read_parquet`.
+`build_short.py` also imports upstream `laya` 0.3.21. The spike ran them in the venv of a
+`laya-upstream` contender that is not in this repository. They download the pinned datasets
+themselves, but they load the tokenizers and `rl_agent_config.json` of the pinned checkpoints from
+`$HF_HOME/hub` and fail if those snapshots are missing. Rebuild with:
 
 ```
 source bench/env.sh

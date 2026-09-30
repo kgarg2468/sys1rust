@@ -1,6 +1,6 @@
 """Build bench/workloads/{smoke,correctness,timing}.jsonl.
 
-Run with the upstream venv (needs transformers + pandas):
+Run with the upstream venv (needs transformers, pandas, pyarrow and huggingface_hub):
     source bench/env.sh
     bench/contenders/laya-upstream/.venv/bin/python bench/workloads/build_workloads.py
 
