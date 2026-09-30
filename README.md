@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms on a base M5's GPU, with no Python." width="880">
+  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms of server time on a base M5's GPU, with no Python." width="880">
 </p>
 
 ## Build
@@ -65,6 +65,8 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 }'
 ```
 
+On the base M5 the server spent 16.4 to 18.4 ms on this request over 6 runs. That is the `X-Inference-Time-Ms` header, which `curl -si` shows.
+
 Each question gets one of three answer types:
 
 | type | you give | you get back |
@@ -76,17 +78,17 @@ Each question gets one of three answer types:
 Every answer also has two confidence numbers, which measure different things:
 
 - `answer_confidence` is the probability of the answer given. It is the one to use for deciding whether to trust an answer.
-- `confidence` is 1 minus the normalized entropy of the probabilities. It is 0 for an even split and 1 when everything is on one option. On `noul` it equals `answer_confidence`.
+- For `choice` and `score`, `confidence` is 1 minus the normalized entropy of the probabilities. It is 0 for an even split and 1 when everything is on one option. For `noul`, it equals `answer_confidence`: the larger of the yes and no probabilities, which is 0.5 for an even split.
 
 Don't compare the two against the same threshold. `action.act_probability` comes from a second output of the model: its probability for acting on the answer rather than escalating. Ctrl-C stops the server, and when it stops, the model is out of memory.
 
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/how-it-works.svg" alt="Your app sends POST /v1/systemone to sys1d, one process on 127.0.0.1:8000 with no Python. sys1d checks the request, takes one of 16 slots, encodes the state with one row per question, runs the model on the GPU through MLX one request at a time, and decodes the probabilities into answers, which go back to your app. The model weights come from the local Hugging Face cache and are read once at start." width="880">
+  <img src="docs/assets/how-it-works.svg" alt="Your app sends POST /v1/systemone to sys1d, one process on 127.0.0.1:8000 with no Python. sys1d checks the API key, takes one of 16 slots, checks the body, encodes the state with one row per question, runs the model on the GPU through MLX one request at a time, and decodes the probabilities into answers, which go back to your app. The model weights come from the local Hugging Face cache and are read once at start." width="880">
 </p>
 
-- **It checks requests the way `laya serve` does**, with the same limits, error codes and `detail` strings.
+- **It checks requests the way `laya serve` does**, with the same limits, error codes and `detail` strings. It checks the API key first, then takes a slot, then reads and checks the body.
 - **The GPU runs one request at a time.** `sys1d` holds up to 16 requests (`LAYA_MAX_CONCURRENT`), one running and the rest waiting their turn. A request that arrives while all 16 slots are held gets `503` with `Retry-After: 1` at once, so clients must retry it. More clients don't get more throughput, since one request already fills the GPU.
 - **All the questions in a request go through the model together**, one row per question, in fp16.
 - **It beats Python MLX by doing less work, not by being Rust.** It skips computing on padding, runs the decision head's last layer only at the positions the answer reads, and uses dense attention where that is cheaper. The answers don't change.
