@@ -24,7 +24,10 @@ export SWIFTPM_FLAGS="--cache-path $BENCH_ROOT/.cache/swiftpm --config-path $BEN
 # xcodebuild: always pass -derivedDataPath $XCODE_DERIVED
 export XCODE_DERIVED=$BENCH_ROOT/.cache/DerivedData
 # Keep a target dir set by the caller, so a stage script can point the adapters at another build.
+# Resolve a relative value against the current directory at source time, so the adapters
+# find the same binaries from any working directory.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$BENCH_ROOT/.cache/cargo-target}"
+case "$CARGO_TARGET_DIR" in /*) ;; *) CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR" ;; esac
 mkdir -p "$BENCH_ROOT/tmp"
 export TMPDIR=$BENCH_ROOT/tmp
 export MLX_RS_METAL_PATH=$BENCH_ROOT/.cache/mlx-metal

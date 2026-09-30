@@ -21,7 +21,7 @@ T_PROCESS_START = time.time()
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.dirname(os.path.dirname(HERE))
 LOCK = json.load(open(os.path.join(BENCH, "models.lock.json")))
-TARGET = os.environ["CARGO_TARGET_DIR"] + "/release"
+TARGET = os.path.join(os.path.abspath(os.environ["CARGO_TARGET_DIR"]), "release")
 MODELS = ["typed-decisions", "multilingual"]
 
 VARIANTS = [
