@@ -139,7 +139,7 @@ impl EncoderConfig {
                 .collect(),
             _ => (0..num_hidden_layers).map(|i| i % every != 0).collect(),
         };
-        Ok(Self {
+        let cfg = Self {
             vocab_size: get_u("vocab_size")?,
             hidden_size: get_u("hidden_size")?,
             num_hidden_layers,
@@ -153,11 +153,51 @@ impl EncoderConfig {
             pad_token_id: v.get("pad_token_id").and_then(Value::as_u64).unwrap_or(0) as u32,
             max_position_embeddings: get_u("max_position_embeddings").unwrap_or(8192),
             layer_is_local,
-        })
+        };
+        cfg.check_shapes()?;
+        Ok(cfg)
+    }
+
+    /// The shapes a backend divides by or reshapes with, checked here so a broken checkpoint
+    /// is a config error naming the field rather than a panic when the backend is built.
+    /// transformers asserts the same divisibility in `ModernBertAttention`, and torch's
+    /// `MultiheadAttention` in the decision head.
+    fn check_shapes(&self) -> Result<()> {
+        let bad = |msg: String| Err(Error::Config(format!("encoder config: {msg}")));
+        if self.num_attention_heads == 0 {
+            return bad("num_attention_heads must be at least 1".into());
+        }
+        if self.hidden_size == 0 {
+            return bad("hidden_size must be at least 1".into());
+        }
+        if self.hidden_size % self.num_attention_heads != 0 {
+            return bad(format!(
+                "hidden_size {} is not a multiple of num_attention_heads {}",
+                self.hidden_size, self.num_attention_heads
+            ));
+        }
+        if self.hidden_size % self.head_nheads() != 0 {
+            return bad(format!(
+                "hidden_size {} is not a multiple of the {} decision-head attention heads (max(1, hidden_size // 64))",
+                self.hidden_size,
+                self.head_nheads()
+            ));
+        }
+        // A query attends keys within `local_attention / 2`; the chunked attention path
+        // divides the sequence by that window, so it must be at least one token.
+        if self.local_attention < 2 {
+            return bad("local_attention must be at least 2".into());
+        }
+        Ok(())
     }
 
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// Heads of the decision-head transformer layers: `max(1, d // 64)`.
+    pub fn head_nheads(&self) -> usize {
+        (self.hidden_size / 64).max(1)
     }
 }
 
@@ -180,7 +220,7 @@ impl ModelConfig {
     }
     /// Heads of the decision-head transformer layers: `max(1, d // 64)`.
     pub fn head_nheads(&self) -> usize {
-        (self.encoder.hidden_size / 64).max(1)
+        self.encoder.head_nheads()
     }
     pub fn head_ffn(&self) -> usize {
         4 * self.encoder.hidden_size
@@ -278,6 +318,47 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(cfg.layer_is_local, [true, false, true, true, false, true]);
+    }
+
+    /// The shapes a backend divides by or reshapes with are checked at load, so a broken
+    /// checkpoint is a config error with the field's name instead of a panic in the first
+    /// forward (`head_dim` divides by the head count, the head split needs an even division,
+    /// the windowed attention chunks the sequence by `local_attention / 2`).
+    #[test]
+    fn shapes_a_backend_divides_by_are_checked() {
+        let err = |extra: Value| {
+            EncoderConfig::from_value(&minimal(extra))
+                .unwrap_err()
+                .to_string()
+        };
+        let e = err(json!({"num_attention_heads": 0}));
+        assert!(e.contains("num_attention_heads must be at least 1"), "{e}");
+        let e = err(json!({"hidden_size": 0}));
+        assert!(e.contains("hidden_size must be at least 1"), "{e}");
+        let e = err(json!({"hidden_size": 65}));
+        assert!(
+            e.contains("hidden_size 65 is not a multiple of num_attention_heads 2"),
+            "{e}"
+        );
+        // 200 splits into 2 encoder heads of 100, but the decision head has 200 // 64 = 3
+        // heads and 3 does not divide 200.
+        let e = err(json!({"hidden_size": 200, "num_attention_heads": 2}));
+        assert!(
+            e.contains("hidden_size 200 is not a multiple of the 3 decision-head attention heads"),
+            "{e}"
+        );
+        for w in [0, 1] {
+            let e = err(json!({"local_attention": w}));
+            assert!(e.contains("local_attention must be at least 2"), "{e}");
+        }
+        // The published shapes and a small even one pass.
+        for (hidden, heads) in [(1024, 16), (768, 12), (192, 3), (64, 2), (32, 1)] {
+            let cfg = EncoderConfig::from_value(&minimal(
+                json!({"hidden_size": hidden, "num_attention_heads": heads}),
+            ))
+            .unwrap();
+            assert_eq!(cfg.head_dim(), hidden / heads);
+        }
     }
 
     #[test]
