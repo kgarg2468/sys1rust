@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 304" width="880" height="304" role="img" aria-labelledby="t d">
+  <title id="t">Time per request on a base M5</title>
+  <desc id="d">Median time per request for the typed-decisions model, lower is better. One question over a 128-token state: sys1rust 17.6 ms, Python laya-mlx 18.9 ms, stock laya serve 53.9 ms. One question over 512 tokens: 45.6, 49.4 and 157.6 ms. Ten questions over 512 tokens: 422, 453 and 708 ms. laya serve is timed over HTTP; sys1rust and laya-mlx in-process, where sys1d's HTTP adds 0.3 ms.</desc>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .h     { font-size: 15px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 13px; fill: #59636E; }
+    .cond  { font-size: 12px; font-weight: 600; letter-spacing: 0.02em; fill: #59636E; }
+    .row   { font-size: 13px; fill: #59636E; }
+    .rowb  { font-size: 13px; font-weight: 600; fill: #1F2328; }
+    .val   { font-size: 12.5px; fill: #59636E; font-variant-numeric: tabular-nums; }
+    .valb  { font-size: 12.5px; font-weight: 600; fill: #1F2328; font-variant-numeric: tabular-nums; }
+    .tick  { font-size: 11px; fill: #6E7781; font-variant-numeric: tabular-nums; }
+    .grid  { stroke: #EAEEF2; stroke-width: 1; }
+    .base  { stroke: #D0D7DE; stroke-width: 1; }
+    .us    { fill: #BF6A2B; }
+    .them  { fill: #8C959F; }
+    .foot  { font-size: 12px; fill: #6E7781; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .h, .rowb, .valb { fill: #E6EDF3; }
+      .s, .cond, .row, .val { fill: #9198A1; }
+      .tick, .foot { fill: #7D8590; }
+      .grid  { stroke: #21262D; }
+      .base  { stroke: #3D444D; }
+      .us    { fill: #D57A3C; }
+      .them  { fill: #6E7681; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="303" rx="12"/>
+  <text class="h" x="24" y="36">Time per request, median, on a base M5</text>
+  <text class="s" x="24" y="57">Shorter is faster. typed-decisions model. Each panel has its own scale.</text>
+
+  <!-- row labels -->
+  <text class="rowb" x="24" y="131">sys1rust</text>
+  <text class="row" x="24" y="167">laya-mlx (Python MLX)</text>
+  <text class="row" x="24" y="203">laya serve (stock)</text>
+
+  <!-- panel 1: 1 question, 128 tokens. Scale 0-60 ms over 170 px, x0 196 -->
+  <text class="cond" x="196" y="96">1 QUESTION · 128 TOKENS</text>
+  <line class="grid" x1="252.7" y1="108" x2="252.7" y2="216"/>
+  <line class="grid" x1="309.3" y1="108" x2="309.3" y2="216"/>
+  <line class="grid" x1="366" y1="108" x2="366" y2="216"/>
+  <line class="base" x1="196" y1="108" x2="196" y2="216"/>
+  <path class="us" d="M196,116 H241.9 a4,4 0 0 1 4,4 V132 a4,4 0 0 1 -4,4 H196 Z"/>
+  <text class="valb" x="251.9" y="130.5">17.6 ms</text>
+  <path class="them" d="M196,152 H245.6 a4,4 0 0 1 4,4 V168 a4,4 0 0 1 -4,4 H196 Z"/>
+  <text class="val" x="255.6" y="166.5">18.9 ms</text>
+  <path class="them" d="M196,188 H344.7 a4,4 0 0 1 4,4 V204 a4,4 0 0 1 -4,4 H196 Z"/>
+  <text class="val" x="354.7" y="202.5">53.9 ms</text>
+  <text class="tick" x="196" y="232" text-anchor="middle">0</text>
+  <text class="tick" x="252.7" y="232" text-anchor="middle">20</text>
+  <text class="tick" x="309.3" y="232" text-anchor="middle">40</text>
+  <text class="tick" x="366" y="232" text-anchor="middle">60</text>
+
+  <!-- panel 2: 1 question, 512 tokens. Scale 0-180 ms over 170 px, x0 420 -->
+  <text class="cond" x="420" y="96">1 QUESTION · 512 TOKENS</text>
+  <line class="grid" x1="476.7" y1="108" x2="476.7" y2="216"/>
+  <line class="grid" x1="533.3" y1="108" x2="533.3" y2="216"/>
+  <line class="grid" x1="590" y1="108" x2="590" y2="216"/>
+  <line class="base" x1="420" y1="108" x2="420" y2="216"/>
+  <path class="us" d="M420,116 H459.1 a4,4 0 0 1 4,4 V132 a4,4 0 0 1 -4,4 H420 Z"/>
+  <text class="valb" x="469.1" y="130.5">45.6 ms</text>
+  <path class="them" d="M420,152 H462.7 a4,4 0 0 1 4,4 V168 a4,4 0 0 1 -4,4 H420 Z"/>
+  <text class="val" x="472.7" y="166.5">49.4 ms</text>
+  <path class="them" d="M420,188 H564.8 a4,4 0 0 1 4,4 V204 a4,4 0 0 1 -4,4 H420 Z"/>
+  <text class="val" x="574.8" y="202.5">157.6 ms</text>
+  <text class="tick" x="420" y="232" text-anchor="middle">0</text>
+  <text class="tick" x="476.7" y="232" text-anchor="middle">60</text>
+  <text class="tick" x="533.3" y="232" text-anchor="middle">120</text>
+  <text class="tick" x="590" y="232" text-anchor="middle">180</text>
+
+  <!-- panel 3: 10 questions, 512 tokens. Scale 0-750 ms over 170 px, x0 644 -->
+  <text class="cond" x="644" y="96">10 QUESTIONS · 512 TOKENS</text>
+  <line class="grid" x1="700.7" y1="108" x2="700.7" y2="216"/>
+  <line class="grid" x1="757.3" y1="108" x2="757.3" y2="216"/>
+  <line class="grid" x1="814" y1="108" x2="814" y2="216"/>
+  <line class="base" x1="644" y1="108" x2="644" y2="216"/>
+  <path class="us" d="M644,116 H735.7 a4,4 0 0 1 4,4 V132 a4,4 0 0 1 -4,4 H644 Z"/>
+  <text class="valb" x="745.7" y="130.5">422 ms</text>
+  <path class="them" d="M644,152 H742.7 a4,4 0 0 1 4,4 V168 a4,4 0 0 1 -4,4 H644 Z"/>
+  <text class="val" x="752.7" y="166.5">453 ms</text>
+  <path class="them" d="M644,188 H800.5 a4,4 0 0 1 4,4 V204 a4,4 0 0 1 -4,4 H644 Z"/>
+  <text class="val" x="810.5" y="202.5">708 ms</text>
+  <text class="tick" x="644" y="232" text-anchor="middle">0</text>
+  <text class="tick" x="700.7" y="232" text-anchor="middle">250</text>
+  <text class="tick" x="757.3" y="232" text-anchor="middle">500</text>
+  <text class="tick" x="814" y="232" text-anchor="middle">750</text>
+
+  <text class="foot" x="24" y="268">laya serve is timed over HTTP. sys1rust and laya-mlx are timed in-process, and sys1d's HTTP adds 0.3 ms.</text>
+  <text class="foot" x="24" y="286">MacBook Pro 14, base M5, macOS 26.2, on wall power. Sources: results/SPEED.md and results/REPORT.md.</text>
+</svg>
