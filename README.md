@@ -1,89 +1,183 @@
-# sys1rust
+<h1 align="center">sys1rust</h1>
 
-Run Laya System 1 decision models locally on Apple silicon. sys1rust is a Rust runtime on Apple's MLX with no Python at run time. Its server, `sys1d`, speaks the same `/v1/systemone` API as upstream `laya serve`, so Jev and Laya clients can point at it without changes. Unlike `laya serve`, which listens on 0.0.0.0, `sys1d` listens on 127.0.0.1 by default. Clients on other machines should reach it through a reverse proxy, as [Run](#run) describes.
+<p align="center">
+  <strong>Laya's System 1 decisions on your Mac's GPU. No Python. Same API as <code>laya serve</code>.</strong>
+</p>
 
-## Status
+<p align="center">
+  sys1rust runs Laya's decision models locally on Apple silicon. Send it some text and a few questions, and it answers each one with a choice, a score or a yes probability, in about 17 ms on a base M5. Its server, <code>sys1d</code>, speaks the same <code>/v1/systemone</code> API as upstream <code>laya serve</code>, so Jev and Laya clients can point at it without changes.
+</p>
 
-Measured on a base M5 MacBook, typed-decisions model (details in `results/`):
+<p align="center">
+  <a href="#speed"><strong>Speed</strong></a> ·
+  <a href="results/README.md"><strong>Results</strong></a> ·
+  <a href="#build"><strong>Build</strong></a>
+</p>
 
-- Answers match upstream Laya. On the 1,500-answer correctness workload, 1,498 agree with the upstream PyTorch fp32 reference (99.9%, above the 99% gate). The two that differ are near ties.
-- It is 1.12x faster than Python laya-mlx at its fastest (compiled fp16, buffer cache capped), and faster on all 12 benchmark shapes. One question over a 128-token state takes 17.6 ms at p50. Ten questions over 512 tokens take 422 ms.
-- The tail stays close to the median. In the timing runs no request took more than twice the median for its shape, where Python MLX without a capped cache had 9% of requests over that line.
-- `sys1d` is a 5 MB binary. HTTP adds 0.3 ms per request at p50. From process start to the first answer takes 243 to 375 ms.
+<p align="center">
+  <img alt="Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-BF6A2B?style=flat-square">
+  <img alt="macOS on Apple silicon" src="https://img.shields.io/badge/macOS-Apple_silicon-2D2A26?style=flat-square">
+  <img alt="MLX 0.32.2" src="https://img.shields.io/badge/MLX-0.32.2-2D2A26?style=flat-square">
+  <img alt="No Python at run time" src="https://img.shields.io/badge/Python_at_run_time-none-BF6A2B?style=flat-square">
+</p>
 
-Limits today:
+<p align="center">
+  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms of server time on a base M5's GPU, with no Python." width="880">
+</p>
 
-- Building needs a prebuilt MLX 0.32.2, which currently comes from the `mlx` Python wheel. The built binary links it by path. A self-contained release is the next step.
-- The runtime finds models in the local Hugging Face cache. It does not download them.
-- A choice answer can differ from upstream's bytes. When two of its labels print as the same JSON key, such as `"1"` and `1`, upstream writes that key twice in `probabilities` and `sys1d` writes it once with the second label's probability. Python's `json`, JavaScript's `JSON.parse` and serde_json's `Value` keep the last duplicate, so a client parsing with one of them gets the same object from both servers. A parser that rejects duplicate keys or keeps the first one reads the two responses differently.
-- `sys1d` accepts standard JSON in UTF-8. Upstream's `json.loads` also accepts `NaN`, `Infinity` and `-Infinity`, `\u` escapes of unpaired surrogates, and bodies in UTF-16 or UTF-32 or with a byte order mark. `sys1d` answers those with 400 `request body must be valid JSON`.
-- The GPU runs one forward pass at a time, so more clients do not get more throughput. `sys1d` holds up to `LAYA_MAX_CONCURRENT` requests at once (16 by default), one running and the rest waiting their turn. A request that arrives while all those slots are held is not queued. It gets `503` with `Retry-After: 1` at once, so clients must retry it.
+## Build
 
-## Supported models
+There is no release yet, so build it from source. You need an Apple silicon Mac, Rust 1.85 or newer, CMake, the Xcode command line tools, and Python 3.10 or newer. Python is only used to fetch MLX and the model. `sys1d` doesn't run it.
 
-| name | Hugging Face repo | encoder | agreement with upstream fp32 answers |
-|---|---|---|---|
+```sh
+# A prebuilt MLX 0.32.2 (the Python wheel ships libmlx and its CMake files),
+# and the Hugging Face CLI (hf) to download models.
+python3 -m venv .mlx && .mlx/bin/pip install mlx==0.32.2 huggingface_hub
+export MLX_SYS_PREBUILT_DIR="$(.mlx/bin/python -c 'import mlx.core, os; print(os.path.dirname(mlx.core.__file__))')"
+
+# The binaries go to runtime/target/release/.
+cargo build --release --manifest-path runtime/Cargo.toml
+```
+
+The binary loads MLX from that venv by its absolute path, so keep `.mlx/` where it is. A self-contained release is the next step.
+
+## Try it
+
+Download the model once, then start the server:
+
+```sh
+.mlx/bin/hf download convaiinnovations/laya-typed-decisions   # sys1d never downloads
+runtime/target/release/sys1d --port 8000
+```
+
+It prints `listening on http://127.0.0.1:8000` when it's ready. In another terminal:
+
+```sh
+curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
+  "state": "Customer: I was charged twice for my subscription this month and I need it fixed today.",
+  "questions": {
+    "team": {"type": "choice", "instructions": "Which team should handle this?",
+             "criteria": {"billing": "payments, charges and refunds", "tech": "bugs and outages", "sales": "new purchases"}},
+    "urgency": {"type": "score", "instructions": "How urgent is this?",
+                "criteria": ["none", "low", "high", "now"]},
+    "money": {"type": "noul", "instructions": "Is money involved?"}
+  }
+}'
+```
+
+On the base M5 the server spent 16.4 to 18.4 ms on this request over 6 runs. That is the `X-Inference-Time-Ms` header, which `curl -si` shows.
+
+Each question gets one of three answer types:
+
+| type | you give | you get back |
+| --- | --- | --- |
+| `choice` | labels, each with a description | `choice`, the most likely label, and `probabilities` for every label |
+| `score` | an ordered list of levels | `score`, the expected level (it can fall between levels), `probabilities` per level, and a `legend` |
+| `noul` | only the instructions | `noul`, the probability that the answer is yes |
+
+Every answer also has two confidence numbers, which measure different things:
+
+- `answer_confidence` is the probability of the answer given. It is the one to use for deciding whether to trust an answer.
+- For `choice` and `score`, `confidence` is 1 minus the normalized entropy of the probabilities. It is 0 for an even split and 1 when everything is on one option. For `noul`, it equals `answer_confidence`: the larger of the yes and no probabilities, which is 0.5 for an even split.
+
+Don't compare the two against the same threshold. `action.act_probability` comes from a second output of the model: its probability for acting on the answer rather than escalating. Ctrl-C stops the server, and when it stops, the model is out of memory.
+
+## How it works
+
+<p align="center">
+  <img src="docs/assets/how-it-works.svg" alt="Your app sends POST /v1/systemone to sys1d, one process on 127.0.0.1:8000 with no Python. sys1d checks the API key, takes one of 16 slots, checks the body, encodes the state with one row per question, runs the model on the GPU through MLX one request at a time, and decodes the probabilities into answers, which go back to your app. The model weights come from the local Hugging Face cache and are read once at start." width="880">
+</p>
+
+- **It checks requests the way `laya serve` does**, with the same limits, error codes and `detail` strings. It checks the API key first, then takes a slot, then reads and checks the body.
+- **The GPU runs one request at a time.** `sys1d` holds up to 16 requests (`LAYA_MAX_CONCURRENT`), one running and the rest waiting their turn. A request that arrives while all 16 slots are held gets `503` with `Retry-After: 1` at once, so clients must retry it. More clients don't get more throughput, since one request already fills the GPU.
+- **All the questions in a request go through the model together**, one row per question, in fp16.
+- **It beats Python MLX by doing less work, not by being Rust.** It skips computing on padding, runs the decision head's last layer only at the positions the answer reads, and uses dense attention where that is cheaper. The answers don't change.
+- **It reads models from the local Hugging Face cache.** `sys1d` never downloads.
+
+## Speed
+
+<p align="center">
+  <img src="docs/assets/speed.svg" alt="Median time per request for the typed-decisions model on a base M5. One question over a 128-token state: sys1rust 17.6 ms, Python laya-mlx 18.9 ms, stock laya serve 53.9 ms. One question over 512 tokens: 45.6, 49.4 and 157.6 ms. Ten questions over 512 tokens: 422, 453 and 708 ms." width="880">
+</p>
+
+| median ms | 1 question, 128 tokens | 1 question, 512 tokens | 10 questions, 512 tokens |
+| --- | --- | --- | --- |
+| sys1rust | 17.6 | 45.6 | 422 |
+| laya-mlx, Python MLX at its fastest (compiled, buffer cache capped) | 18.9 | 49.4 | 453 |
+| `laya serve`, stock, over HTTP | 53.9 | 157.6 | 708 |
+
+- **Against stock `laya serve`**, it is 1.7 to 3.4x faster per request, counting `sys1d`'s 0.3 ms of HTTP. `sys1d` sustained 7.9 requests/s over 5 minutes, and `laya serve` 3.54 over 2 minutes. `laya serve` runs fp32 for requests with fewer than 5 questions, but even upstream in fp16, which it doesn't ship, is 1.7 to 2.6x slower on these three sizes.
+- **Against Python laya-mlx at its fastest**, it is 1.12x faster, and faster on all 12 benchmark sizes, by 4 to 36%.
+- **It gives the same answers.** On the 1,500-answer correctness workload, 1,498 agree with the upstream PyTorch fp32 reference (99.9%, above the 99% gate). The two that differ are near ties.
+- **Its tail stays close to the median.** In the timing runs, no request took more than twice the median for its size. Python MLX without a capped cache had 9% of requests over that line.
+- **It starts fast and is small.** From process start to the first answer takes 243 to 375 ms, with the model files already in the OS file cache. `sys1d` is a 5 MB binary, and its HTTP layer adds 0.3 ms per request.
+
+Everything here was measured on one Mac: a MacBook Pro 14 with a base M5, on macOS 26.2 and wall power. Other chips are untested. The write-ups are in [`results/`](results/README.md). They run from the bake-off of 13 existing runtimes ([`REPORT.md`](results/REPORT.md)) to the speed round ([`SPEED.md`](results/SPEED.md)).
+
+## Models
+
+| `--model` | Hugging Face repo | encoder | agreement with upstream fp32 answers |
+| --- | --- | --- | --- |
 | `typed-decisions` (default) | `convaiinnovations/laya-typed-decisions` | ModernBERT-large | 1,498 of 1,500 on correctness |
 | `multilingual` | `convaiinnovations/laya-multilingual` | mmBERT-base | 100% on correctness, smoke and short |
 | `english` | `convaiinnovations/laya` | ModernBERT-large | 100% on smoke, short and cold; no upstream correctness reference exists |
 
-A local checkpoint directory also works.
+`--model` also takes a local checkpoint directory. Download a hub model with `hf download <repo>` before you serve it.
 
-## Build
+## More
 
-Requirements: an Apple silicon Mac, Rust 1.85 or newer, CMake, Xcode command line tools, and Python 3.10 or newer. Run these from the repository root.
+<details>
+<summary><strong>Options</strong></summary>
 
-```sh
-# 1. A prebuilt MLX 0.32.2 (the Python wheel ships libmlx and its CMake files),
-#    and the Hugging Face CLI (hf) to download models.
-python3 -m venv .mlx && .mlx/bin/pip install mlx==0.32.2 huggingface_hub
-export MLX_SYS_PREBUILT_DIR="$(.mlx/bin/python -c 'import mlx.core, os; print(os.path.dirname(mlx.core.__file__))')"
+Each flag falls back to an environment variable. The `LAYA_*` ones are the same as `laya serve`'s.
 
-# 2. Build. The binaries go to runtime/target/release/.
-cargo build --release --manifest-path runtime/Cargo.toml
-```
+| flag | environment variable | default | |
+| --- | --- | --- | --- |
+| `--model` | `SYS1_MODEL` | `typed-decisions` | a name from [Models](#models), its repo id, or a checkpoint directory |
+| `--revision` | `SYS1_REVISION` | newest cached | serve `snapshots/<sha>` of the cached repo |
+| `--host` | `LAYA_HOST` | `127.0.0.1` | bind address; `laya serve` binds `0.0.0.0` |
+| `--port` | `LAYA_PORT` | `8000` | `0` picks a free port, printed on the ready line |
+| `--api-key` | `LAYA_API_KEY` | none | when set, `/v1/systemone` needs `Authorization: Bearer <key>` |
+| `--max-concurrent` | `LAYA_MAX_CONCURRENT` | `16` | requests held at once; the next one gets `503` |
+| `--tuning` | `SYS1_MLX_TUNING` | the measured default | engine settings, see `Knobs` in `runtime/crates/laya-mlx` |
+| `--f32` | `SYS1_F32` | off | run the transformer in f32 instead of the checkpoint's f16 |
 
-## Run
+When it's ready, `sys1d` prints one JSON line on stdout with the address, model, revision, load time and warm-up time. `GET /health` reports the model, revision and engine. SIGINT or SIGTERM lets requests in flight finish before it exits. `runtime/target/release/sys1d --help` lists everything.
 
-```sh
-.mlx/bin/hf download convaiinnovations/laya-typed-decisions   # once; sys1d never downloads
-runtime/target/release/sys1d --model typed-decisions --port 8000
-```
+</details>
 
-```sh
-curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
-  "state": "{\"subject\": \"Login\", \"body\": \"Tasks vanished after I logged out and back in.\"}",
-  "questions": {"ticket_type": {"type": "choice",
-    "instructions": "What kind of support ticket is this?",
-    "criteria": {"Incident": "something is broken or not working",
-                 "Request": "asks for information or a new service"}}}
-}'
-```
+<details>
+<summary><strong>Serving other machines</strong></summary>
 
-The reply (usage and routing fields cut):
+`sys1d` listens on 127.0.0.1 by default, so only programs on the same Mac can reach it. Keep that default. `sys1d` speaks plain HTTP without TLS, and it has no header read timeout and no connection limit. Only the request body has a deadline, and a body that takes over 10 s gets `408`.
 
-```json
-{"model":"laya-rl-agent","answers":{"ticket_type":{"type":"choice","choice":"Incident",
-  "probabilities":{"Incident":0.8703,"Request":0.1297},"confidence":0.4434,
-  "answer_confidence":0.8703,"action":{"act_probability":1.0}}}, ...}
-```
-
-Flags take the same environment variables as `laya serve`: `LAYA_HOST`, `LAYA_PORT`, `LAYA_API_KEY` and `LAYA_MAX_CONCURRENT`. `--model` (`SYS1_MODEL`) picks the checkpoint. `runtime/target/release/sys1d --help` lists the rest.
-
-`sys1d` listens on 127.0.0.1 by default, so only programs on the same Mac can reach it. Keep that default. `sys1d` speaks plain HTTP without TLS, and it has no header read timeout and no connection limit. Only the request body has a deadline, and a body that takes over 10 s gets `408`. An API key alone does not make remote serving safe. With `LAYA_API_KEY` set, `/v1/systemone` answers only requests that send `Authorization: Bearer <key>`, but over plain HTTP anyone on the network path can read that key. The key is checked only once the headers have arrived, so it does nothing against connections that never finish sending them. Each such connection holds a socket for as long as the client keeps it open, and nothing caps how many there are.
+An API key alone does not make remote serving safe. With `LAYA_API_KEY` set, `/v1/systemone` answers only requests that send `Authorization: Bearer <key>`, but over plain HTTP anyone on the network path can read that key. The key is checked only once the headers have arrived, so it does nothing against connections that never finish sending them. Each such connection holds a socket for as long as the client keeps it open, and nothing caps how many there are.
 
 To serve clients on other machines, run a reverse proxy on the same Mac in front of `sys1d`. The proxy should terminate TLS, time out slow headers, limit connections and forward to 127.0.0.1. Set an API key as well:
 
 ```sh
 export LAYA_API_KEY=replace-with-a-secret
-runtime/target/release/sys1d --model typed-decisions --port 8000   # the proxy forwards to 127.0.0.1:8000
+runtime/target/release/sys1d --port 8000   # the proxy forwards to 127.0.0.1:8000
 ```
 
-`--host` (`LAYA_HOST`) changes the bind address, but any client that can reach a wider address talks to `sys1d` directly, with none of the proxy's protections.
+`--host` changes the bind address, but any client that can reach a wider address talks to `sys1d` directly, with none of the proxy's protections.
 
-## Build and run inside the benchmark setup
+</details>
 
-Use this instead of the steps above when working on the benchmark. `bench/env.sh` takes MLX from the laya-mlx contender's venv but does not create it, so the first step sets that venv up once, as in `bench/contenders/laya-mlx/NOTES.md`. That step needs `uv`. The script also keeps the Cargo output and the Hugging Face cache under `bench/`, so the binary is at `$CARGO_TARGET_DIR/release/sys1d`. The commands download and serve the typed-decisions revision pinned in `bench/models.lock.json`, the one the results used.
+<details>
+<summary><strong>Differences from <code>laya serve</code></strong></summary>
+
+- **Bind address.** `sys1d` listens on 127.0.0.1 by default. `laya serve` listens on 0.0.0.0.
+- **Downloads.** `sys1d` only reads the local Hugging Face cache. `laya serve` downloads a missing model.
+- **Duplicate choice keys.** When two of a choice's labels print as the same JSON key, such as `"1"` and `1`, upstream writes that key twice in `probabilities`, and `sys1d` writes it once with the second label's probability. Python's `json`, JavaScript's `JSON.parse` and serde_json's `Value` keep the last duplicate, so a client parsing with one of them gets the same object from both servers. A parser that rejects duplicate keys or keeps the first one reads the two responses differently.
+- **JSON.** `sys1d` accepts standard JSON in UTF-8. Upstream's `json.loads` also accepts `NaN`, `Infinity` and `-Infinity`, `\u` escapes of unpaired surrogates, and bodies in UTF-16 or UTF-32 or with a byte order mark. `sys1d` answers those with 400 `request body must be valid JSON`.
+
+</details>
+
+<details>
+<summary><strong>Build and run inside the benchmark setup</strong></summary>
+
+Use this instead of [Build](#build) when working on the benchmark. `bench/env.sh` takes MLX from the laya-mlx contender's venv but does not create it, so the first step sets that venv up once, as in `bench/contenders/laya-mlx/NOTES.md`. That step needs `uv`. The script also keeps the Cargo output and the Hugging Face cache under `bench/`, so the binary is at `$CARGO_TARGET_DIR/release/sys1d`. The commands download and serve the typed-decisions revision pinned in `bench/models.lock.json`, the one the results used.
 
 ```sh
 source bench/env.sh
@@ -98,7 +192,10 @@ bench/contenders/laya-mlx/.venv/bin/hf download convaiinnovations/laya-typed-dec
 $CARGO_TARGET_DIR/release/sys1d --model typed-decisions --revision $REV --port 8000
 ```
 
-## Layout
+</details>
+
+<details>
+<summary><strong>Repository layout</strong></summary>
 
 - `runtime/`: the Rust workspace.
   - `laya-core`: request parsing, tokenization, sequence layout and answer decoding, with no GPU code.
@@ -109,7 +206,10 @@ $CARGO_TARGET_DIR/release/sys1d --model typed-decisions --revision $REV --port 8
 - `bench/`: the benchmark harness, workloads and upstream reference answers (`bench/PLAN.md`).
 - `results/`: measured write-ups, from the bake-off of existing runtimes to the speed round.
 - `research/`: sourced reports on the models, runtimes and hardware.
+- `docs/assets/`: the diagrams in this README.
+
+</details>
 
 ## License
 
-Apache-2.0. `laya-core` and `laya-mlx` started as a fork of tjameswilliams/laya-r-mlx, and `vendor/mlx-sys` is from oxiglade/mlx-rs. See `NOTICE`.
+Apache-2.0. `laya-core` and `laya-mlx` started as a fork of tjameswilliams/laya-r-mlx, and `vendor/mlx-sys` is from oxiglade/mlx-rs. See [`NOTICE`](NOTICE).

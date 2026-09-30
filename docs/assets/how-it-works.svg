@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 404" width="880" height="404" role="img" aria-labelledby="t d">
+  <title id="t">How sys1d answers a request</title>
+  <desc id="d">Your app, a Jev or Laya client on the same Mac, sends POST /v1/systemone to sys1d, one process on 127.0.0.1:8000 with no Python. sys1d checks the API key if one is set (else 401), takes one of 16 slots (the 17th request gets 503), checks the body's size, JSON and limits (else a 4xx error), encodes the state and one row per question with laya-core, runs the model on the GPU through MLX with laya-mlx, one request at a time, and decodes the probabilities into answers with laya-core. The answers go back to your app. The model weights come from the local Hugging Face cache and are read once at start.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .box   { fill: #F6F8FA; stroke: #8C959F; stroke-width: 1.2; }
+    .tbox  { fill: none; stroke: #BF6A2B; stroke-width: 2; }
+    .h     { font-size: 15px; font-weight: 600; fill: #1F2328; }
+    .hb    { font-size: 14px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 12.5px; fill: #59636E; }
+    .crate { font-size: 11.5px; fill: #59636E; }
+    .acc   { fill: #A0521C; }
+    .line  { stroke: #8C959F; stroke-width: 1.8; fill: none; }
+    .head  { fill: #8C959F; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .box   { fill: #161B22; stroke: #6E7681; }
+      .tbox  { stroke: #E08A4B; }
+      .h, .hb { fill: #E6EDF3; }
+      .s, .crate { fill: #9198A1; }
+      .acc   { fill: #E08A4B; }
+      .line  { stroke: #6E7681; }
+      .head  { fill: #6E7681; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="403" rx="12"/>
+
+  <!-- your app -->
+  <rect class="box" x="24" y="20" width="832" height="56" rx="8"/>
+  <text class="h" x="440" y="44" text-anchor="middle">Your app</text>
+  <text class="s" x="440" y="63" text-anchor="middle">a Jev or Laya client on the same Mac</text>
+
+  <!-- request down, answers up -->
+  <line class="line" x1="90" y1="76" x2="90" y2="196" marker-end="url(#ah)"/>
+  <text class="s mono" x="100" y="118">POST /v1/systemone</text>
+  <line class="line" x1="790" y1="200" x2="790" y2="80" marker-end="url(#ah)"/>
+  <text class="s" x="780" y="118" text-anchor="end">answers, same JSON as laya serve</text>
+
+  <!-- sys1d process -->
+  <rect class="tbox" x="16" y="146" width="848" height="160" rx="10"/>
+  <text x="440" y="178" text-anchor="middle"><tspan class="h mono acc">sys1d</tspan><tspan class="s" dx="10">one process on 127.0.0.1:8000, no Python</tspan></text>
+
+  <!-- 1 -->
+  <rect class="box" x="27" y="200" width="126" height="92" rx="8"/>
+  <text class="crate mono" x="90" y="220" text-anchor="middle">sys1d</text>
+  <text class="hb" x="90" y="243" text-anchor="middle">Check the key</text>
+  <text class="s" x="90" y="262" text-anchor="middle">if one is set,</text>
+  <text class="s" x="90" y="279" text-anchor="middle">else 401</text>
+  <line class="line" x1="153" y1="246" x2="166" y2="246" marker-end="url(#ah)"/>
+
+  <!-- 2 -->
+  <rect class="box" x="167" y="200" width="126" height="92" rx="8"/>
+  <text class="crate mono" x="230" y="220" text-anchor="middle">sys1d</text>
+  <text class="hb" x="230" y="243" text-anchor="middle">Take a slot</text>
+  <text class="s" x="230" y="262" text-anchor="middle">16 held at once,</text>
+  <text class="s" x="230" y="279" text-anchor="middle">the 17th gets 503</text>
+  <line class="line" x1="293" y1="246" x2="306" y2="246" marker-end="url(#ah)"/>
+
+  <!-- 3 -->
+  <rect class="box" x="307" y="200" width="126" height="92" rx="8"/>
+  <text class="crate mono" x="370" y="220" text-anchor="middle">sys1d</text>
+  <text class="hb" x="370" y="243" text-anchor="middle">Check the body</text>
+  <text class="s" x="370" y="262" text-anchor="middle">size, JSON and</text>
+  <text class="s" x="370" y="279" text-anchor="middle">limits, else 4xx</text>
+  <line class="line" x1="433" y1="246" x2="446" y2="246" marker-end="url(#ah)"/>
+
+  <!-- 4 -->
+  <rect class="box" x="447" y="200" width="126" height="92" rx="8"/>
+  <text class="crate mono" x="510" y="220" text-anchor="middle">laya-core</text>
+  <text class="hb" x="510" y="243" text-anchor="middle">Encode</text>
+  <text class="s" x="510" y="262" text-anchor="middle">tokenize, one row</text>
+  <text class="s" x="510" y="279" text-anchor="middle">per question</text>
+  <line class="line" x1="573" y1="246" x2="586" y2="246" marker-end="url(#ah)"/>
+
+  <!-- 5 -->
+  <rect class="box" x="587" y="200" width="126" height="92" rx="8"/>
+  <text class="crate mono" x="650" y="220" text-anchor="middle">laya-mlx</text>
+  <text class="hb" x="650" y="243" text-anchor="middle">Run the model</text>
+  <text class="s" x="650" y="262" text-anchor="middle">on the GPU (MLX),</text>
+  <text class="s" x="650" y="279" text-anchor="middle">one at a time</text>
+  <line class="line" x1="713" y1="246" x2="726" y2="246" marker-end="url(#ah)"/>
+
+  <!-- 6 -->
+  <rect class="box" x="727" y="200" width="126" height="92" rx="8"/>
+  <text class="crate mono" x="790" y="220" text-anchor="middle">laya-core</text>
+  <text class="hb" x="790" y="243" text-anchor="middle">Decode</text>
+  <text class="s" x="790" y="262" text-anchor="middle">probabilities</text>
+  <text class="s" x="790" y="279" text-anchor="middle">into answers</text>
+
+  <!-- model files -->
+  <rect class="box" x="532" y="330" width="236" height="56" rx="8"/>
+  <text class="h" x="650" y="354" text-anchor="middle">Hugging Face cache</text>
+  <text class="s" x="650" y="373" text-anchor="middle">model weights, read once at start</text>
+  <line class="line" x1="650" y1="330" x2="650" y2="296" marker-end="url(#ah)"/>
+</svg>
