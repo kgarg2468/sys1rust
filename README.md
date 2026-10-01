@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  sys1rust runs Laya's decision models locally on Apple silicon. Send it some text and a few questions, and it answers each one with a choice, a score or a yes probability, in about 17 ms on a base M5. Its server, <code>sys1d</code>, speaks the same <code>/v1/systemone</code> API as upstream <code>laya serve</code>, so Jev and Laya clients can point at it without changes.
+  sys1rust runs Laya's decision models locally on Apple silicon. Send it some text and a few questions, and it answers each one with a choice, a score or a yes probability, in about 17 ms of inference on a base M5. Its server, <code>sys1d</code>, speaks the same <code>/v1/systemone</code> API as upstream <code>laya serve</code>, so Jev and Laya clients can point at it without changes.
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms of server time on a base M5's GPU, with no Python." width="880">
+  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms of inference on a base M5's GPU, with no Python." width="880">
 </p>
 
 ## Build
@@ -65,7 +65,7 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 }'
 ```
 
-On the base M5 the server spent 16.4 to 18.4 ms on this request over 6 runs. That is the `X-Inference-Time-Ms` header, which `curl -si` shows.
+On the base M5, inference for this request took 16.4 to 18.4 ms over 6 runs. That is the `X-Inference-Time-Ms` header, which `curl -si` shows. It covers tokenizing, running the model and decoding. It leaves out reading and checking the request, waiting for the GPU and writing the reply.
 
 Each question gets one of three answer types:
 
