@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms of inference on a base M5's GPU, with no Python." width="880">
+  <img src="docs/assets/request-answer.svg" alt="An app sends sys1d a support message and three questions: which team should handle it, how urgent it is, and whether money is involved. sys1d answers billing with probability 0.79, urgency 2.54 on a scale of 0 to 3, and money involved with probability 0.73, in 17 ms of inference on a base M5, with the model on the GPU and no Python." width="880">
 </p>
 
 ## Build
