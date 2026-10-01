@@ -106,7 +106,7 @@ Don't compare the two against the same threshold. `action.act_probability` comes
 | laya-mlx, Python MLX at its fastest (compiled, buffer cache capped) | 18.9 | 46.3 | 422 |
 | `laya serve`, stock, over HTTP | 53.9 | 157.6 | 708 |
 
-- **Against stock `laya serve`**, it is 1.9 to 3.5x faster per request, counting `sys1d`'s 0.3 ms of HTTP. `sys1d` sustained 7.9 requests/s over 5 minutes, and `laya serve` 3.54 over 2 minutes. `laya serve` runs fp32 for requests with fewer than 5 questions, but even upstream in fp16, which it doesn't ship, is 1.9 to 2.7x slower on these three sizes.
+- **Against stock `laya serve`**, it is 1.9 to 3.5x faster per request, counting `sys1d`'s 0.3 ms of HTTP. The `laya serve` times come from the bake-off ([`REPORT.md`](results/REPORT.md)), an earlier session than the round 2 sys1rust times, and separate runs on this laptop vary by about 5%. In earlier runs, `sys1d` sustained 7.9 requests/s over 5 minutes, and `laya serve` 3.54 over 2 minutes. `laya serve` runs fp32 for requests with fewer than 5 questions, but even upstream in fp16, which it doesn't ship, is 1.9 to 2.7x slower on these three sizes, also against times from an earlier session.
 - **Against Python laya-mlx at its fastest**, it is 1.17x faster, and faster on all 12 benchmark sizes, by 5 to 48%.
 - **It gives the same answers.** On the 1,500-answer correctness workload, 1,498 agree with the upstream PyTorch fp32 reference (99.9%, above the 99% gate). The two that differ are near ties.
 - **Its tail stays close to the median.** In the timing runs, no request took more than twice the median for its size. Python MLX without a capped cache had 9% of requests over that line.

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 304" width="880" height="304" role="img" aria-labelledby="t d">
   <title id="t">Time per request on a base M5</title>
-  <desc id="d">Median time per request for the typed-decisions model, lower is better. One question over a 128-token state: sys1rust 16.6 ms, Python laya-mlx 18.9 ms, stock laya serve 53.9 ms. One question over 512 tokens: 44.1, 46.3 and 157.6 ms. Ten questions over 512 tokens: 380, 422 and 708 ms. laya serve is timed over HTTP; sys1rust and laya-mlx in-process, where sys1d's HTTP adds 0.3 ms.</desc>
+  <desc id="d">Median time per request for the typed-decisions model, lower is better. One question over a 128-token state: sys1rust 16.6 ms, Python laya-mlx 18.9 ms, stock laya serve 53.9 ms. One question over 512 tokens: 44.1, 46.3 and 157.6 ms. Ten questions over 512 tokens: 380, 422 and 708 ms. laya serve is timed over HTTP; sys1rust and laya-mlx in-process, where sys1d's HTTP adds 0.3 ms. sys1rust and laya-mlx were measured in one session; laya serve in an earlier one.</desc>
   <style>
     text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .panel { fill: #FFFFFF; stroke: #D0D7DE; }
@@ -91,5 +91,5 @@
   <text class="tick" x="814" y="232" text-anchor="middle">750</text>
 
   <text class="foot" x="24" y="268">laya serve is timed over HTTP. sys1rust and laya-mlx are timed in-process, and sys1d's HTTP adds 0.3 ms.</text>
-  <text class="foot" x="24" y="286">MacBook Pro 14, base M5, macOS 26.2, on wall power. Sources: results/SPEED.md and results/REPORT.md.</text>
+  <text class="foot" x="24" y="286">Base M5, macOS 26.2, wall power. sys1rust and laya-mlx: SPEED.md round 2, one session. laya serve: REPORT.md, an earlier session.</text>
 </svg>
