@@ -510,8 +510,6 @@ struct EncoderLayer {
     wi: Linear,
     wo2: Linear,
     rope_theta: f32,
-    /// `[log2(rope_theta)]` f32, the `fuserope` kernel's `lbase` input.
-    rope_lbase: Array,
     local: bool,
 }
 
@@ -817,7 +815,6 @@ impl MlxBackend {
                     } else {
                         enc.global_rope_theta
                     } as f32,
-                    rope_lbase: split_rope::log2_base(if local { enc.local_rope_theta } else { enc.global_rope_theta } as f32),
                     local,
                 });
             }
@@ -872,7 +869,13 @@ impl MlxBackend {
                     eprintln!("laya-mlx: fuserope needs the GPU; the CPU backend runs the MLX split and rope ops instead");
                     None
                 }
-                (true, false) => match SplitRope::new(enc.num_attention_heads, enc.head_dim(), dtype, enc.global_rope_theta as f32) {
+                (true, false) => match SplitRope::new(
+                    enc.num_attention_heads,
+                    enc.head_dim(),
+                    dtype,
+                    enc.global_rope_theta as f32,
+                    enc.local_rope_theta as f32,
+                ) {
                     Ok(k) => Some(k),
                     Err(e) => {
                         eprintln!("laya-mlx: fuserope is off for this load, the MLX split and rope ops run instead: {e}");
@@ -962,7 +965,6 @@ impl MlxBackend {
             push_norm(&mut v, &l.mlp_norm);
             push_lin(&mut v, &l.wi);
             push_lin(&mut v, &l.wo2);
-            v.push(&l.rope_lbase);
         }
         for h in &self.head {
             push_norm(&mut v, &h.norm1);
@@ -1288,9 +1290,9 @@ impl MlxBackend {
             Ok(())
         };
         mark("emb+masks", &[&h])?;
-        // `[n, len]` for the `fuserope` kernel: the batch shape goes in as data, so one kernel
-        // instantiation serves every shape.
-        let dims = Array::from_slice(&[n, len], &[2]);
+        // The `fuserope` kernel with `[n, len]` as its `dims` input: the batch shape goes in
+        // as data, so one pipeline serves every shape. Nothing is built when the kernel is off.
+        let fused = self.split_rope.as_ref().map(|kernel| (kernel, Array::from_slice(&[n, len], &[2])));
         for layer in &self.layers {
             let t = std::time::Instant::now();
             let a = match &layer.attn_norm {
@@ -1299,11 +1301,11 @@ impl MlxBackend {
             };
             mark("attn_norm", &[&a])?;
             let qkv = layer.wqkv.apply(&a)?;
-            let (q, k, v) = match &self.split_rope {
+            let (q, k, v) = match &fused {
                 // The kernel reads the packed rows through the unpack index itself.
-                Some(kernel) => {
+                Some((kernel, dims)) => {
                     mark("wqkv", &[&qkv])?;
-                    kernel.apply(&qkv, packing.as_ref().map(|p| &p.unpack), &dims, &layer.rope_lbase, n, len)?
+                    kernel.apply(&qkv, packing.as_ref().map(|p| &p.unpack), dims, layer.local, n, len)?
                 }
                 None => {
                     // Packed: back to `[n, len, 3d]` for attention.
