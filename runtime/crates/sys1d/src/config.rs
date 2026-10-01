@@ -14,7 +14,10 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 16;
 /// `results/SPEED.md`: dense local attention up to 1,024 tokens, the last head layer only at
 /// the rows the scorer reads, and no computing on padding; together 0.90 of the time of the
 /// SPIKE settings, with the same answers (probabilities within 0.0005 on all three models).
-pub const DEFAULT_TUNING: &str = "f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad";
+/// Round 2 of `SPEED.md`: `fuserope`, the encoder's split, RoPE and unpad expand as one Metal
+/// kernel, bit-identical to the MLX ops; if the kernel cannot be built on a machine, laya-mlx
+/// says so once on stderr at load and runs the MLX ops.
+pub const DEFAULT_TUNING: &str = "f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad,fuserope";
 
 /// Checkpoint names and their Hugging Face repos, in upstream's naming.
 pub const CHECKPOINTS: [(&str, &str); 3] = [

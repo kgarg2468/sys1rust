@@ -6,7 +6,7 @@
     },
     {
       "path": "results/SPEED.md",
-      "description": "Measured effect and cost of the laya-mlx speed settings (dense_upto, headprune, unpad) and the review that made them default",
+      "description": "Measured effect and cost of the laya-mlx speed settings (dense_upto, headprune, unpad, and in round 2 the fuserope Metal kernel) and the reviews that made them default",
       "scope": ["runtime/crates/laya-mlx/**", "runtime/crates/sys1-bench/**"]
     },
     {

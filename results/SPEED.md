@@ -12,6 +12,7 @@
   - no computing on padding
 - MLX's matmuls already run at 13 to 14 TFLOP/s on most of the model's shapes, about the published fp16 peak of this chip. Kernel settings, split-K and RoPE layout changes gained nothing.
 - The one route to a much larger gain is int8 matmuls, which run about 2x fp16 on the M5 GPU. A simulation shows int8 on the MLP matmuls alone passes the 99% agreement gate, but narrowly (99.3%). It needs custom Metal kernels, because MLX has no int8 matmul.
+- Round 2 (2026-09-30, below): one custom Metal kernel for the encoder's qkv split, RoPE and unpad expand. Bit-identical answers, 0.962 of the stage G default's time in a paired run, and 1.17x over Python laya-mlx in the two-round harness. It is the `sys1d` default. Int8 was measured with a real kernel and is not shipped: it fails the agreement gate on multilingual.
 
 ## Conditions
 
@@ -108,7 +109,7 @@ A second agent reviewed the code (commit 0495800) line by line before the settin
   - a request with no padding;
   - the smoke workload.
   All pass. The largest probability change is 0.0005 (multilingual, head pruning), with no answer changed.
-- **Default.** `sys1d` now runs `f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad`. `sys1-bench` has a new variant, `mlx-fp16-lean`, with the same settings; `mlx-fp16-fast` keeps its old meaning. The `http-fp16-fast` bench variant uses the server default, so it now runs the new settings.
+- **Default.** `sys1d` now runs `f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad` (round 2 adds `fuserope`, below). `sys1-bench` has a new variant, `mlx-fp16-lean`, with the same settings; `mlx-fp16-fast` keeps its old meaning. The `http-fp16-fast` bench variant uses the server default, so it now runs the new settings.
 
 All three published Laya models now run in the Rust runtime. Before this round only typed-decisions had been tried. Stage G, on the reviewed build, battery power:
 
@@ -122,6 +123,40 @@ All three published Laya models now run in the Rust runtime. Before this round o
 - In the paired runs, `--check` counted 3 score mismatches on multilingual. It counts any change in a score's value, and these differ by at most 0.0002. The harness rounds scores before comparing, and there multilingual agrees 100%.
 - On multilingual, one question at 128 tokens takes 7.7 ms.
 
+## Round 2: the split, RoPE and unpad expand as one Metal kernel (2026-09-30)
+
+Round 1 left RoPE and its copies at 6% of the forward. In every encoder layer MLX ran `split_equal`, three reshape copies into `[n, H, len, hd]`, two `fast::rope` launches and, with `unpad`, the gather that expands the packed rows. A research round timed custom Metal kernels through the C API behind `mx.fast.metal_kernel` (mlx-rs 0.32 has no binding for it; `metal_kernels.rs` is a small wrapper over the vendored mlx-sys). One kernel ships, as the setting `fuserope`.
+
+- **What it does.** One launch per layer reads the qkv rows and writes roped q, roped k and v in `[n, H, len, hd]`. With `unpad` it reads each padded position's row through the packing's index, so the expand costs nothing extra. It keeps MLX's rope arithmetic (exp2 of the log2 base, computed on the host as f32, `fast::cos` and `fast::sin` in float), so its output equals `fast::rope`'s bit for bit. One thread handles 4 pairs with 4-wide loads and stores, so the head dim must be a multiple of 8; all three models have 64.
+- **Gain.** Paired A/B (`sys1-probe --ab`) against the stage G default on typed-decisions, 12 timing shapes, 5 pairs each after 2 warmups, AC power: geo-mean 0.962, range 0.928 to 1.005. Single questions gain nothing (0.994 to 1.005); 4 and 10 questions gain 4 to 7%. Paired runs on multilingual and english with 1 warmup and 2 pairs per shape: 0.948 and 0.964.
+- **Answers.** On all three models, `fuserope` alone is byte-identical to the plain path on every state of the equivalence suite (`tests/settings.rs`). `sys1-probe --check` of the stage G default against the new one on typed-decisions, multilingual and english: largest probability difference 0.000000, 0 of 60 answers changed, on each. The correctness run with the new default agrees with the reference on 1,498 of 1,500 answers (99.9%), gold accuracy 75.8%, as before.
+- **macOS 14 and 15.** MLX compiles the kernel from source on the user's machine. The same `sys1d` binary with `DYLD_LIBRARY_PATH` set to the macOS 14, 15 and 26 builds of MLX 0.32.2 compiled the kernel and passed its load check on each, and the new default gave the same answers as the old one on each build (0 choice flips, largest probability difference 0.0000 over the 240 timing requests). The 14 and 15 builds differ from 26 by 0.0056 with either default, as measured before this round: they have no kernels for this chip's matmul hardware and run about 3x slower. On the 26 build the sum of per-shape p50 went from 1,315 to 1,218 ms (0.93); on 14 and 15 from 4,030 to 3,962 ms (0.98), since the kernel's share is smaller where the matmuls are 3x slower.
+- **Fallback.** The decision is made at load, never in a request. laya-mlx builds the kernel and runs it once on a small packed and an unpacked batch against the MLX ops. If the kernel does not compile, does not match, the backend is CPU, or the head dim is not a multiple of 8, it prints one line to stderr and the forward runs the MLX ops.
+- **Tried and ruled out.**
+  - A merge-side kernel (attention output back to the packed `[T, d]` rows for the output projection, with the pack gather fused): 1.02 to 1.05x slower. MLX's attention already writes its output in `[n, len, H, hd]` memory order, so the transpose it was meant to replace is a free view.
+  - 1 pair per thread instead of 4: no measured difference. The 4-wide variant ships.
+  - Int8 matmuls, measured with a real kernel on the MLP input projection (int8 weights and activations): 1.39x over Python on typed-decisions, but agreement with the reference fell to 99.6% there and to 95.1% on multilingual, under the 99% gate. Not shipped. The answers-unchanged rule holds for every model, and the simulation of round 1 (99.3% on typed-decisions) did not predict the multilingual result.
+
+Stage E style, two rounds in opposite order, p50 ms. "Old default" is the stage G default, "round 2 default" adds `fuserope`.
+
+| shape | Python laya-mlx compiled, cache capped | Rust old default | Rust round 2 default | Python / Rust round 2 |
+|---|---|---|---|---|
+| 1q, 64-token state | 22.1 | 18.5 | 18.4 | 1.20 |
+| 4q, 64 | 59.6 | 48.7 | 46.1 | 1.29 |
+| 10q, 64 | 138.4 | 101.1 | 93.4 | 1.48 |
+| 1q, 128 | 18.9 | 16.7 | 16.6 | 1.14 |
+| 4q, 128 | 62.1 | 58.3 | 55.6 | 1.12 |
+| 10q, 128 | 157.5 | 135.5 | 126.3 | 1.25 |
+| 1q, 256 | 27.2 | 25.1 | 24.8 | 1.09 |
+| 4q, 256 | 96.7 | 94.2 | 88.9 | 1.09 |
+| 10q, 256 | 245.4 | 224.2 | 211.7 | 1.16 |
+| 1q, 512 | 46.3 | 43.9 | 44.1 | 1.05 |
+| 4q, 512 | 165.3 | 158.7 | 150.1 | 1.10 |
+| 10q, 512 | 421.8 | 402.5 | 379.8 | 1.11 |
+| **geo-mean** | 80.1 | 71.5 | 68.6 | **1.17** (range 1.05 to 1.48) |
+
+The old default measured 1.12x over Python in the same session (range 1.03 to 1.37), as in stage E.
+
 ## What this means
 
 - The lead over Python laya-mlx comes from doing less work, not from Rust. Python could copy head pruning (its research notes already list it) and, with more work, unpadding. Today no released runtime does either.
@@ -131,6 +166,7 @@ All three published Laya models now run in the Rust runtime. Before this round o
 ## Files
 
 - **Code.** `runtime/crates/laya-mlx/src/lib.rs` has the settings `dense_upto`, `headprune` and `unpad`. The experiments that did not help are at commit 0495800. `crates/laya-mlx/tests/settings.rs` has the equivalence tests. `runtime/crates/sys1-bench/src/bin/sys1-probe.rs` has `--ab SPEC_A SPEC_B` and `--check`.
+- **Round 2.** `runtime/crates/laya-mlx/src/metal_kernels.rs` is the wrapper for MLX custom Metal kernels, `src/split_rope.rs` and `src/kernels/split_rope.metal` are the `fuserope` kernel with its load-time check and its tests against the MLX ops, and `tests/settings.rs` runs `fuserope` alone and with the three settings. The merge and int8 kernels were not merged.
 - **Stage G.** `raw/speed/review/` holds the multilingual and english runs before the review (stage F) and after it (stage G), the paired speed log `stageG-ab.log`, and `stageF.sh`. Stage F ran the `sys1-bench` in the default target directory, not the build passed to it as `BIN_DIR`, because the sys1rust adapter re-sourced `bench/env.sh` and reset `CARGO_TARGET_DIR` (since fixed). Its results record `code_version` 0495800, which names the source tree, not the binary that ran; stage G ran on the reviewed build and is unaffected.
 - **Results.** `raw/speed/bench/results/` holds stage E (timing, correctness and short) and the three alternating short runs. `raw/speed/fakeq/` holds the int8 simulation outputs.
 - **Scripts.** `raw/speed/scripts/` has `stageE.sh` and its log, `gemm_shapes.py` (matmul speed at the model's shapes), `fakeq_adapter.py`, `long.jsonl` (1,024-token rows), and the per-op profile taken on battery (`ops-battery.txt`).

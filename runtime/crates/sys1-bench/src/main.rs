@@ -59,8 +59,8 @@ const VARIANTS: [Variant; 6] = [
         name: "mlx-fp16-lean",
         notes: "mlx-fp16-fast plus the results/SPEED.md work reductions, the sys1d default: dense local \
                 attention up to 1,024 tokens, the last head layer only at the scorer's rows, no computing \
-                on padding.",
-        opts: || tuned("f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad"),
+                on padding, and (round 2) the split + RoPE + unpad expand as one Metal kernel.",
+        opts: || tuned("f16gelu,cache=512,wired=2048,dense_upto=1024,headprune,unpad,fuserope"),
     },
     Variant {
         name: "mlx-env",
