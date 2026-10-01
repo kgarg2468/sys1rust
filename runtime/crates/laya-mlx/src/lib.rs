@@ -1483,6 +1483,13 @@ impl Backend for MlxBackend {
         format!("mlx({dev},{dt})")
     }
 
+    fn active_kernels(&self) -> &'static [&'static str] {
+        match self.split_rope {
+            Some(_) => &["fuserope"],
+            None => &[],
+        }
+    }
+
     fn padded_len(&self, len: usize, _rows: usize) -> usize {
         if let Some(&b) = self.knobs.buckets.iter().find(|&&b| b >= len) {
             return b;

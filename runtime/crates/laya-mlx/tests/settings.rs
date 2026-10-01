@@ -199,8 +199,19 @@ fn check_shapes(agent: &Agent, cases: &[Case]) {
 /// state's answers must serialise to the same JSON and the raw logits and pooled outputs must
 /// be equal; otherwise the same choices and probabilities within `TOL`.
 fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str, exact: bool) -> f64 {
-    let base = run(&load(dir, BASE), cases);
-    let tuned = run(&load(dir, &format!("{BASE},{extra}")), cases);
+    let base_agent = load(dir, BASE);
+    let tuned_agent = load(dir, &format!("{BASE},{extra}"));
+    // A kernel setting that fell back at load runs the same MLX ops as the base agent, and a
+    // comparison would pass without touching the kernel. Refuse that run.
+    assert!(base_agent.backend().active_kernels().is_empty(), "{name}: the base settings `{BASE}` have a kernel active");
+    for setting in extra.split(',').filter(|s| *s == "fuserope") {
+        assert!(
+            tuned_agent.backend().active_kernels().contains(&setting),
+            "{name}/{extra}: `{setting}` is not active on the tuned agent: it fell back to the MLX split and rope ops at load (laya-mlx printed why on stderr), so this run would not test the fused path"
+        );
+    }
+    let base = run(&base_agent, cases);
+    let tuned = run(&tuned_agent, cases);
     let (mut worst, mut worst_logit, mut worst_pooled, mut answers, mut exact_states) = (0.0f64, 0.0f32, 0.0f32, 0usize, 0usize);
     let (mut pooled_scale, mut pooled_ulp) = (0.0f32, 0.0f32);
     for (i, c) in cases.iter().enumerate() {

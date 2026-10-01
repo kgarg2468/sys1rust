@@ -70,6 +70,12 @@ pub trait Backend: Send + Sync {
     /// Human-readable backend/device description, e.g. `mlx(gpu,f16)`.
     fn name(&self) -> String;
     fn forward(&self, batch: &Batch) -> Result<BackendOutput>;
+    /// The settings whose custom kernel is active: requested, built and checked at load. A
+    /// setting that fell back to the library ops is not listed, so a test of a kernel can
+    /// tell a run through it from one through the fallback.
+    fn active_kernels(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// Sequence length to pad a batch of `rows` rows whose longest row is `len` tokens to.
     /// Backends that keep a fixed set of shapes round `len` up to a bucket.
     fn padded_len(&self, len: usize, _rows: usize) -> usize {
