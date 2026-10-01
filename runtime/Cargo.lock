@@ -773,6 +773,7 @@ version = "0.1.0"
 dependencies = [
  "laya-core",
  "mlx-rs",
+ "mlx-sys",
  "safetensors",
  "serde_json",
 ]

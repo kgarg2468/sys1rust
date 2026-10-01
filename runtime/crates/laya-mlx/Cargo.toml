@@ -8,6 +8,7 @@ description = "MLX (Apple silicon) backend for the Laya decision model."
 [dependencies]
 laya-core = { workspace = true }
 mlx-rs = "0.32"
+mlx-sys = "=0.6.0"
 safetensors = { workspace = true }
 
 [dev-dependencies]
