@@ -97,17 +97,17 @@ Don't compare the two against the same threshold. `action.act_probability` comes
 ## Speed
 
 <p align="center">
-  <img src="docs/assets/speed.svg" alt="Median time per request for the typed-decisions model on a base M5. One question over a 128-token state: sys1rust 17.6 ms, Python laya-mlx 18.9 ms, stock laya serve 53.9 ms. One question over 512 tokens: 45.6, 49.4 and 157.6 ms. Ten questions over 512 tokens: 422, 453 and 708 ms." width="880">
+  <img src="docs/assets/speed.svg" alt="Median time per request for the typed-decisions model on a base M5. One question over a 128-token state: sys1rust 16.6 ms, Python laya-mlx 18.9 ms, stock laya serve 53.9 ms. One question over 512 tokens: 44.1, 46.3 and 157.6 ms. Ten questions over 512 tokens: 380, 422 and 708 ms." width="880">
 </p>
 
 | median ms | 1 question, 128 tokens | 1 question, 512 tokens | 10 questions, 512 tokens |
 | --- | --- | --- | --- |
-| sys1rust | 17.6 | 45.6 | 422 |
-| laya-mlx, Python MLX at its fastest (compiled, buffer cache capped) | 18.9 | 49.4 | 453 |
+| sys1rust | 16.6 | 44.1 | 380 |
+| laya-mlx, Python MLX at its fastest (compiled, buffer cache capped) | 18.9 | 46.3 | 422 |
 | `laya serve`, stock, over HTTP | 53.9 | 157.6 | 708 |
 
-- **Against stock `laya serve`**, it is 1.7 to 3.4x faster per request, counting `sys1d`'s 0.3 ms of HTTP. `sys1d` sustained 7.9 requests/s over 5 minutes, and `laya serve` 3.54 over 2 minutes. `laya serve` runs fp32 for requests with fewer than 5 questions, but even upstream in fp16, which it doesn't ship, is 1.7 to 2.6x slower on these three sizes.
-- **Against Python laya-mlx at its fastest**, it is 1.12x faster, and faster on all 12 benchmark sizes, by 4 to 36%.
+- **Against stock `laya serve`**, it is 1.9 to 3.5x faster per request, counting `sys1d`'s 0.3 ms of HTTP. `sys1d` sustained 7.9 requests/s over 5 minutes, and `laya serve` 3.54 over 2 minutes. `laya serve` runs fp32 for requests with fewer than 5 questions, but even upstream in fp16, which it doesn't ship, is 1.9 to 2.7x slower on these three sizes.
+- **Against Python laya-mlx at its fastest**, it is 1.17x faster, and faster on all 12 benchmark sizes, by 5 to 48%.
 - **It gives the same answers.** On the 1,500-answer correctness workload, 1,498 agree with the upstream PyTorch fp32 reference (99.9%, above the 99% gate). The two that differ are near ties.
 - **Its tail stays close to the median.** In the timing runs, no request took more than twice the median for its size. Python MLX without a capped cache had 9% of requests over that line.
 - **It starts fast and is small.** From process start to the first answer takes 243 to 375 ms, with the model files already in the OS file cache. `sys1d` is a 5 MB binary, and its HTTP layer adds 0.3 ms per request.
