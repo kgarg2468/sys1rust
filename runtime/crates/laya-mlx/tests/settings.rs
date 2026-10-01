@@ -1,9 +1,11 @@
-//! Equivalence of the work-reduction settings (`dense_upto=1024`, `headprune`, `unpad`, and the
-//! three together) and of boolean masks (`mask=bool`) with the plain path, on the real
-//! checkpoints (ignored by default; needs them in the HF cache, `source bench/env.sh` first).
+//! Equivalence of the work-reduction settings (`dense_upto=1024`, `headprune`, `unpad`, the
+//! three together, and `fuserope` alone and with the three), and of boolean masks (`mask=bool`),
+//! with the plain path, on the real checkpoints (ignored by default; needs them in the HF
+//! cache, `source bench/env.sh` first).
 //! Every checkpoint found is run, a missing one is skipped with a note. Pass criteria per
 //! question: the same chosen answer (argmax choice, rounded score, noul side) and every
-//! reported probability within 1e-3.
+//! reported probability within 1e-3; `fuserope` alone must be exact (the same answer JSON for
+//! every state, equal raw logits and pooled outputs).
 //!
 //! The cases are the `bench/workloads/smoke.jsonl` requests plus built edge cases: one question
 //! with 2 options and with 1 option, 20 options, a state past `max_len` (truncated), two states
@@ -193,10 +195,24 @@ fn check_shapes(agent: &Agent, cases: &[Case]) {
 
 /// Load the base agent and the agent with `extra` on top, run both over the cases and compare.
 /// Returns the max probability diff seen, after asserting every criterion.
-fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str) -> f64 {
-    let base = run(&load(dir, BASE), cases);
-    let tuned = run(&load(dir, &format!("{BASE},{extra}")), cases);
-    let (mut worst, mut worst_logit, mut worst_pooled, mut answers, mut exact) = (0.0f64, 0.0f32, 0.0f32, 0usize, 0usize);
+/// `extra` on top of the base settings against the base settings alone. With `exact`, every
+/// state's answers must serialise to the same JSON and the raw logits and pooled outputs must
+/// be equal; otherwise the same choices and probabilities within `TOL`.
+fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str, exact: bool) -> f64 {
+    let base_agent = load(dir, BASE);
+    let tuned_agent = load(dir, &format!("{BASE},{extra}"));
+    // A kernel setting that fell back at load runs the same MLX ops as the base agent, and a
+    // comparison would pass without touching the kernel. Refuse that run.
+    assert!(base_agent.backend().active_kernels().is_empty(), "{name}: the base settings `{BASE}` have a kernel active");
+    for setting in extra.split(',').filter(|s| *s == "fuserope") {
+        assert!(
+            tuned_agent.backend().active_kernels().contains(&setting),
+            "{name}/{extra}: `{setting}` is not active on the tuned agent: it fell back to the MLX split and rope ops at load (laya-mlx printed why on stderr), so this run would not test the fused path"
+        );
+    }
+    let base = run(&base_agent, cases);
+    let tuned = run(&tuned_agent, cases);
+    let (mut worst, mut worst_logit, mut worst_pooled, mut answers, mut exact_states) = (0.0f64, 0.0f32, 0.0f32, 0usize, 0usize);
     let (mut pooled_scale, mut pooled_ulp) = (0.0f32, 0.0f32);
     for (i, c) in cases.iter().enumerate() {
         worst_logit = worst_logit.max(max_abs(&base.logits[i], &tuned.logits[i]));
@@ -206,9 +222,11 @@ fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str) -> f64 {
             (pooled_scale, pooled_ulp) = (scale, ulp);
         }
         for (a, b) in base.answers[i].iter().zip(&tuned.answers[i]) {
-            if a == b {
-                exact += 1;
+            let same_json = serde_json::to_string(a).unwrap() == serde_json::to_string(b).unwrap();
+            if same_json {
+                exact_states += 1;
             }
+            assert!(same_json || !exact, "{name}/{}/{extra}: answers differ: {a} vs {b}", c.name);
             let (qa, qb) = (a.as_object().unwrap(), b.as_object().unwrap());
             assert_eq!(qa.len(), qb.len(), "{name}/{}/{extra}", c.name);
             for (qid, ans) in qa {
@@ -236,15 +254,20 @@ fn compare(name: &str, dir: &Path, cases: &[Case], extra: &str) -> f64 {
         }
     }
     let states: usize = base.answers.iter().map(Vec::len).sum();
+    if exact {
+        assert_eq!(exact_states, states, "{name}/{extra}: not every state is byte-identical");
+        assert_eq!((worst_logit, worst_pooled), (0.0, 0.0), "{name}/{extra}: raw logits or pooled outputs differ");
+    }
     eprintln!(
-        "{name:<16} {extra:<32} {answers} answers over {} cases: max prob diff {worst:.2e}, {exact}/{states} states byte-identical, raw logits {worst_logit:.2e}, pooled {worst_pooled:.2e} (one f16 ulp at its max |x| {pooled_scale:.0} is {pooled_ulp})",
+        "{name:<16} {extra:<32} {answers} answers over {} cases: max prob diff {worst:.2e}, {exact_states}/{states} states byte-identical, raw logits {worst_logit:.2e}, pooled {worst_pooled:.2e} (one f16 ulp at its max |x| {pooled_scale:.0} is {pooled_ulp})",
         cases.len()
     );
     worst
 }
 
-/// Run `extra` against the base settings on every checkpoint in the cache.
-fn every_checkpoint(extra: &str) {
+/// Run `extra` against the base settings on every checkpoint in the cache; `exact` as in
+/// [`compare`].
+fn every_checkpoint(extra: &str, exact: bool) {
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let smoke = read_jsonl(&bench_root().join("workloads/smoke.jsonl"));
     let cases = cases(&smoke);
@@ -255,7 +278,7 @@ fn every_checkpoint(extra: &str) {
             continue;
         };
         check_shapes(&load(&dir, BASE), &cases);
-        compare(name, &dir, &cases, extra);
+        compare(name, &dir, &cases, extra, exact);
         ran += 1;
     }
     assert!(ran > 0, "no checkpoint in the HF cache; source bench/env.sh and download one");
@@ -264,25 +287,47 @@ fn every_checkpoint(extra: &str) {
 #[test]
 #[ignore]
 fn dense_upto_matches_plain() {
-    every_checkpoint("dense_upto=1024");
+    every_checkpoint("dense_upto=1024", false);
 }
 
 #[test]
 #[ignore]
 fn headprune_matches_plain() {
-    every_checkpoint("headprune");
+    every_checkpoint("headprune", false);
 }
 
 #[test]
 #[ignore]
 fn unpad_matches_plain() {
-    every_checkpoint("unpad");
+    every_checkpoint("unpad", false);
 }
 
 #[test]
 #[ignore]
 fn all_three_match_plain() {
-    every_checkpoint("dense_upto=1024,headprune,unpad");
+    every_checkpoint("dense_upto=1024,headprune,unpad", false);
+}
+
+/// The `fuserope` kernel on the padded layout (no `unpad`): the kernel is checked bit for bit
+/// against the MLX ops in `split_rope.rs`; this checks the answers end to end, exactly. Every
+/// state's answers serialise to the same JSON as the plain path's, and the raw logits and
+/// pooled outputs are equal, so `fuserope` cannot change a chosen answer where the plain path
+/// does not. The plain path's agreement with the upstream fp32 reference is checked by the
+/// bench harness (`tests/reference.rs` for the smoke set): on the typed-decisions correctness
+/// workload with the round 2 default (`fuserope` on), 1,498 of 1,500 answers agree (99.9%),
+/// the same two near-tie flips as with the old default; see `results/SPEED.md`, round 2.
+#[test]
+#[ignore]
+fn fuserope_matches_plain() {
+    every_checkpoint("fuserope", true);
+}
+
+/// The `fuserope` kernel on the packed layout, the round 2 default of sys1d: with `unpad` the
+/// kernel also does the expand through the packing's index.
+#[test]
+#[ignore]
+fn all_four_match_plain() {
+    every_checkpoint("dense_upto=1024,headprune,unpad,fuserope", false);
 }
 
 /// Boolean masks on every path: `over_max_len` and `heavy_padding` pad past `4 * window`, so
@@ -292,7 +337,7 @@ fn all_three_match_plain() {
 #[test]
 #[ignore]
 fn bool_masks_match_additive() {
-    every_checkpoint("mask=bool");
+    every_checkpoint("mask=bool", false);
 }
 
 /// The smoke set against the fp32 CPU reference, per checkpoint, with the three work
