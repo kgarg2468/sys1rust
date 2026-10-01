@@ -234,4 +234,4 @@ The best CPU paths are about 6x slower than the best GPU path for one question a
 
 ## Sudo rule (removed 2026-10-01 12:39 PT)
 
-- The power runs used a temporary passwordless sudo rule for `powermetrics`. It stopped working on its own at 11:56 PT on 2026-09-29, and the operator removed the file, `/etc/sudoers.d/sys1rust-powermetrics`, on 2026-10-01.
+- The power runs used a temporary passwordless sudo rule for `powermetrics`. It stopped working on its own at 11:56 PT on 2026-09-29, and the operator deleted its sudoers drop-in file on 2026-10-01.
