@@ -11,8 +11,10 @@
 //! masks, and diagnostic timing. Work-reduction knobs, off unless asked for (measured in
 //! `results/SPEED.md`): `dense_upto` (the dense/chunked local-attention switch), `headprune`
 //! (last head layer only on the rows the scorer reads) and `unpad` (hidden states packed to
-//! the real tokens outside attention). Experiments that gained nothing (`split`, `rope1`,
-//! `splitk`) were removed after commit 0495800; that commit has their code.
+//! the real tokens outside attention). `fuserope` (round 2) runs the encoder's qkv split,
+//! head reshape, RoPE and unpad expand as one custom Metal kernel (`split_rope.rs`).
+//! Experiments that gained nothing (`split`, `rope1`, `splitk`) were removed after commit
+//! 0495800; that commit has their code.
 
 use laya_core::weights::{to_f16, to_f32};
 use laya_core::{
@@ -27,6 +29,8 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 pub mod metal_kernels;
+mod split_rope;
+use split_rope::SplitRope;
 
 /// Finite "minus infinity" for additive attention masks (safe in f16, no NaN rows).
 const MASK_NEG: f32 = -1e4;
@@ -99,6 +103,13 @@ struct Knobs {
     /// Keep hidden states packed as `[T, d]` (real tokens only) through embeddings, norms,
     /// linears and GeGLU; expand to `[n, len, ...]` only around attention.
     unpad: bool,
+    /// Encoder qkv split, head reshape, RoPE and the `unpad` expand in one custom Metal kernel
+    /// ([`SplitRope`]) instead of MLX's split, reshape, rope and gather ops; exact, see
+    /// `results/SPEED.md` round 2. The kernel is compiled and checked against the MLX ops at
+    /// load; if that fails (no GPU, a head dim that is not a multiple of 8, a kernel that does
+    /// not compile or does not match the MLX ops on this machine) the load prints one line to
+    /// stderr and the forward runs the MLX ops instead.
+    fuserope: bool,
 }
 
 impl Knobs {
@@ -132,6 +143,7 @@ impl Knobs {
             dense_upto: None,
             headprune: false,
             unpad: false,
+            fuserope: false,
         };
         for kv in spec.split(',').filter(|s| !s.is_empty()) {
             let (key, val) = match kv.split_once('=') {
@@ -185,6 +197,7 @@ impl Knobs {
                 "dense_upto" => k.dense_upto = Some(number(value()?)?),
                 "headprune" => k.headprune = flag()?,
                 "unpad" => k.unpad = flag()?,
+                "fuserope" => k.fuserope = flag()?,
                 _ => return Err(Error::Config(format!("mlx settings: unknown setting `{key}` in `{spec}`"))),
             }
         }
@@ -200,7 +213,7 @@ pub fn check_settings(spec: &str) -> Result<()> {
 }
 
 /// Convert an MLX exception into a `laya_core::Error::Backend`.
-trait Lx<T> {
+pub(crate) trait Lx<T> {
     fn lx(self) -> Result<T>;
 }
 impl<T> Lx<T> for std::result::Result<T, mlx_rs::error::Exception> {
@@ -497,6 +510,8 @@ struct EncoderLayer {
     wi: Linear,
     wo2: Linear,
     rope_theta: f32,
+    /// `[log2(rope_theta)]` f32, the `fuserope` kernel's `lbase` input.
+    rope_lbase: Array,
     local: bool,
 }
 
@@ -588,6 +603,8 @@ pub struct MlxBackend {
     band: Array,
     caches: Mutex<Caches>,
     geglu: GeGlu,
+    /// The `fuserope` kernel when the setting is on and the kernel passed its load-time check.
+    split_rope: Option<SplitRope>,
     knobs: Knobs,
 }
 
@@ -800,6 +817,7 @@ impl MlxBackend {
                     } else {
                         enc.global_rope_theta
                     } as f32,
+                    rope_lbase: split_rope::log2_base(if local { enc.local_rope_theta } else { enc.global_rope_theta } as f32),
                     local,
                 });
             }
@@ -845,6 +863,23 @@ impl MlxBackend {
                     )?,
                 });
             }
+            // The kernel-fallback rule: `fuserope` is decided here, at load, never in a
+            // request. A kernel that cannot be built or does not reproduce the MLX ops on this
+            // machine is reported once and the MLX path serves instead.
+            let split_rope = match (knobs.fuserope, cpu) {
+                (false, _) => None,
+                (true, true) => {
+                    eprintln!("laya-mlx: fuserope needs the GPU; the CPU backend runs the MLX split and rope ops instead");
+                    None
+                }
+                (true, false) => match SplitRope::new(enc.num_attention_heads, enc.head_dim(), dtype, enc.global_rope_theta as f32) {
+                    Ok(k) => Some(k),
+                    Err(e) => {
+                        eprintln!("laya-mlx: fuserope is off for this load, the MLX split and rope ops run instead: {e}");
+                        None
+                    }
+                },
+            };
             let this = Self {
                 cpu,
                 dtype,
@@ -869,6 +904,7 @@ impl MlxBackend {
                 },
                 caches: Mutex::new(Caches::default()),
                 geglu: GeGlu::new(&knobs.geglu, knobs.f16gelu),
+                split_rope,
                 knobs: knobs.clone(),
             };
             // Materialise every weight (and transposed view) once, up front.
@@ -926,6 +962,7 @@ impl MlxBackend {
             push_norm(&mut v, &l.mlp_norm);
             push_lin(&mut v, &l.wi);
             push_lin(&mut v, &l.wo2);
+            v.push(&l.rope_lbase);
         }
         for h in &self.head {
             push_norm(&mut v, &h.norm1);
@@ -1165,16 +1202,10 @@ impl MlxBackend {
             .lx()
     }
 
-    /// Encoder `qkv [n, len, 3d]` -> roped `q`, roped `k` and `v`, each `[n, H, len, hd]`.
+    /// Encoder `qkv [n, len, 3d]` -> roped `q`, roped `k` and `v`, each `[n, H, len, hd]`, with
+    /// the MLX ops (the reference the `fuserope` kernel is checked against).
     fn qkv_rope(&self, qkv: &Array, n: i32, len: i32, theta: f32) -> Result<(Array, Array, Array)> {
-        let rope = |x: &Array| -> Result<Array> {
-            fast::rope(x, self.head_dim as i32, false, theta, 1.0, 0, None::<&Array>).lx()
-        };
-        let parts = qkv.split_equal(3, -1).lx()?;
-        let q = self.split_heads(&parts[0], n, len, self.n_heads)?;
-        let k = self.split_heads(&parts[1], n, len, self.n_heads)?;
-        let v = self.split_heads(&parts[2], n, len, self.n_heads)?;
-        Ok((rope(&q)?, rope(&k)?, v))
+        split_rope::mlx_path(qkv, n, len, self.n_heads as i32, self.head_dim as i32, theta)
     }
 
     /// Token index of position 0 of every row: `r * len` in the padded layout, the packing
@@ -1257,6 +1288,9 @@ impl MlxBackend {
             Ok(())
         };
         mark("emb+masks", &[&h])?;
+        // `[n, len]` for the `fuserope` kernel: the batch shape goes in as data, so one kernel
+        // instantiation serves every shape.
+        let dims = Array::from_slice(&[n, len], &[2]);
         for layer in &self.layers {
             let t = std::time::Instant::now();
             let a = match &layer.attn_norm {
@@ -1265,13 +1299,22 @@ impl MlxBackend {
             };
             mark("attn_norm", &[&a])?;
             let qkv = layer.wqkv.apply(&a)?;
-            // Packed: back to `[n, len, 3d]` for attention.
-            let qkv = match &packing {
-                Some(p) => p.expand(&qkv, n, len)?,
-                None => qkv,
+            let (q, k, v) = match &self.split_rope {
+                // The kernel reads the packed rows through the unpack index itself.
+                Some(kernel) => {
+                    mark("wqkv", &[&qkv])?;
+                    kernel.apply(&qkv, packing.as_ref().map(|p| &p.unpack), &dims, &layer.rope_lbase, n, len)?
+                }
+                None => {
+                    // Packed: back to `[n, len, 3d]` for attention.
+                    let qkv = match &packing {
+                        Some(p) => p.expand(&qkv, n, len)?,
+                        None => qkv,
+                    };
+                    mark("wqkv", &[&qkv])?;
+                    self.qkv_rope(&qkv, n, len, layer.rope_theta)?
+                }
             };
-            mark("wqkv", &[&qkv])?;
-            let (q, k, v) = self.qkv_rope(&qkv, n, len, layer.rope_theta)?;
             mark("split+rope", &[&q, &k, &v])?;
             let att = match (&ctx.local, layer.local) {
                 (LocalAttn::Windowed(w), true) => self.windowed_attention(&q, &k, &v, w, scale)?,
@@ -1501,12 +1544,13 @@ mod tests {
     fn knobs_default_off_and_parse() {
         let k = Knobs::from_spec(Some("")).unwrap();
         assert_eq!(k.dense_upto, None);
-        assert!(!k.headprune && !k.unpad);
-        let k = Knobs::from_spec(Some("dense_upto=512,headprune,unpad")).unwrap();
+        assert!(!k.headprune && !k.unpad && !k.fuserope);
+        let k = Knobs::from_spec(Some("dense_upto=512,headprune,unpad,fuserope")).unwrap();
         assert_eq!(k.dense_upto, Some(512));
-        assert!(k.headprune && k.unpad);
-        let k = Knobs::from_spec(Some("headprune=0,unpad=0")).unwrap();
-        assert!(!k.headprune && !k.unpad);
+        assert!(k.headprune && k.unpad && k.fuserope);
+        let k = Knobs::from_spec(Some("headprune=0,unpad=0,fuserope=0")).unwrap();
+        assert!(!k.headprune && !k.unpad && !k.fuserope);
+        assert!(Knobs::from_spec(Some("fuserope=1")).unwrap().fuserope);
     }
 
     /// The padding rows of a batch go through the packing as their row's token 0, and every
@@ -1571,6 +1615,7 @@ mod tests {
         assert!(err("dense_upto").contains("needs a value"));
         assert!(err("unpad=yes").contains("`yes` is not 0 or 1"));
         assert!(err("headprune=on").contains("`on` is not 0 or 1"));
+        assert!(err("fuserope=split").contains("`split` is not 0 or 1"));
         assert!(err("wired=2048,f16gelu,cache=512 ").contains("`cache=512 `"));
         assert_eq!(check_settings("f16gelu,cache=512,wired=2048").ok(), Some(()));
         assert!(check_settings("f16gelu,cache=512x").is_err());

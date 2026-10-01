@@ -1,6 +1,7 @@
-//! Equivalence of the work-reduction settings (`dense_upto=1024`, `headprune`, `unpad`, and the
-//! three together) and of boolean masks (`mask=bool`) with the plain path, on the real
-//! checkpoints (ignored by default; needs them in the HF cache, `source bench/env.sh` first).
+//! Equivalence of the work-reduction settings (`dense_upto=1024`, `headprune`, `unpad`, the
+//! three together, and `fuserope` alone and with the three), and of boolean masks (`mask=bool`),
+//! with the plain path, on the real checkpoints (ignored by default; needs them in the HF
+//! cache, `source bench/env.sh` first).
 //! Every checkpoint found is run, a missing one is skipped with a note. Pass criteria per
 //! question: the same chosen answer (argmax choice, rounded score, noul side) and every
 //! reported probability within 1e-3.
@@ -283,6 +284,22 @@ fn unpad_matches_plain() {
 #[ignore]
 fn all_three_match_plain() {
     every_checkpoint("dense_upto=1024,headprune,unpad");
+}
+
+/// The `fuserope` kernel on the padded layout (no `unpad`): the kernel is checked bit for bit
+/// against the MLX ops in `split_rope.rs`, this checks the answers end to end.
+#[test]
+#[ignore]
+fn fuserope_matches_plain() {
+    every_checkpoint("fuserope");
+}
+
+/// The `fuserope` kernel on the packed layout, the round 2 default of sys1d: with `unpad` the
+/// kernel also does the expand through the packing's index.
+#[test]
+#[ignore]
+fn all_four_match_plain() {
+    every_checkpoint("dense_upto=1024,headprune,unpad,fuserope");
 }
 
 /// Boolean masks on every path: `over_max_len` and `heavy_padding` pad past `4 * window`, so
