@@ -26,6 +26,8 @@ use safetensors::SafeTensors;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+pub mod metal_kernels;
+
 /// Finite "minus infinity" for additive attention masks (safe in f16, no NaN rows).
 const MASK_NEG: f32 = -1e4;
 /// Logit value reported for masked marker slots.
