@@ -43,6 +43,8 @@ Update, 2026-09-29: three exact changes (dense local attention, pruning the last
 
 Update, 2026-09-29: after a review (one bug fixed, the unhelpful experiments removed), those three changes are the `sys1d` default (runtime 815ecd0). All three published Laya models now run in the Rust runtime with the upstream answers: typed-decisions, multilingual and english. The changes save 8.5 to 10% of the time on each. See `SPEED.md`, stage G.
 
+Update, 2026-09-30: round 2 of the speed work ships one custom Metal kernel, `fuserope`, for the encoder's qkv split, RoPE and unpad expand. Its answers are bit-identical to the MLX ops on all three models, it takes 0.962 of the stage G default's time in a paired run, and the Rust runtime is now 1.17x over Python laya-mlx on the timing workload. It is the `sys1d` default. Int8 matmuls were measured with a real kernel and are not shipped: 95.1% agreement on multilingual, under the gate. See `SPEED.md`, round 2.
+
 How much speed a runtime alone can still find (my estimate, not measured). laya-mlx's own FLOP counts put the 421M model at about 0.75 to 0.85 GFLOP per token. The compiled MLX path then runs at about 8 TFLOP/s for one question at 128 or 512 tokens, and about 10.6 TFLOP/s for ten questions at 512. A third-party test measured this chip's fp16 matmul peak at 15.3 to 16.6 TFLOP/s. So on 128 to 512 token inputs MLX already gets half to two thirds of the peak, and a better kernel can win at most 1.5 to 2x there. Short questions (about 80 tokens) run at about 4.8 TFLOP/s. They are limited by fixed per-call overhead, but laya-mlx's own kernel work there gained only 1.03 to 1.08x.
 
 ## Why the model is the lever
