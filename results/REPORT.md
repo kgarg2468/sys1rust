@@ -232,6 +232,6 @@ The best CPU paths are about 6x slower than the best GPU path for one question a
 - `bench/teardown.sh --yes` deleted the 65 GB `bench/` folder, the four Core ML compile caches in the per-user Caches folder (about 20 GB), the two rustup toolchains and the temp files, and stopped caffeinate. 18 more empty onnxruntime `mat-debug-*.log` files from the benchmark window were deleted by hand.
 - Before deleting, the last small files were copied here: the final STATUS.md, laya-mlx's `tools/`, jevalaya's `run-configs/` and laya-mlx's research docs (`raw/laya-mlx-docs/`). No contender source checkout had local changes.
 
-## Still open
+## Sudo rule (removed 2026-10-01 12:39 PT)
 
-- The power runs used a temporary passwordless sudo rule for `powermetrics`. It has not been removed yet, because removing it needs the operator's password. The rule stops working on its own at 11:56 PT on 2026-09-29.
+- The power runs used a temporary passwordless sudo rule for `powermetrics`. It stopped working on its own at 11:56 PT on 2026-09-29, and the operator deleted its sudoers drop-in file on 2026-10-01.
